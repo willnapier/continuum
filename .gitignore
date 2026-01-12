@@ -1,0 +1,13 @@
+target/
+
+# Sync conflict files (Syncthing, Dropbox, etc.)
+*.sync-conflict-*
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

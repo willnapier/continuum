@@ -1,0 +1,17 @@
+[package]
+name = "continuum-goose"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "continuum-goose"
+path = "src/main.rs"
+
+[dependencies]
+continuum-core = { path = "../continuum-core" }
+color-eyre.workspace = true
+tokio.workspace = true
+which = "6.0"
+rusqlite.workspace = true
+chrono.workspace = true

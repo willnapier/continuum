@@ -1,0 +1,18 @@
+[package]
+name = "continuum"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Continuum: assistant-agnostic context and log toolkit"
+
+[[bin]]
+name = "continuum"
+path = "src/main.rs"
+
+[dependencies]
+continuum-core = { path = "../continuum-core" }
+clap.workspace = true
+color-eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

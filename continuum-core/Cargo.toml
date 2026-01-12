@@ -1,0 +1,21 @@
+[package]
+name = "continuum-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Core library for Continuum: types, adapters, and storage"
+
+[lib]
+name = "continuum_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+color-eyre.workspace = true
+regex.workspace = true
+rusqlite.workspace = true  # Only used by Goose adapter to read Goose's own database
+
+[dev-dependencies]
+tempfile = "3.15"

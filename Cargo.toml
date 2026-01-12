@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "continuum-core",
+    "continuum-cli",
+    "continuum-claude",
+    "continuum-codex",
+    "continuum-goose",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Will Napier <will@willnapier.com>"]
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+color-eyre = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+tokio = { version = "1.42", features = ["process", "io-util", "rt", "rt-multi-thread", "macros"] }
+regex = "1.11"
+rusqlite = { version = "0.32", features = ["bundled"] }  # Only used by Goose adapter
