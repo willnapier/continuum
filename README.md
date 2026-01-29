@@ -332,6 +332,14 @@ Contributions welcome! This project values:
 - Terminal tools over GUIs
 - Unix philosophy
 
+## Related Repositories
+
+| Repository | Description |
+|------------|-------------|
+| [dotfiles](https://github.com/willnapier/dotfiles) | System configuration with AI export watchers and converter tools |
+| [nushell-knowledge-tools](https://github.com/willnapier/nushell-knowledge-tools) | Universal CLI functions for knowledge management |
+| [helix-knowledge-integration](https://github.com/willnapier/helix-knowledge-integration) | Helix editor integration for the knowledge tools |
+
 ## See Also
 
 - [Nushell](https://www.nushell.sh/) - Modern shell with structured data
