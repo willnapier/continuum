@@ -441,6 +441,14 @@ fn find_latest_session_file(projects_dir: &std::path::Path) -> Option<std::path:
     latest.map(|(path, _)| path)
 }
 
+fn hash_content(role: &str, content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    role.hash(&mut hasher);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
     use continuum_core::{MessageCompressor, PlainTextWriter};
     use std::io::{BufRead, BufReader};
@@ -454,9 +462,12 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
 
     let compressor = MessageCompressor::new();
     let mut messages: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut start_time: Option<String> = None;
 
-    // Read all messages from the session file
+    // Read all messages from the session file, deduplicating content.
+    // CC sessions with context compression re-serialize earlier messages,
+    // causing massive duplication in long sessions without this check.
     let file = std::fs::File::open(session_path)
         .with_context(|| format!("Failed to open {}", session_path.display()))?;
     let reader = BufReader::new(file);
@@ -488,7 +499,10 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
 
                 if role == "user" {
                     if let Some(content) = msg["content"].as_str() {
-                        messages.push(("user".to_string(), content.to_string()));
+                        let hash = hash_content("user", content);
+                        if seen.insert(hash) {
+                            messages.push(("user".to_string(), content.to_string()));
+                        }
                     }
                 } else if role == "assistant" {
                     if let Some(content_array) = msg["content"].as_array() {
@@ -505,7 +519,10 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
                             .join("\n");
 
                         if !text.is_empty() {
-                            messages.push(("assistant".to_string(), text));
+                            let hash = hash_content("assistant", &text);
+                            if seen.insert(hash) {
+                                messages.push(("assistant".to_string(), text));
+                            }
                         }
                     }
                 }

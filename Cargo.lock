@@ -303,6 +303,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "continuum-gemini"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "color-eyre",
+ "continuum-core",
+ "serde",
+ "serde_json",
+ "which",
+]
+
+[[package]]
 name = "continuum-goose"
 version = "0.1.0"
 dependencies = [

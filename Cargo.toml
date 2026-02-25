@@ -5,6 +5,7 @@ members = [
     "continuum-claude",
     "continuum-codex",
     "continuum-goose",
+    "continuum-gemini",
 ]
 resolver = "2"
 
