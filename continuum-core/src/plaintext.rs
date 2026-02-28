@@ -64,6 +64,7 @@ impl PlainTextWriter {
         end_time: Option<&str>,
         status: &str,
         message_count: usize,
+        skills: &[String],
     ) -> Result<PathBuf> {
         let date = Self::extract_date(start_time);
         let session_dir = self.session_dir(assistant, &date, session_id);
@@ -76,7 +77,7 @@ impl PlainTextWriter {
         let session_json_path = session_dir.join("session.json");
         let created_at = chrono::Utc::now().to_rfc3339();
 
-        let metadata = json!({
+        let mut metadata = json!({
             "id": session_id,
             "assistant": assistant,
             "start_time": start_time,
@@ -85,6 +86,10 @@ impl PlainTextWriter {
             "message_count": message_count,
             "created_at": created_at,
         });
+
+        if !skills.is_empty() {
+            metadata["skills"] = json!(skills);
+        }
 
         let mut file = fs::File::create(&session_json_path)
             .with_context(|| format!("Failed to create {}", session_json_path.display()))?;
@@ -205,6 +210,7 @@ mod tests {
             None,
             "active",
             0,
+            &[],
         )?;
 
         assert!(session_dir.join("session.json").exists());

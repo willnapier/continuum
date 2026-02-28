@@ -243,6 +243,7 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
         None,
         "closed",
         message_count,
+        &[],
     )?;
 
     // Write messages

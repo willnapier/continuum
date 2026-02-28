@@ -160,6 +160,7 @@ fn import_codex_session(
         None,
         "closed",
         message_count,
+        &[],
     )?;
 
     // Write messages
@@ -248,6 +249,7 @@ fn import_goose_session(
         None,
         "closed",
         message_count,
+        &[],
     )?;
 
     // Write messages
@@ -290,6 +292,7 @@ fn import_claude_code_session(
     let compressor = MessageCompressor::new();
     let mut messages: Vec<(String, String)> = Vec::new();
     let mut start_time: Option<String> = None;
+    let mut skills: Vec<String> = Vec::new();
 
     // Read all messages
     for line_result in adapter.stream_session(&session_path)? {
@@ -325,6 +328,21 @@ fn import_claude_code_session(
                 } else if role == "assistant" {
                     // Assistant messages have content as an array
                     if let Some(content_array) = msg["content"].as_array() {
+                        // Extract skills from Skill tool_use blocks
+                        for block in content_array {
+                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                                && block.get("name").and_then(|v| v.as_str()) == Some("Skill")
+                            {
+                                if let Some(skill) =
+                                    block.pointer("/input/skill").and_then(|v| v.as_str())
+                                {
+                                    if !skills.contains(&skill.to_string()) {
+                                        skills.push(skill.to_string());
+                                    }
+                                }
+                            }
+                        }
+
                         let text = content_array
                             .iter()
                             .filter_map(|c| {
@@ -368,6 +386,7 @@ fn import_claude_code_session(
         None,
         "closed",
         message_count,
+        &skills,
     )?;
 
     // Write messages

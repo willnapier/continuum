@@ -195,6 +195,7 @@ fn import_session_to_continuum(db_path: &std::path::Path, session_id: &str) -> R
         None,
         "closed",
         message_count,
+        &[],
     )?;
 
     // Write messages

@@ -185,8 +185,23 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
     let session: GeminiSession = serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse {}", session_path.display()))?;
 
+    // Build known skill names from ~/.gemini/skills/ directory
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let skills_dir = std::path::PathBuf::from(&home).join(".gemini/skills");
+    let mut known_skills: Vec<String> = Vec::new();
+    if skills_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    known_skills.push(name.to_string());
+                }
+            }
+        }
+    }
+
     // Extract user and gemini messages
     let mut messages: Vec<(String, String)> = Vec::new();
+    let mut skills: Vec<String> = Vec::new();
 
     for msg in &session.messages {
         match msg.msg_type.as_str() {
@@ -199,6 +214,18 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.is_empty() {
+                        // Check for /skill-name at the start of user messages
+                        let trimmed = text.trim();
+                        if trimmed.starts_with('/') {
+                            if let Some(cmd) = trimmed.split_whitespace().next() {
+                                let skill_name = &cmd[1..]; // strip leading /
+                                if known_skills.iter().any(|s| s == skill_name)
+                                    && !skills.contains(&skill_name.to_string())
+                                {
+                                    skills.push(skill_name.to_string());
+                                }
+                            }
+                        }
                         messages.push(("user".to_string(), text));
                     }
                 }
@@ -239,6 +266,7 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
         end_time,
         "closed",
         message_count,
+        &skills,
     )?;
 
     // Clear any existing messages.jsonl so resumed sessions don't duplicate
