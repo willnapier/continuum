@@ -523,22 +523,61 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
                             }
                         }
 
-                        let text = content_array
-                            .iter()
-                            .filter_map(|c| {
-                                if c["type"].as_str() == Some("text") {
-                                    c["text"].as_str().map(String::from)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        // Process all content blocks: text and tool_use
+                        for block in content_array {
+                            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                        if !text.is_empty() {
-                            let hash = hash_content("assistant", &text);
-                            if seen.insert(hash) {
-                                messages.push(("assistant".to_string(), text));
+                            match block_type {
+                                "text" => {
+                                    if let Some(text) = block["text"].as_str() {
+                                        if !text.is_empty() {
+                                            let hash = hash_content("assistant-text", text);
+                                            if seen.insert(hash) {
+                                                messages.push(("assistant".to_string(), text.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                                "tool_use" => {
+                                    let tool_name = block["name"].as_str().unwrap_or("unknown");
+                                    let input = block.get("input")
+                                        .map(|i| serde_json::to_string(i).unwrap_or_default())
+                                        .unwrap_or_default();
+                                    let tool_entry = format!(
+                                        "TOOL_USE: {} -> {}",
+                                        tool_name, input
+                                    );
+                                    let hash = hash_content("assistant-tool", &tool_entry);
+                                    if seen.insert(hash) {
+                                        messages.push(("assistant".to_string(), tool_entry));
+                                    }
+                                }
+                                "tool_result" => {
+                                    // Extract tool result content
+                                    let output = match block.get("content") {
+                                        Some(serde_json::Value::String(s)) => s.clone(),
+                                        Some(serde_json::Value::Array(blocks)) => blocks
+                                            .iter()
+                                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                        _ => String::new(),
+                                    };
+                                    if !output.is_empty() {
+                                        // Truncate large outputs to keep logs manageable
+                                        let truncated = if output.len() > 500 {
+                                            format!("{}... [truncated]", &output[..500])
+                                        } else {
+                                            output
+                                        };
+                                        let result_entry = format!("TOOL_RESULT: {}", truncated);
+                                        let hash = hash_content("user-result", &result_entry);
+                                        if seen.insert(hash) {
+                                            messages.push(("user".to_string(), result_entry));
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -547,7 +586,7 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
         }
     }
 
-    // Compress messages
+    // Compress messages (noise filter removes pleasantries/boilerplate)
     let compressed = compressor.compress_batch(&messages);
     let message_count = compressed.len();
 
@@ -558,8 +597,8 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
     let timestamp = start_time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     let date = PlainTextWriter::extract_date(Some(&timestamp));
 
-    // Write session
-    writer.write_session(
+    // Write session (overwrites session.json)
+    let session_dir = writer.write_session(
         session_id,
         "claude-code",
         Some(&timestamp),
@@ -568,6 +607,14 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
         message_count,
         &skills,
     )?;
+
+    // Delete existing messages.jsonl before writing to prevent duplication
+    // on session re-import (CC sessions can be resumed, triggering re-import).
+    let messages_path = session_dir.join("messages.jsonl");
+    if messages_path.exists() {
+        std::fs::remove_file(&messages_path)
+            .with_context(|| format!("Failed to remove old messages.jsonl: {}", messages_path.display()))?;
+    }
 
     // Write messages
     for (idx, (role, content)) in compressed.iter().enumerate() {
