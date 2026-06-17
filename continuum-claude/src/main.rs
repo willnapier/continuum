@@ -377,10 +377,10 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
         }
     } else {
         // Normal mode: import to continuum logs
-        if let Some(session_path) = after_session {
-            if before_session.as_ref() != Some(&session_path) {
+        if let Some(ref session_path) = after_session {
+            if before_session.as_ref() != Some(session_path) {
                 eprintln!("\n📝 Importing session to continuum logs...");
-                match import_session_to_continuum(&session_path) {
+                match import_session_to_continuum(session_path) {
                     Ok(_) => {
                         // Silently saved - no prompt needed
                     }
@@ -388,6 +388,10 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
                         eprintln!("⚠ Warning: Failed to import session: {}", e);
                     }
                 }
+
+                // Post-session farewell check: if user said goodbye but
+                // daypage-append wasn't called, compensate automatically
+                check_farewell_and_log(session_path);
             }
         }
     }
@@ -632,6 +636,154 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
     eprintln!("✓ Saved {} messages to continuum logs", message_count);
 
     Ok(())
+}
+
+/// Post-session check: was this a substantive session without daypage-append?
+/// If so, generate and call daypage-append automatically.
+///
+/// A session is "substantive" if it has 3+ assistant exchanges. This catches:
+/// - User said goodbye but model forgot to log
+/// - Ctrl-C / accidental close
+/// - Any other exit without logging
+///
+/// Skips trivial sessions (quick test, login-only, accidental launch).
+fn check_farewell_and_log(session_path: &std::path::Path) {
+    use std::io::{BufRead, BufReader};
+
+    const MIN_EXCHANGES: usize = 3;
+
+    let daypage_re = regex::Regex::new(r"daypage-append").unwrap();
+
+    let file = match std::fs::File::open(session_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let reader = BufReader::new(file);
+
+    let mut has_daypage_append = false;
+    let mut skill_name: Option<String> = None;
+    let mut assistant_count: usize = 0;
+    let mut first_timestamp: Option<String> = None;
+    let mut last_timestamp: Option<String> = None;
+
+    for line in reader.lines().flatten() {
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Capture timestamps for duration calculation
+        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str()) {
+            if first_timestamp.is_none() {
+                first_timestamp = Some(ts.to_string());
+            }
+            last_timestamp = Some(ts.to_string());
+        }
+
+        match entry_type {
+            "user" => {
+                // No per-message processing needed for user messages
+            }
+            "assistant" => {
+                assistant_count += 1;
+
+                // Check for Skill tool_use to extract skill name
+                if let Some(arr) = entry.pointer("/message/content").and_then(|v| v.as_array()) {
+                    for block in arr {
+                        if block.pointer("/type").and_then(|v| v.as_str()) == Some("tool_use")
+                            && block.pointer("/name").and_then(|v| v.as_str()) == Some("Skill")
+                        {
+                            if let Some(s) = block.pointer("/input/skill").and_then(|v| v.as_str()) {
+                                skill_name = Some(s.to_string());
+                            }
+                        }
+                        // Check for daypage-append in Bash tool calls
+                        if block.pointer("/type").and_then(|v| v.as_str()) == Some("tool_use")
+                            && block.pointer("/name").and_then(|v| v.as_str()) == Some("Bash")
+                        {
+                            if let Some(cmd) = block.pointer("/input/command").and_then(|v| v.as_str()) {
+                                if daypage_re.is_match(cmd) {
+                                    has_daypage_append = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Already logged — nothing to do
+    if has_daypage_append {
+        return;
+    }
+
+    // Skip trivial sessions (quick test, login-only, accidental launch)
+    if assistant_count < MIN_EXCHANGES {
+        return;
+    }
+
+    // Calculate duration
+    let duration_min = match (&first_timestamp, &last_timestamp) {
+        (Some(first), Some(last)) => {
+            let t1 = chrono::DateTime::parse_from_rfc3339(first).ok();
+            let t2 = chrono::DateTime::parse_from_rfc3339(last).ok();
+            match (t1, t2) {
+                (Some(a), Some(b)) => {
+                    let dur = b.signed_duration_since(a);
+                    std::cmp::max(1, dur.num_minutes())
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+
+    // Build the tag prefix from skill name
+    let tag = match skill_name.as_deref() {
+        Some("senior-dev") => "dev",
+        Some("clinical-notes") => "clinical-notes",
+        Some("philosophy-tutor") => "geoff",
+        Some("life-optimiser") => "seneca",
+        Some("diana") => "diana",
+        Some("music-scr") => "music",
+        Some(other) => other,
+        None => "dev",
+    };
+
+    // Dev work is now captured by the weekly DevLog (dev-catchup --devlog), not
+    // the DayPage. Skip auto-logging dev/unlabelled sessions; other personas
+    // (clinical-notes, geoff, seneca, diana, music) still log to the DayPage.
+    if tag == "dev" {
+        return;
+    }
+
+    let entry = format!(
+        "{}:: {}x {}min - [auto-logged by continuum: session ended without daypage-append]",
+        tag, assistant_count, duration_min
+    );
+
+    eprintln!("📋 Session had {}x exchanges but no daypage-append. Auto-logging...", assistant_count);
+
+    // Call daypage-append
+    match std::process::Command::new("daypage-append")
+        .arg(&entry)
+        .status()
+    {
+        Ok(s) if s.success() => {
+            eprintln!("✓ Auto-logged: {}", entry);
+        }
+        Ok(_) => {
+            eprintln!("⚠ daypage-append exited with error");
+        }
+        Err(e) => {
+            eprintln!("⚠ Failed to run daypage-append: {}", e);
+        }
+    }
 }
 
 // Claude Code JSON event types
