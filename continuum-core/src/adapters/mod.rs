@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub mod claude_code;
 pub mod codex;
 pub mod goose;
+pub mod grok_cli;
 
 /// Trait for adapting different assistant log formats into Continuum's format
 pub trait LogAdapter {

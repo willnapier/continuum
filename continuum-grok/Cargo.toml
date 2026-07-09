@@ -1,0 +1,17 @@
+[package]
+name = "continuum-grok"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Import Grok CLI sessions into Continuum logs"
+
+[[bin]]
+name = "continuum-grok"
+path = "src/main.rs"
+
+[dependencies]
+continuum-core = { path = "../continuum-core" }
+color-eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

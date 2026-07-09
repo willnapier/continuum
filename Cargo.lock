@@ -271,6 +271,7 @@ dependencies = [
  "color-eyre",
  "continuum-core",
  "exec",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
@@ -324,6 +325,17 @@ dependencies = [
  "rusqlite",
  "tokio",
  "which",
+]
+
+[[package]]
+name = "continuum-grok"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "color-eyre",
+ "continuum-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
