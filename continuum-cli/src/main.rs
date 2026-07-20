@@ -1,7 +1,7 @@
 // Continuum CLI - Plain-Text Assistant Log Management
 // Manages conversation logs stored as JSONL files in ~/Assistants/continuum-logs
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::{eyre::Context, Result};
@@ -282,6 +282,8 @@ fn import_claude_code_session(
         adapter.find_latest_session()?
     };
 
+    ensure_claude_session_importable(&session_path, &clinical_session_marker_dir()?)?;
+
     eprintln!("Importing Claude Code session: {}", session_path.display());
 
     let session_id = session_path
@@ -408,6 +410,39 @@ fn import_claude_code_session(
     Ok(())
 }
 
+fn clinical_session_marker_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "Refusing Claude Code import: HOME is unavailable, so the clinical-session registry cannot be checked"
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".local/share/continuum/claude-clinical-sessions"))
+}
+
+fn ensure_claude_session_importable(session_path: &Path, marker_dir: &Path) -> Result<()> {
+    if !marker_dir.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "Refusing Claude Code import: clinical-session registry is unavailable at {}",
+            marker_dir.display()
+        ));
+    }
+
+    let session_id = session_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("Refusing Claude Code import: invalid session path")
+        })?;
+
+    if marker_dir.join(session_id).is_file() {
+        return Err(color_eyre::eyre::eyre!(
+            "Refusing to import protected cc-clinical session {session_id}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn handle_stats() -> Result<()> {
     println!("\n📊 Continuum Statistics\n");
     println!("To view detailed statistics, use the Nushell function:");
@@ -418,4 +453,49 @@ fn handle_stats() -> Result<()> {
     println!("  continuum-timeline 2025-11-09\n");
     println!("📍 Log location: ~/Assistants/continuum-logs/\n");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_claude_session_importable;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn claude_import_fails_closed_without_clinical_registry() {
+        let temp = tempdir().unwrap();
+        let missing_registry = temp.path().join("missing");
+        let session = temp
+            .path()
+            .join("11111111-1111-1111-1111-111111111111.jsonl");
+
+        let error = ensure_claude_session_importable(&session, &missing_registry).unwrap_err();
+        assert!(error.to_string().contains("registry is unavailable"));
+    }
+
+    #[test]
+    fn claude_import_refuses_registered_clinical_session() {
+        let temp = tempdir().unwrap();
+        let registry = temp.path().join("registry");
+        fs::create_dir(&registry).unwrap();
+        fs::write(registry.join("11111111-1111-1111-1111-111111111111"), []).unwrap();
+        let session = temp
+            .path()
+            .join("11111111-1111-1111-1111-111111111111.jsonl");
+
+        let error = ensure_claude_session_importable(&session, &registry).unwrap_err();
+        assert!(error.to_string().contains("protected cc-clinical session"));
+    }
+
+    #[test]
+    fn claude_import_allows_unregistered_session() {
+        let temp = tempdir().unwrap();
+        let registry = temp.path().join("registry");
+        fs::create_dir(&registry).unwrap();
+        let session = temp
+            .path()
+            .join("22222222-2222-2222-2222-222222222222.jsonl");
+
+        ensure_claude_session_importable(&session, &registry).unwrap();
+    }
 }
