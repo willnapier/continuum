@@ -379,24 +379,58 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
         // Normal mode: import to continuum logs
         if let Some(ref session_path) = after_session {
             if before_session.as_ref() != Some(session_path) {
-                eprintln!("\n📝 Importing session to continuum logs...");
-                match import_session_to_continuum(session_path) {
-                    Ok(_) => {
-                        // Silently saved - no prompt needed
+                if clinical_marker_exists(&home, session_path) {
+                    // Defence-in-depth for the clinical→Continuum boundary
+                    // (design-forum, 2026-07-22). This wrapper imports the
+                    // latest-modified session across all projects — which, if a
+                    // `cc-clinical` PHI session is being written concurrently in
+                    // another terminal, could be that clinical transcript.
+                    // `cc-clinical` registers a 0600 marker before launch, so a
+                    // present marker is the precise, sufficient signal to refuse;
+                    // Continuum must stay PHI-free. We also skip the farewell
+                    // pass so no clinical content is read. (A missing registry /
+                    // marker means no protection was requested for this session,
+                    // so ordinary non-clinical capture proceeds unchanged.)
+                    eprintln!(
+                        "⏭ Skipping protected cc-clinical session — not imported to continuum"
+                    );
+                } else {
+                    eprintln!("\n📝 Importing session to continuum logs...");
+                    match import_session_to_continuum(session_path) {
+                        Ok(_) => {
+                            // Silently saved - no prompt needed
+                        }
+                        Err(e) => {
+                            eprintln!("⚠ Warning: Failed to import session: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("⚠ Warning: Failed to import session: {}", e);
-                    }
-                }
 
-                // Post-session farewell check: if user said goodbye but
-                // daypage-append wasn't called, compensate automatically
-                check_farewell_and_log(session_path);
+                    // Post-session farewell check: if user said goodbye but
+                    // daypage-append wasn't called, compensate automatically
+                    check_farewell_and_log(session_path);
+                }
             }
         }
     }
 
     std::process::exit(status.code().unwrap_or(1))
+}
+
+/// True if this Claude session carries a clinical-session marker and must NOT be
+/// imported into Continuum (a PHI-free store). Mirrors continuum-cli's
+/// `ensure_claude_session_importable` refusal. A missing registry/marker means no
+/// protection was requested for this session, so ordinary capture proceeds — the
+/// concurrency case this defends (a concurrent `cc-clinical` session being the
+/// latest-modified file) always has its marker present, since `cc-clinical`
+/// registers it before launch.
+fn clinical_marker_exists(home: &str, session_path: &std::path::Path) -> bool {
+    match session_path.file_stem().and_then(|value| value.to_str()) {
+        Some(session_id) => std::path::Path::new(home)
+            .join(".local/share/continuum/claude-clinical-sessions")
+            .join(session_id)
+            .is_file(),
+        None => false,
+    }
 }
 
 fn find_latest_session_file(projects_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -841,4 +875,49 @@ enum Content {
     Text { text: String },
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clinical_marker_exists;
+    use std::path::Path;
+
+    #[test]
+    fn marked_session_is_protected_unmarked_imports() {
+        let base =
+            std::env::temp_dir().join(format!("cc-continuum-claude-test-{}", std::process::id()));
+        let reg = base.join(".local/share/continuum/claude-clinical-sessions");
+        std::fs::create_dir_all(&reg).unwrap();
+        let marked = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let unmarked = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(reg.join(marked), b"").unwrap();
+        let home = base.to_str().unwrap();
+
+        let marked_path = format!("/x/{marked}.jsonl");
+        let unmarked_path = format!("/x/{unmarked}.jsonl");
+        assert!(
+            clinical_marker_exists(home, Path::new(&marked_path)),
+            "a registered clinical session must be protected (skipped, not imported)"
+        );
+        assert!(
+            !clinical_marker_exists(home, Path::new(&unmarked_path)),
+            "an unmarked session must import normally"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn missing_registry_does_not_block_normal_capture() {
+        // A home with no registry dir: ordinary non-clinical capture must proceed
+        // (fail-open on absent registry — the dangerous case always has a marker).
+        let base =
+            std::env::temp_dir().join(format!("cc-continuum-claude-noreg-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let home = base.to_str().unwrap();
+        assert!(!clinical_marker_exists(
+            home,
+            Path::new("/x/99999999-0000-0000-0000-000000000000.jsonl")
+        ));
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
