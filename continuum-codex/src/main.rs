@@ -1,6 +1,12 @@
 // Continuum-Codex: Transparent wrapper for Codex CLI
 // Automatically captures all conversations to plain-text JSONL files
+//
+// IMPORTANT: Never install this binary (or a symlink to it) as `codex` on PATH
+// ahead of the real OpenAI CLI. Self-detection used to rely only on the path
+// containing "continuum-codex", so a copy named `~/.local/bin/codex` re-spawned
+// itself forever. Resolution now skips our own executable by identity.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use color_eyre::{eyre::Context, Result};
 
@@ -10,43 +16,7 @@ fn main() -> Result<()> {
     // Get all arguments passed to continuum-codex
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Find the real codex binary
-    let codex_path = which::which("codex")
-        .context("Failed to find codex binary")?;
-
-    // Resolve symlinks to get the actual binary path
-    let resolved_codex = std::fs::canonicalize(&codex_path)
-        .unwrap_or_else(|_| codex_path.clone());
-
-    let codex_path_str = resolved_codex
-        .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid path"))?
-        .to_string();
-
-    // If the found codex IS this wrapper, search for the real codex binary
-    let real_codex = if codex_path_str.contains("continuum-codex") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-
-        // Try common installation locations (Linux-first for platform neutrality)
-        let fallback_paths = [
-            "/usr/bin/codex".to_string(),                               // Linux standard (pacman, apt)
-            "/usr/local/bin/codex".to_string(),                         // User install (both platforms)
-            format!("{}/.local/bin/codex-real", home),                  // Backed up binary
-            "/opt/homebrew/bin/codex".to_string(),                      // macOS Homebrew
-            "/opt/homebrew/opt/codex/bin/codex".to_string(),            // macOS Homebrew alternate
-        ];
-
-        fallback_paths
-            .iter()
-            .find(|path| std::path::Path::new(path).exists())
-            .ok_or_else(|| color_eyre::eyre::eyre!(
-                "Could not find real codex binary. Tried: {}",
-                fallback_paths.join(", ")
-            ))?
-            .to_string()
-    } else {
-        codex_path_str
-    };
+    let real_codex = find_real_codex()?.to_string_lossy().into_owned();
 
     // Check for no-save marker file
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -107,6 +77,64 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(status.code().unwrap_or(1))
+}
+
+/// Locate the real OpenAI Codex CLI, never this wrapper (by any name).
+fn find_real_codex() -> Result<PathBuf> {
+    let self_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+
+    // Prefer known real-install locations over PATH (PATH may point at a
+    // misnamed copy of this wrapper, historically `~/.local/bin/codex`).
+    let preferred = [
+        PathBuf::from("/usr/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+        PathBuf::from(format!("{}/.local/bin/codex-real", home)),
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/opt/homebrew/opt/codex/bin/codex"),
+    ];
+
+    for candidate in &preferred {
+        if candidate.exists() && !is_this_wrapper(candidate, self_exe.as_ref()) {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // Scan every PATH hit; skip ourselves and any continuum-named binary.
+    for candidate in which::which_all("codex").context("Failed to search PATH for codex")? {
+        if !is_this_wrapper(&candidate, self_exe.as_ref()) {
+            return Ok(candidate);
+        }
+    }
+
+    color_eyre::eyre::bail!(
+        "Could not find real codex binary. Tried preferred paths and every `codex` on PATH \
+         (skipped this wrapper). Install @openai/codex or place the real CLI at /usr/bin/codex."
+    )
+}
+
+fn is_this_wrapper(path: &Path, self_exe: Option<&PathBuf>) -> bool {
+    // Name-based: deployed as continuum-codex, or an obvious wrapper backup.
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        if name.contains("continuum-codex") || name.contains("misdeployed") {
+            return true;
+        }
+    }
+
+    // Identity-based: same canonical path as the running binary (covers the
+    // failure mode where this wrapper was copied to ~/.local/bin/codex).
+    if let Some(self_path) = self_exe {
+        if let Ok(resolved) = std::fs::canonicalize(path) {
+            if resolved == *self_path {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {

@@ -95,7 +95,7 @@ LLM: *no search needed* → instant answer
 git clone https://github.com/willnapier/continuum
 cd continuum
 
-# Build and install
+# Build and install wrappers under their continuum-* names only
 cargo build --release
 cp target/release/continuum ~/.local/bin/
 cp target/release/continuum-claude ~/.local/bin/
@@ -103,10 +103,10 @@ cp target/release/continuum-codex ~/.local/bin/
 cp target/release/continuum-goose ~/.local/bin/
 cp target/release/continuum-gemini ~/.local/bin/
 
-# Install wrappers (replaces your assistant binaries)
-ln -sf ~/continuum/target/release/continuum-claude ~/.local/bin/claude
-ln -sf ~/continuum/target/release/continuum-codex ~/.local/bin/codex
-ln -sf ~/continuum/target/release/continuum-goose ~/.local/bin/goose
+# DO NOT `ln -sf continuum-codex ~/.local/bin/codex` (or the same for claude/goose).
+# That shadows the real CLI on PATH and used to re-spawn the wrapper forever.
+# Wire capture via shell functions/aliases instead (nushell already has
+# `def --wrapped codex` → continuum-codex; real OpenAI CLI stays at /usr/bin/codex).
 
 # Source Nushell functions
 echo "source ~/continuum/continuum.nu" >> ~/.config/nushell/config.nu
