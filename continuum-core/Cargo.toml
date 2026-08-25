@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+which = "6.0"
 chrono.workspace = true
 color-eyre.workspace = true
 regex.workspace = true

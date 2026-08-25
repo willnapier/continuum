@@ -6,6 +6,7 @@ pub mod adapters;
 pub mod compression;
 pub mod plaintext;
 pub mod loop_detection;
+pub mod usage;
 
 // Re-export commonly used types
 pub use types::*;

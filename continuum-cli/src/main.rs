@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::{eyre::Context, Result};
-use continuum_core::{CodexLogEntry, LogAdapter, PlainTextWriter, MessageCompressor, LoopDetector, LoopSeverity};
 use continuum_core::adapters::claude_code::ClaudeCodeAdapter;
 use continuum_core::adapters::codex::CodexAdapter;
-use continuum_core::adapters::goose::{GooseAdapter, parse_goose_content};
+use continuum_core::adapters::goose::{parse_goose_content, GooseAdapter};
+use continuum_core::{
+    CodexLogEntry, LogAdapter, LoopDetector, LoopSeverity, MessageCompressor, PlainTextWriter,
+};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -16,6 +18,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::Import(cmd) => handle_import(cmd)?,
         Command::Stats => handle_stats()?,
+        Command::Usage(cmd) => handle_usage(cmd)?,
     }
     Ok(())
 }
@@ -39,6 +42,47 @@ enum Command {
     Import(ImportArgs),
     /// Show statistics about stored conversations
     Stats,
+    /// Inspect or refresh assistant allocation usage
+    Usage(UsageArgs),
+}
+
+#[derive(Args, Debug)]
+struct UsageArgs {
+    /// Assistant whose allocation should be inspected
+    #[arg(default_value = "codex")]
+    assistant: String,
+    /// Fetch a fresh observation from the assistant
+    #[arg(long)]
+    refresh: bool,
+    /// Deliver newly eligible desktop notifications
+    #[arg(long, requires = "refresh")]
+    notify: bool,
+    /// Suppress the human-readable report
+    #[arg(long)]
+    quiet: bool,
+    /// Source of this observation (manual, scheduled, session-start, session-exit)
+    #[arg(long, default_value = "manual")]
+    provenance: String,
+}
+
+fn handle_usage(args: &UsageArgs) -> Result<()> {
+    let assistant = args.assistant.to_lowercase();
+    if assistant != "codex" {
+        color_eyre::eyre::bail!(
+            "usage monitoring is not yet implemented for '{}'; currently supported: codex",
+            args.assistant
+        );
+    }
+    if args.refresh {
+        let observation = continuum_core::usage::refresh_codex_usage(&args.provenance)?;
+        if args.notify {
+            continuum_core::usage::notify_transitions(&observation)?;
+        }
+    }
+    if !args.quiet {
+        println!("{}", continuum_core::usage::render_usage(&assistant)?);
+    }
+    Ok(())
 }
 
 #[derive(Args, Debug)]
@@ -77,7 +121,10 @@ fn handle_import(args: &ImportArgs) -> Result<()> {
             import_claude_code_session(&writer, &adapter, args)
         }
         _ => {
-            eprintln!("Error: Unknown assistant '{}'. Supported: codex, goose, claude-code", args.assistant);
+            eprintln!(
+                "Error: Unknown assistant '{}'. Supported: codex, goose, claude-code",
+                args.assistant
+            );
             std::process::exit(1);
         }
     }
@@ -176,8 +223,19 @@ fn import_codex_session(
         )?;
     }
 
-    println!("✓ Imported {} messages from Codex session: {}", message_count, session_id);
-    println!("  Location: {}", writer.base_dir().join("codex").join(&date).join(session_id).display());
+    println!(
+        "✓ Imported {} messages from Codex session: {}",
+        message_count, session_id
+    );
+    println!(
+        "  Location: {}",
+        writer
+            .base_dir()
+            .join("codex")
+            .join(&date)
+            .join(session_id)
+            .display()
+    );
 
     Ok(())
 }
@@ -265,8 +323,19 @@ fn import_goose_session(
         )?;
     }
 
-    println!("✓ Imported {} messages from Goose session: {}", message_count, session_id);
-    println!("  Location: {}", writer.base_dir().join("goose").join(&date).join(session_id).display());
+    println!(
+        "✓ Imported {} messages from Goose session: {}",
+        message_count, session_id
+    );
+    println!(
+        "  Location: {}",
+        writer
+            .base_dir()
+            .join("goose")
+            .join(&date)
+            .join(session_id)
+            .display()
+    );
 
     Ok(())
 }
@@ -404,8 +473,19 @@ fn import_claude_code_session(
         )?;
     }
 
-    println!("✓ Imported {} messages from Claude Code session: {}", message_count, session_id);
-    println!("  Location: {}", writer.base_dir().join("claude-code").join(&date).join(session_id).display());
+    println!(
+        "✓ Imported {} messages from Claude Code session: {}",
+        message_count, session_id
+    );
+    println!(
+        "  Location: {}",
+        writer
+            .base_dir()
+            .join("claude-code")
+            .join(&date)
+            .join(session_id)
+            .display()
+    );
 
     Ok(())
 }

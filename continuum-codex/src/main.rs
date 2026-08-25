@@ -6,9 +6,9 @@
 // containing "continuum-codex", so a copy named `~/.local/bin/codex` re-spawned
 // itself forever. Resolution now skips our own executable by identity.
 
+use color_eyre::{eyre::Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use color_eyre::{eyre::Context, Result};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -34,15 +34,24 @@ fn main() -> Result<()> {
 
     let before_session = find_latest_session_file(&sessions_dir);
 
+    let interactive_launch = is_new_interactive_session(&args);
+    if interactive_launch {
+        if let Ok(Some(banner)) = continuum_core::usage::cached_banner("codex") {
+            eprintln!("{banner}");
+        }
+    }
+
     // Spawn codex as a child process
-    let status = Command::new(&real_codex)
+    let mut child = Command::new(&real_codex)
         .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn codex process")?
-        .wait()?;
+        .context("Failed to spawn codex process")?;
+    refresh_usage_detached("session-start");
+    let status = child.wait()?;
+    refresh_usage_detached("session-exit");
 
     // After codex exits, find the session that was just modified
     let after_session = find_latest_session_file(&sessions_dir);
@@ -77,6 +86,65 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(status.code().unwrap_or(1))
+}
+
+fn is_new_interactive_session(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return false;
+    }
+    let subcommands = [
+        "exec",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "mcp-server",
+        "app-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "resume",
+        "archive",
+        "delete",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    ];
+    !args.iter().any(|arg| subcommands.contains(&arg.as_str()))
+}
+
+fn refresh_usage_detached(provenance: &str) {
+    let continuum = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("continuum")))
+        .filter(|path| path.exists())
+        .or_else(|| which::which("continuum").ok());
+    let Some(continuum) = continuum else { return };
+    let _ = Command::new(continuum)
+        .args([
+            "usage",
+            "codex",
+            "--refresh",
+            "--notify",
+            "--quiet",
+            "--provenance",
+            provenance,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Locate the real OpenAI Codex CLI, never this wrapper (by any name).
@@ -172,10 +240,14 @@ fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path:
                                 for file_entry in files.flatten() {
                                     let file_path = file_entry.path();
 
-                                    if file_path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                                    if file_path.extension().and_then(|s| s.to_str())
+                                        == Some("jsonl")
+                                    {
                                         if let Ok(metadata) = std::fs::metadata(&file_path) {
                                             if let Ok(modified) = metadata.modified() {
-                                                if latest.is_none() || modified > latest.as_ref().unwrap().1 {
+                                                if latest.is_none()
+                                                    || modified > latest.as_ref().unwrap().1
+                                                {
                                                     latest = Some((file_path, modified));
                                                 }
                                             }
@@ -194,7 +266,9 @@ fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path:
 }
 
 fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::path::PathBuf> {
-    use continuum_core::{CodexLogEntry, MessageCompressor, PlainTextWriter, LoopDetector, LoopSeverity};
+    use continuum_core::{
+        CodexLogEntry, LoopDetector, LoopSeverity, MessageCompressor, PlainTextWriter,
+    };
     use std::io::{BufRead, BufReader};
 
     let writer = PlainTextWriter::new()?;
