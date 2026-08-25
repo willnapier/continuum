@@ -163,7 +163,7 @@ continuum usage codex --refresh
 
 The Codex wrapper prints a concise cached allocation banner when a new interactive session starts and refreshes the cache asynchronously at session start and exit. Background launchd/systemd jobs run every 30 minutes, so desktop opportunities remain visible even while Codex is closed.
 
-The initial policy sends an opportunity notification when a fixed-reset window has at most 48 hours left and at most 80% has been used, a later reminder inside six hours, and a reserve warning once usage reaches 85%. Notifications are deduplicated locally per vendor window. They are advisory: Continuum does not turn `/fast` on, restart a session, or notify a phone.
+The initial policy sends an opportunity notification when a fixed-reset window is in its final two-sevenths (capped at 48 hours) and at most 80% has been used, a later reminder halfway through that opportunity period (capped at six hours), and a reserve warning once usage reaches 85%. Scaling matters because Codex may expose both five-hour and weekly windows: a fresh short window should not be called imminent. Notifications are deduplicated locally per vendor window. They are advisory: Continuum does not turn `/fast` on, restart a session, or notify a phone.
 
 Raw vendor observations are retained losslessly under `~/Assistants/continuum-usage/observations/<machine>.jsonl`; the launch banner reads `~/Assistants/continuum-usage/latest/`. Notification delivery state remains machine-local under `~/.local/state/continuum/usage/`. This split permits future assistant adapters to preserve their own semantics while Continuum owns global history and presentation.
 

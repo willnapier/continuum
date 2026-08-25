@@ -49,6 +49,7 @@ pub struct VendorUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAssessment {
     pub seconds_to_reset: Option<i64>,
+    pub opportunity_lead_seconds: i64,
     pub opportunity: bool,
     pub reminder: bool,
     pub reserve_threat: bool,
@@ -179,10 +180,20 @@ pub fn load_latest(assistant: &str) -> Result<Option<UsageObservation>> {
 
 pub fn assess(observation: &UsageObservation, now: i64) -> UsageAssessment {
     let seconds_to_reset = observation.vendor.resets_at.map(|reset| reset - now);
-    let hours_to_reset = seconds_to_reset.map(|seconds| seconds.div_euclid(3600));
-    let opportunity = matches!(hours_to_reset, Some(0..=OPPORTUNITY_HOURS))
+    // The 48-hour design threshold was proposed for a 7-day vendor window.
+    // Scale it down for shorter windows so a fresh 5-hour window is not
+    // immediately labelled an expiry opportunity.
+    let proportional_lead = observation
+        .vendor
+        .window_duration_mins
+        .map(|minutes| minutes * 60 * 2 / 7)
+        .unwrap_or(OPPORTUNITY_HOURS * 3600);
+    let opportunity_lead_seconds = proportional_lead.min(OPPORTUNITY_HOURS * 3600);
+    let opportunity = matches!(seconds_to_reset, Some(seconds) if (0..=opportunity_lead_seconds).contains(&seconds))
         && observation.vendor.used_percent <= OPPORTUNITY_MAX_USED_PERCENT;
-    let reminder = opportunity && matches!(hours_to_reset, Some(0..=REMINDER_HOURS));
+    let reminder_lead_seconds = (opportunity_lead_seconds / 2).min(REMINDER_HOURS * 3600);
+    let reminder = opportunity
+        && matches!(seconds_to_reset, Some(seconds) if (0..=reminder_lead_seconds).contains(&seconds));
     let reserve_threat = observation.vendor.used_percent >= RESERVE_THREAT_USED_PERCENT;
     let reset_key = observation
         .vendor
@@ -196,6 +207,7 @@ pub fn assess(observation: &UsageObservation, now: i64) -> UsageAssessment {
         .unwrap_or("unknown-limit");
     UsageAssessment {
         seconds_to_reset,
+        opportunity_lead_seconds,
         opportunity,
         reminder,
         reserve_threat,
@@ -259,7 +271,7 @@ pub fn render_usage(assistant: &str) -> Result<String> {
         "normal"
     };
     Ok(format!(
-        "{} — {}\nRaw vendor observation\n  Used:              {}%\n  Remaining:         {}%\n  Window:            {} minutes ({})\n  Reset:             {}\n  Plan:              {}\n  Snapshot:          {} ({} old, {})\nDerived Continuum state\n  Time to reset:     {}\n  State:             {}\n  Opportunity rule:  <= {}h to reset and <= {}% used\n  Reserve rule:      >= {}% used",
+        "{} — {}\nRaw vendor observation\n  Used:              {}%\n  Remaining:         {}%\n  Window:            {} minutes ({})\n  Reset:             {}\n  Plan:              {}\n  Snapshot:          {} ({} old, {})\nDerived Continuum state\n  Time to reset:     {}\n  State:             {}\n  Opportunity rule:  <= {} and <= {}% used\n  Reserve rule:      >= {}% used",
         assistant,
         observation.vendor.limit_id.as_deref().unwrap_or("unknown limit"),
         observation.vendor.used_percent,
@@ -273,7 +285,7 @@ pub fn render_usage(assistant: &str) -> Result<String> {
         observation.provenance,
         remaining_time,
         state,
-        OPPORTUNITY_HOURS,
+        human_duration(assessment.opportunity_lead_seconds),
         OPPORTUNITY_MAX_USED_PERCENT,
         RESERVE_THREAT_USED_PERCENT,
     ))
@@ -576,6 +588,15 @@ mod tests {
         assert!(assess(&observation(40, 24), 1_000).opportunity);
         assert!(!assess(&observation(40, 72), 1_000).opportunity);
         assert!(!assess(&observation(90, 24), 1_000).opportunity);
+    }
+
+    #[test]
+    fn short_window_does_not_become_an_immediate_opportunity() {
+        let mut short = observation(10, 4);
+        short.vendor.window_duration_mins = Some(300);
+        assert!(!assess(&short, 1_000).opportunity);
+        short.vendor.resets_at = Some(1_000 + 60 * 60);
+        assert!(assess(&short, 1_000).opportunity);
     }
 
     #[test]
