@@ -40,33 +40,89 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
     Observation::failure(PROBE, VERSION, PROVIDER, kind, msg)
 }
 
+/// `Debug` deliberately omitted: this holds a live OAuth token, and a derived
+/// `Debug` is exactly how a secret ends up in a log line or a panic message.
+/// Tests assert on the error string instead, never on this value.
 struct Credentials {
     access_token: String,
     subscription: Option<String>,
 }
 
-fn read_credentials() -> Result<Credentials, Observation> {
-    let home = std::env::var("HOME")
-        .map_err(|_| fail(FailureKind::Unknown, "HOME is not set"))?;
+/// macOS keychain service under which Claude Code stores the credential blob.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Where the Claude Code credential actually lives, in the order we try.
+///
+/// **This is platform-dependent and getting it wrong is silent.** On Linux the
+/// JSON file is the live store. On macOS it is the *login keychain*, and
+/// `~/.claude/.credentials.json` is a stale artefact left behind by an older
+/// Claude Code: on the machine where this was found the file was frozen at
+/// 2026-07-25 while the keychain item's modification date tracked the current
+/// session. Reading only the file made every macOS observation report
+/// `InvalidCredentials` on a machine that was authenticated and working — a
+/// false negative that looked exactly like a real auth failure.
+///
+/// So macOS tries the keychain first and falls back to the file; every other
+/// platform reads the file, as before. Both are parsed by the same code, since
+/// the keychain item holds the same JSON blob.
+fn credential_sources() -> Vec<(&'static str, Box<dyn Fn() -> Result<String, String>>)> {
+    let mut sources: Vec<(&'static str, Box<dyn Fn() -> Result<String, String>>)> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    sources.push(("macOS login keychain", Box::new(read_keychain)));
+
+    sources.push(("~/.claude/.credentials.json", Box::new(read_credentials_file)));
+    sources
+}
+
+/// Read the credential blob from the macOS login keychain via `security`.
+///
+/// Shelling out rather than linking a Security-framework crate is deliberate:
+/// it adds no dependency, and `/usr/bin/security` is Apple-signed, so its
+/// keychain access is governed by the item's own ACL rather than by this
+/// binary's code signature — which matters here because the probe is rebuilt
+/// often and an ad-hoc signature changes identity on every rebuild.
+#[cfg(target_os = "macos")]
+fn read_keychain() -> Result<String, String> {
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .output()
+        .map_err(|e| format!("cannot run `security`: {e}"))?;
+    if !out.status.success() {
+        // Item absent, or the user declined the keychain prompt. Either way
+        // this is not fatal — the file fallback is tried next.
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("no keychain item for service {KEYCHAIN_SERVICE:?}")
+        } else {
+            err
+        });
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!("keychain item {KEYCHAIN_SERVICE:?} is empty"));
+    }
+    Ok(text)
+}
+
+fn read_credentials_file() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let path = format!("{home}/.claude/.credentials.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        fail(
-            FailureKind::InvalidCredentials,
-            format!("cannot read {path}: {e}"),
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| fail(FailureKind::InvalidCredentials, format!("{path} is not JSON: {e}")))?;
-    let oauth = value.get("claudeAiOauth").ok_or_else(|| {
-        fail(
-            FailureKind::InvalidCredentials,
-            "credentials file has no claudeAiOauth block",
-        )
-    })?;
+    std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))
+}
+
+/// Pull the OAuth token out of a Claude Code credential blob.
+fn parse_credentials(text: &str) -> Result<Credentials, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let oauth = value
+        .get("claudeAiOauth")
+        .ok_or_else(|| "no claudeAiOauth block".to_string())?;
     let access_token = oauth
         .get("accessToken")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| fail(FailureKind::InvalidCredentials, "no accessToken present"))?
+        .ok_or_else(|| "no accessToken present".to_string())?
         .to_string();
     Ok(Credentials {
         access_token,
@@ -79,9 +135,35 @@ fn read_credentials() -> Result<Credentials, Observation> {
     })
 }
 
+fn read_credentials() -> Result<Credentials, Observation> {
+    // Report every source tried, so a failure says which stores were consulted
+    // rather than implying the one hard-coded path is the only one there is.
+    let mut tried: Vec<String> = Vec::new();
+    for (label, load) in credential_sources() {
+        match load().and_then(|text| parse_credentials(&text)) {
+            Ok(creds) => return Ok(creds),
+            Err(why) => tried.push(format!("{label}: {why}")),
+        }
+    }
+    Err(fail(
+        FailureKind::InvalidCredentials,
+        format!("no usable Claude Code credential ({})", tried.join("; ")),
+    ))
+}
+
 /// Pull one `anthropic-ratelimit-unified-<window>-<field>` header.
 fn header<'a>(get: &'a dyn Fn(&str) -> Option<String>, window: &str, field: &str) -> Option<String> {
     get(&format!("anthropic-ratelimit-unified-{window}-{field}"))
+}
+
+/// Anthropic sends utilization as a 0..1 fraction. Refuse anything else rather
+/// than asserting it: a switch to percent would make 34.0 exceed every
+/// threshold and pin the window permanently `Critical`, and a non-finite value
+/// serialises as `null` into a non-optional field, which makes core discard the
+/// entire observation.
+fn fraction(raw: Option<String>) -> Option<f64> {
+    let v = raw?.parse::<f64>().ok()?;
+    (v.is_finite() && (0.0..=1.0).contains(&v)).then_some(v)
 }
 
 fn window_resource(
@@ -91,9 +173,18 @@ fn window_resource(
     window_secs: i64,
     representative: bool,
 ) -> Option<Resource> {
-    let utilization = header(&get, window, "utilization")?.parse::<f64>().ok();
-    let resets_at = header(&get, window, "reset").and_then(|v| v.parse::<i64>().ok());
     let status = header(&get, window, "status");
+    let resets_at = header(&get, window, "reset").and_then(|v| v.parse::<i64>().ok());
+    let utilization = fraction(header(&get, window, "utilization"));
+
+    // Gate on ANY of the three headers, not on utilization alone. A rejected
+    // window plausibly carries no meaningful percentage, and dropping the whole
+    // resource would discard `status` — the vendor's own verdict, and the most
+    // decision-relevant fact there is. Kept with utilization absent, it renders
+    // `NotAssessable` via `implies_capacity`, which is the truthful outcome.
+    if utilization.is_none() && resets_at.is_none() && status.is_none() {
+        return None;
+    }
 
     Some(Resource {
         id: format!("unified-{window}"),
@@ -120,8 +211,12 @@ fn window_resource(
 /// field — without it core would read the reset as perishable and cheerfully
 /// advise burning credit.
 fn overage_resource(get: &dyn Fn(&str) -> Option<String>) -> Option<Resource> {
-    let utilization = header(&get, "overage", "utilization")?.parse::<f64>().ok();
+    let status = header(&get, "overage", "status");
     let resets_at = header(&get, "overage", "reset").and_then(|v| v.parse::<i64>().ok());
+    let utilization = fraction(header(&get, "overage", "utilization"));
+    if utilization.is_none() && resets_at.is_none() && status.is_none() {
+        return None;
+    }
     Some(Resource {
         id: "unified-overage".to_string(),
         label: "Overage (credit spend)".to_string(),
@@ -137,7 +232,7 @@ fn overage_resource(get: &dyn Fn(&str) -> Option<String>) -> Option<Resource> {
             }),
             ..Default::default()
         },
-        vendor_status: header(&get, "overage", "status"),
+        vendor_status: status,
         vendor_representative: false,
     })
 }
@@ -255,4 +350,71 @@ fn probe() -> Observation {
         }));
     }
     obs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape Claude Code writes, in the file and in the keychain item alike
+    /// — which is the whole reason one parser serves both sources.
+    const BLOB: &str = r#"{"claudeAiOauth":{"accessToken":"tok-123","subscriptionType":"max"}}"#;
+
+    #[test]
+    fn parses_token_and_subscription() {
+        let c = parse_credentials(BLOB).expect("valid blob parses");
+        assert_eq!(c.access_token, "tok-123");
+        assert_eq!(c.subscription.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn subscription_is_optional() {
+        let c = parse_credentials(r#"{"claudeAiOauth":{"accessToken":"t"}}"#)
+            .expect("token alone is enough");
+        assert_eq!(c.subscription, None);
+    }
+
+    /// Each rejection must say which thing was missing: these messages are
+    /// joined into the failure envelope and are all a reader gets.
+    #[test]
+    fn rejects_malformed_blobs_with_a_reason() {
+        for (input, expect) in [
+            ("not json at all", "not JSON"),
+            (r#"{"somethingElse":{}}"#, "no claudeAiOauth block"),
+            (r#"{"claudeAiOauth":{}}"#, "no accessToken present"),
+            (r#"{"claudeAiOauth":{"accessToken":42}}"#, "no accessToken present"),
+        ] {
+            // Not `expect_err`: that would need `Debug` on `Credentials`, and
+            // deriving it would put a live token one panic away from a log.
+            let err = match parse_credentials(input) {
+                Ok(_) => panic!("{input:?} should have been rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(expect),
+                "{input:?} should report {expect:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Trailing whitespace matters: `security -w` emits a trailing newline, so
+    /// the keychain path hands us a string the file path never would.
+    #[test]
+    fn tolerates_trailing_newline_from_security_cli() {
+        let c = parse_credentials(&format!("{BLOB}\n")).expect("trailing newline is fine");
+        assert_eq!(c.access_token, "tok-123");
+    }
+
+    /// The file must stay in the list on every platform, and on macOS the
+    /// keychain must be tried FIRST — the stale-file bug was precisely the
+    /// wrong order.
+    #[test]
+    fn source_order_is_platform_correct() {
+        let labels: Vec<&str> = credential_sources().into_iter().map(|(l, _)| l).collect();
+        assert!(labels.contains(&"~/.claude/.credentials.json"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(labels[0], "macOS login keychain");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(labels.len(), 1);
+    }
 }
