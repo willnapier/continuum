@@ -150,9 +150,9 @@ Save this conversation? [Y/n/r]
 
 See **[QUALITY-CONTROL.md](QUALITY-CONTROL.md)** for complete documentation.
 
-### Resource Observatory
+### Usage monitoring (`usagewatch`)
 
-Cross-provider usage, scarcity, perishability, and notification monitoring is provided by `usagewatch` and standalone `usage-probe-*` executables. The original Codex-only `continuum usage` command, wrapper banner, and scheduler have been retired. See `~/Assistants/shared/RESOURCE-OBSERVATORY.md` for the current commands, schema, policy, and deployment model.
+Cross-provider usage, scarcity, perishability, and notification monitoring is provided by `usagewatch` and standalone `usage-probe-*` executables. The original Codex-only `continuum usage` command, wrapper banner, and scheduler have been retired. See `~/Assistants/shared/USAGEWATCH.md` for the current commands, schema, policy, and deployment model.
 
 ### Managed Codex CLI
 
