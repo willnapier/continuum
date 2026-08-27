@@ -66,12 +66,14 @@ fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Status) {
         Command::Status => {
-            let latest: Vec<_> = store.latest_per_probe()?.into_values().collect();
+            // Readings, not cadence markers — a skip means the existing reading
+            // is still fresh, so blanking the view would be backwards.
+            let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
             print!("{}", render::status(&latest, &policy, now));
         }
 
         Command::Alerts => {
-            let latest: Vec<_> = store.latest_per_probe()?.into_values().collect();
+            let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
             let alerts = render::alerts(&latest, &policy, now);
             if alerts.is_empty() {
                 println!("Nothing to flag.");
@@ -167,7 +169,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Raw { probe } => match store.latest_per_probe()?.get(&probe) {
+        Command::Raw { probe } => match store.latest_reading_per_probe()?.get(&probe) {
             Some(row) => println!("{}", serde_json::to_string_pretty(row)?),
             None => println!("No stored observation for probe `{probe}`."),
         },

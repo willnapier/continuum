@@ -243,21 +243,33 @@ impl Store {
         Ok(report)
     }
 
-    /// The newest row per probe, across machines. Ordering uses ingest time
-    /// because that is core-stamped; probe clocks are advisory.
+    /// The newest row per probe, across machines.
+    ///
+    /// Ordered by `(ingested_at_unix, sequence)`. The sequence tie-break is not
+    /// decoration: two writes commonly land in the same second, and comparing
+    /// timestamps alone silently keeps whichever was read first. Within a
+    /// machine the sequence is monotonic, which is the only sound ordering we
+    /// have — probe clocks are advisory and machine clocks skew.
     pub fn latest_per_probe(&self) -> Result<BTreeMap<String, StoredObservation>> {
-        let report = self.read_all()?;
-        let mut out: BTreeMap<String, StoredObservation> = BTreeMap::new();
-        for row in report.rows {
-            let key = row.observation.probe.name.clone();
-            match out.get(&key) {
-                Some(existing) if existing.ingested_at_unix >= row.ingested_at_unix => {}
-                _ => {
-                    out.insert(key, row);
+        Ok(newest_by_probe(self.read_all()?.rows.into_iter()))
+    }
+
+    /// The newest *reading* per probe — cadence markers excluded.
+    ///
+    /// A skip is bookkeeping, not a measurement. Letting it displace the last
+    /// real reading would mean any scheduled run blanked the status view, which
+    /// is precisely backwards: the reason we skipped is that the existing
+    /// reading is still fresh enough to use.
+    pub fn latest_reading_per_probe(&self) -> Result<BTreeMap<String, StoredObservation>> {
+        Ok(newest_by_probe(self.read_all()?.rows.into_iter().filter(|row| {
+            !matches!(
+                &row.observation.outcome,
+                crate::envelope::Outcome::Failure {
+                    kind: crate::envelope::FailureKind::SkippedByCadence,
+                    ..
                 }
-            }
-        }
-        Ok(out)
+            )
+        })))
     }
 
     // -- probe metadata ------------------------------------------------------
@@ -304,6 +316,26 @@ impl Store {
         fs::remove_file(&v1)?;
         Ok(count)
     }
+}
+
+/// Keep the newest row per probe, ordered by ingest time then sequence.
+fn newest_by_probe(
+    rows: impl Iterator<Item = StoredObservation>,
+) -> BTreeMap<String, StoredObservation> {
+    let mut out: BTreeMap<String, StoredObservation> = BTreeMap::new();
+    for row in rows {
+        let key = row.observation.probe.name.clone();
+        let newer = match out.get(&key) {
+            None => true,
+            Some(existing) => {
+                (row.ingested_at_unix, row.sequence) > (existing.ingested_at_unix, existing.sequence)
+            }
+        };
+        if newer {
+            out.insert(key, row);
+        }
+    }
+    out
 }
 
 fn sanitize(input: &str) -> String {
@@ -406,6 +438,38 @@ mod tests {
             .unwrap();
         let report = store.read_all().unwrap();
         assert_eq!(report.rows.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cadence_skip_does_not_displace_the_last_real_reading() {
+        let root = tmp_root("skipdisplace");
+        let store = Store::new(&root);
+        store
+            .append(Observation::ok("claude", "0.1.0", "anthropic", SideEffect::QuotaConsuming, vec![]))
+            .unwrap();
+        store
+            .append(Observation::failure(
+                "claude",
+                "core",
+                "anthropic",
+                FailureKind::SkippedByCadence,
+                "too soon",
+            ))
+            .unwrap();
+
+        // The raw view sees the marker...
+        let raw = store.latest_per_probe().unwrap();
+        assert!(matches!(
+            raw["claude"].observation.outcome,
+            crate::envelope::Outcome::Failure { .. }
+        ));
+        // ...but status must still show the measurement.
+        let reading = store.latest_reading_per_probe().unwrap();
+        assert!(matches!(
+            reading["claude"].observation.outcome,
+            crate::envelope::Outcome::Ok { .. }
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
