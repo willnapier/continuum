@@ -37,10 +37,12 @@ use continuum_usage_core::envelope::{
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const TOPUP_URL: &str = "https://cli-chat-proxy.grok.com/v1/auto-topup-rule";
 
-/// The vendor's credit unit appears to be **cents**: the CLI formats it with a
-/// `$` sign, and the auto top-up rule reads 5000 / 5000 / 10000, which is a
-/// natural $50 trigger, $50 top-up, $100 monthly cap. Treated as an assumption
-/// and recorded as one in the raw payload — the vendor does not document it.
+/// The vendor's credit unit is **cents**.
+///
+/// Confirmed by William 2026-08-27: the TUI renders his balance as `$41.31`,
+/// i.e. 4,131 credits. So a 15,500 monthly limit is $155.00 and the auto
+/// top-up rule reads $50 trigger / $50 top-up / $100 monthly cap. Undocumented
+/// by xAI, established by observation.
 const CENTS_PER_CREDIT: f64 = 1.0;
 
 const PROBE: &str = "grok";
@@ -220,6 +222,24 @@ fn parse_topup(v: &serde_json::Value) -> Option<TopupRule> {
 /// but purchasing began at 67.7%: the rule fires when 5,000 remain, not when
 /// zero do. Modelling the free portion as its own resource makes crossing that
 /// line a first-class scarcity signal instead of an invisible one.
+/// Money actually charged for auto top-ups this period.
+///
+/// Whole blocks, because that is how the card is billed, capped by the rule's
+/// monthly ceiling.
+fn purchased_usd(used: f64, free: f64, rule: &TopupRule) -> f64 {
+    let over = (used - free).max(0.0);
+    if over <= 0.0 || rule.amount <= 0.0 {
+        return 0.0;
+    }
+    let blocks = (over / rule.amount).ceil();
+    let max_blocks = if rule.max_per_month > 0.0 {
+        (rule.max_per_month / rule.amount).floor()
+    } else {
+        blocks
+    };
+    (blocks.min(max_blocks) * rule.amount * CENTS_PER_CREDIT) / 100.0
+}
+
 fn included_resource(billing: &serde_json::Value, rule: &TopupRule) -> Option<Resource> {
     let c = billing.get("config")?;
     let val = |k: &str| c.get(k).and_then(|v| v.get("val")).and_then(|v| v.as_f64());
@@ -244,8 +264,15 @@ fn included_resource(billing: &serde_json::Value, rule: &TopupRule) -> Option<Re
             expires_unused: Some(false),
             monetary: Some(Monetary {
                 currency: "USD".to_string(),
-                // What auto top-up has already bought this period.
-                spent: Some(((used - free).max(0.0) * CENTS_PER_CREDIT) / 100.0),
+                // What has actually been CHARGED, not what has been consumed.
+                //
+                // Top-ups are lumpy: crossing the trigger buys a whole $50
+                // block immediately, whether or not it gets used. William's
+                // balance read $41.31 of a $50 block while consumption past the
+                // included line was only ~$10.58 — so reporting consumption
+                // would understate the card charge by design. Round up to whole
+                // blocks, and cap at what the rule permits per month.
+                spent: Some(purchased_usd(used, free, rule)),
                 cap: Some((rule.max_per_month * CENTS_PER_CREDIT) / 100.0),
             }),
             ..Default::default()
@@ -442,7 +469,8 @@ fn probe() -> Observation {
             "credits_estimate": t.ticks as f64 / TICKS_PER_CREDIT,
             "billing": billing_note,
             "auto_topup_rule": topup_note,
-            "credit_unit_assumption": "credits treated as cents (the CLI formats them with a dollar sign; the rule reads as a 50 dollar trigger, 50 dollar top-up, 100 dollar monthly cap). Not documented by xAI - confirm against /usage in the TUI.",
+            "credit_unit": "cents - confirmed 2026-08-27 against the TUI balance ($41.31). Undocumented by xAI.",
+            "prepaid_balance": "not exposed by /v1/billing for this account (no isUnifiedBillingUser payload); read Credits left in the TUI",
         }));
     }
     obs
@@ -521,10 +549,26 @@ mod tests {
         // surplus, so "might as well" must not fire.
         assert_eq!(a.perishability, AxisState::Inapplicable);
 
-        // 1,058 credits bought so far, against a 10,000 monthly ceiling.
+        // 1,058 credits past the line triggers ONE whole $50 block, which is
+        // what the card is charged — not the $10.58 actually consumed.
         let m = r.facets.monetary.as_ref().unwrap();
-        assert!((m.spent.unwrap() - 10.58).abs() < 0.01, "got {:?}", m.spent);
+        assert_eq!(m.spent, Some(50.0), "top-ups are billed in whole blocks");
         assert_eq!(m.cap, Some(100.0));
+    }
+
+    #[test]
+    fn purchases_are_whole_blocks_and_respect_the_monthly_ceiling() {
+        let rule = parse_topup(&live_rule()).unwrap();
+        // Nothing past the line: no charge.
+        assert_eq!(purchased_usd(10_000.0, 10_500.0, &rule), 0.0);
+        // A single credit past it still buys a whole $50 block.
+        assert_eq!(purchased_usd(10_501.0, 10_500.0, &rule), 50.0);
+        // Exactly 5,000 past the line is still one block, not two.
+        assert_eq!(purchased_usd(15_500.0, 10_500.0, &rule), 50.0);
+        // Past 10,000 over, a second block is bought.
+        assert_eq!(purchased_usd(15_501.0, 10_500.0, &rule), 100.0);
+        // The rule permits at most two blocks a month, however far past you go.
+        assert_eq!(purchased_usd(99_999.0, 10_500.0, &rule), 100.0);
     }
 
     #[test]
