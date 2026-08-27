@@ -255,6 +255,25 @@ fn main() -> Result<()> {
                  (excluded from aggregation by design — a short history you can attribute\n\
                   beats a longer one you cannot)"
             );
+
+            let fold = store.fold_machine_ids()?;
+            if fold.is_empty() {
+                println!("machine ids: already folded, nothing to do");
+            } else {
+                println!(
+                    "machine ids: folded to lower case — {} row(s) rewritten, {} file(s) renamed",
+                    fold.rows_rewritten,
+                    fold.files_renamed.len()
+                );
+                for r in &fold.files_renamed {
+                    println!("  {r}");
+                }
+            }
+            // Conflicts are the case-sensitive shape of the same bug: two real
+            // files, two sequence counters. Reported loudly rather than merged.
+            for c in &fold.conflicts {
+                eprintln!("CONFLICT: {c}");
+            }
         }
     }
 

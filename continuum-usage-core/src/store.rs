@@ -379,6 +379,180 @@ impl Store {
         fs::remove_file(&v1)?;
         Ok(count)
     }
+
+    /// Fold legacy mixed-case machine ids onto the canonical `sanitize`d form.
+    ///
+    /// **Why this is needed at all.** Case-folding `machine_id` changed the id
+    /// this host *emits* but migrated nothing already on disk, and on macOS that
+    /// went unnoticed: **APFS is case-insensitive**, so the new lowercase path
+    /// resolved straight onto the existing capitalised files. Newly-created
+    /// files took the folded name while `observations/Williams-MacBook-Air-local.jsonl`
+    /// kept being appended to — leaving **one file holding two ids**, the older
+    /// rows under `Williams-MacBook-Air-local` and the newer under
+    /// `williams-macbook-air-local`. Anything grouping by `machine_id` then
+    /// counts one machine as two. On a case-sensitive filesystem the same change
+    /// yields two separate files instead — the same split, differently shaped.
+    ///
+    /// Idempotent: a store already folded reports zero and touches nothing.
+    pub fn fold_machine_ids(&self) -> Result<FoldReport> {
+        self.ensure_dirs()?;
+        let mut report = FoldReport::default();
+
+        // Observations carry the id twice — in the filename and in every row —
+        // and both must move together or the split simply changes shape.
+        for entry in fs::read_dir(self.observations_dir())? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let folded = sanitize(&stem);
+            if folded == stem {
+                continue;
+            }
+            let dest = self.observations_dir().join(format!("{folded}.jsonl"));
+            if dest.exists() && !is_same_file(&path, &dest) {
+                // A genuinely separate folded file already exists — the
+                // case-sensitive shape of this bug. Merging would have to
+                // reconcile two independent sequence counters, and a wrong
+                // merge is worse than a reported one. Surface it.
+                report.conflicts.push(format!(
+                    "{} and {} are both present and distinct; merge by hand",
+                    path.display(),
+                    dest.display()
+                ));
+                continue;
+            }
+            // Held across the rewrite and the rename, against a concurrent probe.
+            let _guard = self.lock(&folded)?;
+            report.rows_rewritten += rewrite_machine_id(&path, &folded)?;
+            rename_case_safe(&path, &dest)?;
+            report
+                .files_renamed
+                .push(format!("{stem}.jsonl -> {folded}.jsonl"));
+        }
+
+        // The per-machine state files carry the id only in their name.
+        for (prefix, suffix) in [
+            ("sequence-", ""),
+            ("notified-", ".json"),
+            ("probe-meta-", ".json"),
+        ] {
+            for entry in fs::read_dir(self.state_dir())? {
+                let path = entry?.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(rest) = name.strip_prefix(prefix) else {
+                    continue;
+                };
+                let Some(id) = rest.strip_suffix(suffix) else {
+                    continue;
+                };
+                let folded = sanitize(id);
+                if folded == id {
+                    continue;
+                }
+                let dest = self.state_dir().join(format!("{prefix}{folded}{suffix}"));
+                if dest.exists() && !is_same_file(&path, &dest) {
+                    report.conflicts.push(format!(
+                        "{} and {} are both present and distinct; merge by hand",
+                        path.display(),
+                        dest.display()
+                    ));
+                    continue;
+                }
+                rename_case_safe(&path, &dest)?;
+                report
+                    .files_renamed
+                    .push(format!("{name} -> {prefix}{folded}{suffix}"));
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+/// What `fold_machine_ids` changed. Conflicts are reported, never guessed at.
+#[derive(Debug, Default)]
+pub struct FoldReport {
+    pub rows_rewritten: usize,
+    pub files_renamed: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+impl FoldReport {
+    pub fn is_empty(&self) -> bool {
+        self.rows_rewritten == 0 && self.files_renamed.is_empty() && self.conflicts.is_empty()
+    }
+}
+
+/// Two paths resolving to one inode — which is exactly what names differing
+/// only in case do on a case-insensitive filesystem.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Rename via a temporary name.
+///
+/// **A direct rename would silently do nothing here.** On APFS `Foo.jsonl` and
+/// `foo.jsonl` are the same file, so `rename(from, to)` succeeds and leaves the
+/// original spelling on disk — the failure mode is a clean exit that changed
+/// nothing. Going through a third name forces the entry to be rewritten.
+fn rename_case_safe(from: &Path, to: &Path) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let tmp = to.with_file_name(format!(
+        "{}.case-fold-tmp",
+        to.file_name().and_then(|s| s.to_str()).unwrap_or("entry")
+    ));
+    fs::rename(from, &tmp)
+        .with_context(|| format!("renaming {} aside", from.display()))?;
+    fs::rename(&tmp, to).with_context(|| format!("renaming into {}", to.display()))?;
+    Ok(())
+}
+
+/// Rewrite `machine_id` on every row, returning how many rows changed.
+///
+/// Rows are edited as `Value`, not round-tripped through `StoredObservation`:
+/// a typed round-trip would silently drop any field this version does not know
+/// about, turning a migration into data loss.
+fn rewrite_machine_id(path: &Path, folded: &str) -> Result<usize> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut out = String::with_capacity(text.len());
+    let mut changed = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut v) => {
+                if v.get("machine_id").and_then(|m| m.as_str()) != Some(folded) {
+                    v["machine_id"] = serde_json::Value::String(folded.to_string());
+                    changed += 1;
+                }
+                out.push_str(&serde_json::to_string(&v)?);
+                out.push('\n');
+            }
+            // A malformed row is carried across verbatim. `read_all` already
+            // counts and skips these; dropping them here would make a migration
+            // quietly destructive.
+            Err(_) => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    fs::write(path, out).with_context(|| format!("rewriting {}", path.display()))?;
+    Ok(changed)
 }
 
 /// Keep the newest row per probe, ordered by ingest time then sequence.
@@ -721,6 +895,148 @@ mod tests {
             meta.get("claude").unwrap().last_side_effect,
             Some(SideEffect::QuotaConsuming)
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("usage-fold-test-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    fn row(machine: &str, seq: u64) -> String {
+        format!(
+            r#"{{"schema_version":2,"probe":{{"name":"p","version":"0"}},"provider":"x",
+"observed_at":"2026-08-27T00:00:00+00:00","outcome":"ok","side_effect":"passive",
+"resources":[],"machine_id":"{machine}","sequence":{seq},
+"ingested_at":"2026-08-27T00:00:00+00:00","ingested_at_unix":1,"extra_future_field":"keep me"}}"#
+        )
+        .replace('\n', "")
+    }
+
+    fn seed(root: &Path, id: &str) -> Store {
+        let store = Store::new(root);
+        store.ensure_dirs().unwrap();
+        fs::write(
+            store.observations_dir().join(format!("{id}.jsonl")),
+            format!("{}\n{}\n", row(id, 1), row(id, 2)),
+        )
+        .unwrap();
+        fs::write(store.state_dir().join(format!("sequence-{id}")), "2").unwrap();
+        fs::write(store.state_dir().join(format!("notified-{id}.json")), "{}").unwrap();
+        store
+    }
+
+    /// The Mac case: one file, capitalised name, rows carrying the old id.
+    #[test]
+    fn folds_filename_and_every_row() {
+        let root = tmp_root("basic");
+        let store = seed(&root, "Williams-MacBook-Air-local");
+
+        let r = store.fold_machine_ids().unwrap();
+        assert_eq!(r.rows_rewritten, 2);
+        assert!(r.conflicts.is_empty(), "unexpected conflicts: {:?}", r.conflicts);
+
+        let folded = store
+            .observations_dir()
+            .join("williams-macbook-air-local.jsonl");
+        let text = fs::read_to_string(&folded).unwrap();
+        assert!(text.contains(r#""machine_id":"williams-macbook-air-local""#));
+        assert!(!text.contains("Williams-MacBook-Air-local"));
+
+        // The state files must move with it, or the counter is orphaned.
+        assert!(store
+            .state_dir()
+            .join("sequence-williams-macbook-air-local")
+            .exists());
+        assert!(store
+            .state_dir()
+            .join("notified-williams-macbook-air-local.json")
+            .exists());
+
+        // On APFS the old spelling resolves to the same inode, so `exists()`
+        // cannot prove the rename. Read the directory and check the real name.
+        let names: Vec<String> = fs::read_dir(store.observations_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["williams-macbook-air-local.jsonl".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A migration that runs on every `migrate` must be safe to run twice.
+    #[test]
+    fn is_idempotent() {
+        let root = tmp_root("idempotent");
+        let store = seed(&root, "Mixed-Case-Host");
+        store.fold_machine_ids().unwrap();
+
+        let second = store.fold_machine_ids().unwrap();
+        assert!(second.is_empty(), "second run should be a no-op: {second:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Unknown fields must survive: rows are edited as `Value`, never
+    /// round-tripped through a typed struct that would drop them.
+    #[test]
+    fn preserves_fields_this_version_does_not_know() {
+        let root = tmp_root("unknown-fields");
+        let store = seed(&root, "Odd-Host");
+        store.fold_machine_ids().unwrap();
+
+        let text =
+            fs::read_to_string(store.observations_dir().join("odd-host.jsonl")).unwrap();
+        assert!(text.contains("extra_future_field"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A malformed row is carried across verbatim rather than dropped —
+    /// a migration must not be quietly destructive.
+    #[test]
+    fn carries_malformed_rows_across() {
+        let root = tmp_root("malformed");
+        let store = seed(&root, "Bad-Host");
+        let p = store.observations_dir().join("Bad-Host.jsonl");
+        let mut text = fs::read_to_string(&p).unwrap();
+        text.push_str("{ this is not json\n");
+        fs::write(&p, text).unwrap();
+
+        store.fold_machine_ids().unwrap();
+        let out = fs::read_to_string(store.observations_dir().join("bad-host.jsonl")).unwrap();
+        assert!(out.contains("{ this is not json"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two genuinely distinct files — the case-sensitive shape of the bug, and
+    /// reproducible on any filesystem via a character that sanitizes to `-`.
+    /// Two sequence counters cannot be merged by guesswork, so it is reported.
+    #[test]
+    fn reports_conflict_instead_of_merging() {
+        let root = tmp_root("conflict");
+        let store = seed(&root, "Host.One");
+        fs::write(
+            store.observations_dir().join("host-one.jsonl"),
+            format!("{}\n", row("host-one", 9)),
+        )
+        .unwrap();
+
+        let r = store.fold_machine_ids().unwrap();
+        assert_eq!(r.conflicts.len(), 1, "expected one conflict: {r:?}");
+        assert_eq!(r.rows_rewritten, 0, "must not rewrite when conflicted");
+        // Both files still there, untouched.
+        assert!(store.observations_dir().join("Host.One.jsonl").exists());
+        assert!(store.observations_dir().join("host-one.jsonl").exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 }
