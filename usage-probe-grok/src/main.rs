@@ -30,10 +30,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Observation, Outcome, Resource, SideEffect, WorkUnit,
+    Facets, FailureKind, KindHint, Measure, Monetary, Observation, Outcome, Resource, SideEffect,
+    WorkUnit,
 };
 
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
+const TOPUP_URL: &str = "https://cli-chat-proxy.grok.com/v1/auto-topup-rule";
+
+/// The vendor's credit unit appears to be **cents**: the CLI formats it with a
+/// `$` sign, and the auto top-up rule reads 5000 / 5000 / 10000, which is a
+/// natural $50 trigger, $50 top-up, $100 monthly cap. Treated as an assumption
+/// and recorded as one in the raw payload — the vendor does not document it.
+const CENTS_PER_CREDIT: f64 = 1.0;
 
 const PROBE: &str = "grok";
 const PROVIDER: &str = "xai";
@@ -178,6 +186,75 @@ fn parse_rfc3339(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value).ok().map(|d| d.timestamp())
 }
 
+/// The auto top-up rule, when one is configured and enabled.
+///
+/// This is where **real money** enters. Everything else about a subscription is
+/// prepaid and flat; a top-up is a purchase. The rule matters more than the
+/// balance, because it says *when* the purchasing starts — and it does not start
+/// at zero.
+struct TopupRule {
+    trigger_at_remaining: f64,
+    amount: f64,
+    max_per_month: f64,
+}
+
+fn parse_topup(v: &serde_json::Value) -> Option<TopupRule> {
+    let r = v.get("rule")?;
+    if !r.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let val = |k: &str| r.get(k).and_then(|x| x.get("val")).and_then(|x| x.as_f64());
+    Some(TopupRule {
+        trigger_at_remaining: val("minBeforeHittingSl")?.abs(),
+        // Emitted negative: they are charges against the account.
+        amount: val("topupAmount").unwrap_or(0.0).abs(),
+        max_per_month: val("maxAmountPerMonth").unwrap_or(0.0).abs(),
+    })
+}
+
+/// The portion of the monthly allowance that is genuinely included — i.e. what
+/// you can spend before auto top-up starts charging you.
+///
+/// This resource exists because the headline percentage is misleading when a
+/// top-up rule is armed. The allowance reads 75% used and sounds comfortable,
+/// but purchasing began at 67.7%: the rule fires when 5,000 remain, not when
+/// zero do. Modelling the free portion as its own resource makes crossing that
+/// line a first-class scarcity signal instead of an invisible one.
+fn included_resource(billing: &serde_json::Value, rule: &TopupRule) -> Option<Resource> {
+    let c = billing.get("config")?;
+    let val = |k: &str| c.get(k).and_then(|v| v.get("val")).and_then(|v| v.as_f64());
+    let limit = val("monthlyLimit")?;
+    let used = val("used")?;
+    let free = (limit - rule.trigger_at_remaining).max(0.0);
+    if free <= 0.0 {
+        return None;
+    }
+    Some(Resource {
+        id: "grok-included-before-topup".to_string(),
+        label: "Included (before top-up)".to_string(),
+        kind_hint: KindHint::ResetWindow,
+        facets: Facets {
+            utilization: Some((used / free).clamp(0.0, 1.0)),
+            consumed: Some(Measure::new(used, "credits")),
+            remaining: Some(Measure::new((free - used).max(0.0), "credits")),
+            limit: Some(Measure::new(free, "credits")),
+            resets_at: c.get("billingPeriodEnd").and_then(|v| v.as_str()).and_then(parse_rfc3339),
+            // Past this line you are buying, so unspent headroom below it is
+            // money not yet spent rather than surplus about to be lost.
+            expires_unused: Some(false),
+            monetary: Some(Monetary {
+                currency: "USD".to_string(),
+                // What auto top-up has already bought this period.
+                spent: Some(((used - free).max(0.0) * CENTS_PER_CREDIT) / 100.0),
+                cap: Some((rule.max_per_month * CENTS_PER_CREDIT) / 100.0),
+            }),
+            ..Default::default()
+        },
+        vendor_status: None,
+        vendor_representative: false,
+    })
+}
+
 /// The monthly included allowance, from the billing endpoint.
 fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resource> {
     let c = billing.get("config")?;
@@ -247,6 +324,8 @@ fn probe() -> Observation {
     // -- the readable half: monthly allowance --------------------------------
     let mut resources = vec![];
     let mut billing_note = serde_json::Value::Null;
+    let mut topup_note = serde_json::Value::Null;
+    let mut topup_rule: Option<TopupRule> = None;
     match read_token() {
         Err(e) => billing_note = serde_json::json!({ "billing_unavailable": e }),
         Ok(token) => {
@@ -258,6 +337,25 @@ fn probe() -> Observation {
                     |t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()),
                 ) {
                     Ok(billing) => {
+                        // The top-up rule is what turns a flat fee into real
+                        // spend, so fetch it before deciding what to show.
+                        if let Ok(resp) = ureq::get(TOPUP_URL)
+                            .set("authorization", &format!("Bearer {token}"))
+                            .timeout(std::time::Duration::from_secs(15))
+                            .call()
+                        {
+                            if let Ok(text) = resp.into_string() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    topup_rule = parse_topup(&v);
+                                    topup_note = v;
+                                }
+                            }
+                        }
+                        if let Some(rule) = &topup_rule {
+                            if let Some(r) = included_resource(&billing, rule) {
+                                resources.push(r);
+                            }
+                        }
                         if let Some(r) = monthly_resource(&billing, &t) {
                             resources.push(r);
                         }
@@ -343,6 +441,8 @@ fn probe() -> Observation {
             "cost_usd_ticks": t.ticks,
             "credits_estimate": t.ticks as f64 / TICKS_PER_CREDIT,
             "billing": billing_note,
+            "auto_topup_rule": topup_note,
+            "credit_unit_assumption": "credits treated as cents (the CLI formats them with a dollar sign; the rule reads as a 50 dollar trigger, 50 dollar top-up, 100 dollar monthly cap). Not documented by xAI - confirm against /usage in the TUI.",
         }));
     }
     obs
@@ -378,6 +478,67 @@ mod tests {
         assert_eq!(ts, 1_787_829_919, "timestamp is seconds, not millis");
         assert!(extract("{}").is_none());
         assert!(extract("not json").is_none());
+    }
+
+    // Verbatim from GET /v1/auto-topup-rule on nimbini, 2026-08-27.
+    fn live_rule() -> serde_json::Value {
+        serde_json::json!({"rule":{
+            "enabled": true,
+            "minBeforeHittingSl": {"val": 5000},
+            "topupAmount": {"val": -5000},
+            "maxAmountPerMonth": {"val": -10000}}})
+    }
+
+    #[test]
+    fn topup_amounts_are_absolute_despite_arriving_negative() {
+        let r = parse_topup(&live_rule()).expect("enabled rule");
+        assert_eq!(r.trigger_at_remaining, 5000.0);
+        assert_eq!(r.amount, 5000.0, "emitted as -5000; it is a charge, not a credit");
+        assert_eq!(r.max_per_month, 10000.0);
+    }
+
+    #[test]
+    fn a_disabled_rule_yields_nothing() {
+        let off = serde_json::json!({"rule":{"enabled": false, "minBeforeHittingSl":{"val":5000}}});
+        assert!(parse_topup(&off).is_none());
+        assert!(parse_topup(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn crossing_the_topup_trigger_is_critical_though_the_headline_looks_fine() {
+        // The whole point. 11,558 of 15,500 reads 75% and sounds comfortable,
+        // but the rule buys more once 5,000 remain — so the genuinely included
+        // portion is 10,500, and that was exhausted at 67.7%.
+        let rule = parse_topup(&live_rule()).unwrap();
+        let r = included_resource(&live_shape(), &rule).expect("resource");
+        assert_eq!(r.facets.limit.as_ref().unwrap().value, 10_500.0);
+        assert_eq!(r.facets.utilization, Some(1.0));
+        assert_eq!(r.facets.remaining.as_ref().unwrap().value, 0.0);
+
+        let a = assess(&r, &Policy::default(), 1_787_900_000, 0);
+        assert_eq!(a.scarcity, AxisState::Critical);
+        // Past this line you are buying; headroom below it is not perishable
+        // surplus, so "might as well" must not fire.
+        assert_eq!(a.perishability, AxisState::Inapplicable);
+
+        // 1,058 credits bought so far, against a 10,000 monthly ceiling.
+        let m = r.facets.monetary.as_ref().unwrap();
+        assert!((m.spent.unwrap() - 10.58).abs() < 0.01, "got {:?}", m.spent);
+        assert_eq!(m.cap, Some(100.0));
+    }
+
+    #[test]
+    fn below_the_trigger_nothing_has_been_bought() {
+        let rule = parse_topup(&live_rule()).unwrap();
+        let early = serde_json::json!({"config":{
+            "monthlyLimit":{"val":15500},"used":{"val":4000},
+            "billingPeriodEnd":"2026-09-01T00:00:00+00:00"}});
+        let r = included_resource(&early, &rule).expect("resource");
+        assert_eq!(r.facets.monetary.as_ref().unwrap().spent, Some(0.0));
+        assert_eq!(
+            assess(&r, &Policy::default(), 1_787_900_000, 0).scarcity,
+            AxisState::Healthy
+        );
     }
 
     #[test]
