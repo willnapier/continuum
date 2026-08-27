@@ -54,20 +54,39 @@ fn reset_cell(kind: KindHint, seconds: Option<i64>) -> String {
 
 /// Translate a resource into terms a person actually reasons in.
 ///
-/// Vendor units — "credits", "ticks" — are meaningless outside the vendor's own
-/// accounting. Money and time are not. Where a resource carries a monetary
-/// facet, show it; where a burn rate exists, show how long the remainder lasts.
+/// Vendor accounting units are meaningless outside the vendor's own books.
+/// Two things are not: **how much more work is left**, and **real money**.
+///
+/// Money appears only where money actually moves — a metered key, an overage
+/// meter. Pricing a flat-rate subscription allowance at list rates invents a
+/// figure the user never pays and implies a spend that is not happening; that
+/// is worse than showing the raw vendor unit, because a currency symbol is
+/// believed.
 fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
+    // Work first: it is the question a prepaid allowance actually answers.
+    if let Some(w) = &r.facets.work_unit {
+        if w.cost > 0.0 {
+            if let Some(rem) = &r.facets.remaining {
+                let units = (rem.value / w.cost).floor() as i64;
+                let plural = if units == 1 { "" } else { "s" };
+                return Some(format!(
+                    "≈ {units} more {}{plural} at your recent size (from {} this week)",
+                    w.label, w.observed
+                ));
+            }
+            return Some(format!("{} {}s this week", w.observed, w.label));
+        }
+    }
     let m = r.facets.monetary.as_ref()?;
     let sym = match m.currency.as_str() {
         "USD" => "$",
         "GBP" => "£",
         "EUR" => "€",
-        other => return Some(format!("{other} {:.0} spent", m.spent?)),
+        other => return Some(format!("{other} {:.2} spent", m.spent?)),
     };
     match (m.spent, m.cap) {
-        (Some(spent), Some(cap)) => Some(format!("≈ {sym}{spent:.0} of {sym}{cap:.0}")),
-        (Some(spent), None) => Some(format!("≈ {sym}{spent:.0} spent")),
+        (Some(spent), Some(cap)) => Some(format!("{sym}{spent:.2} of {sym}{cap:.2} spent")),
+        (Some(spent), None) => Some(format!("{sym}{spent:.2} spent")),
         _ => None,
     }
 }
@@ -259,21 +278,44 @@ mod tests {
     const NOW: i64 = 1_000_000;
 
     #[test]
-    fn money_is_shown_instead_of_a_meaningless_vendor_unit() {
+    fn a_prepaid_allowance_is_glossed_as_work_not_money() {
+        // William's real Grok numbers: 3,942 credits left, 16 sessions this
+        // week costing 6,523 => about 408 per session => about 9 sessions.
         let r = res(
             "grok-monthly-credits",
             KindHint::ResetWindow,
             Facets {
-                consumed: Some(crate::envelope::Measure::new(11_558.0, "credits")),
-                monetary: Some(Monetary {
-                    currency: "USD".into(),
-                    spent: Some(702.13),
-                    cap: Some(941.75),
+                remaining: Some(crate::envelope::Measure::new(3_942.0, "credits")),
+                work_unit: Some(crate::envelope::WorkUnit {
+                    label: "session".into(),
+                    cost: 6_523.0 / 16.0,
+                    observed: 16,
                 }),
                 ..Default::default()
             },
         );
-        assert_eq!(human_gloss(&r).as_deref(), Some("≈ $702 of $942"));
+        let g = human_gloss(&r).expect("gloss");
+        assert!(g.starts_with("≈ 9 more sessions"), "got {g}");
+        assert!(!g.contains('$'), "a flat-rate allowance must not be priced: {g}");
+        assert!(g.contains("from 16 this week"), "sample size must be visible: {g}");
+    }
+
+    #[test]
+    fn real_money_is_still_shown_where_money_actually_moves() {
+        // A metered key: billed per token, so pounds are the honest unit.
+        let r = res(
+            "dpa-spend",
+            KindHint::Continuous,
+            Facets {
+                monetary: Some(Monetary {
+                    currency: "GBP".into(),
+                    spent: Some(41.18),
+                    cap: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(human_gloss(&r).as_deref(), Some("£41.18 spent"));
     }
 
     #[test]

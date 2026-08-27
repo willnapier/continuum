@@ -127,6 +127,33 @@ impl Measure {
     }
 }
 
+/// How much of a resource one unit of real work costs.
+///
+/// Lets core answer "how much more can I do" without knowing anything about the
+/// vendor. A prepaid allowance denominated in the vendor's own accounting unit
+/// — "credits", "ticks", "units" — is meaningless to a person; the same
+/// allowance expressed as *sessions* is not.
+///
+/// This is emitted by probes as a **fact measured from their own history**, not
+/// as a verdict. `observed` carries the sample size so the estimate can be read
+/// with appropriate scepticism: work units vary enormously in size, and a
+/// figure drawn from four sessions deserves less trust than one drawn from
+/// forty.
+///
+/// Deliberately NOT money. Money is shown only where money actually moves —
+/// a metered key, an overage meter, a top-up purchase. Pricing a flat-rate
+/// subscription allowance at list rates invents a number the user never pays
+/// and implies a spend that is not happening.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkUnit {
+    /// Singular noun for one unit of work, e.g. `session`.
+    pub label: String,
+    /// Resource units consumed per work unit, in the resource's own unit.
+    pub cost: f64,
+    /// How many work units the estimate was measured over.
+    pub observed: u64,
+}
+
 /// Monetary consequences, when the provider exposes them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monetary {
@@ -170,6 +197,9 @@ pub struct Facets {
     pub expires_unused: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monetary: Option<Monetary>,
+    /// Translation from this resource's unit into units of real work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_unit: Option<WorkUnit>,
 }
 
 /// One measurable thing within a provider account.

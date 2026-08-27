@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Monetary, Observation, Outcome, Resource, SideEffect,
+    Facets, FailureKind, KindHint, Measure, Observation, Outcome, Resource, SideEffect, WorkUnit,
 };
 
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
@@ -64,16 +64,6 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
 /// figure as an estimate and the billing endpoint as authoritative.
 const TICKS_PER_CREDIT: f64 = 6.0e7;
 
-/// US dollars of list-price inference per credit.
-///
-/// `costUsdTicks / 1e9` is already a USD figure, so this is just
-/// `1e9 / TICKS_PER_CREDIT` expressed the useful way round: **a credit is about
-/// six cents**. "Credits" is a vendor unit that means nothing to a human; money
-/// and time do. The vendor unit stays in `consumed`/`limit` because that is what
-/// the endpoint actually said, and the translation rides alongside in
-/// `monetary` rather than replacing it.
-const USD_PER_CREDIT: f64 = TICKS_PER_CREDIT / 1.0e9;
-
 #[derive(Default)]
 struct Totals {
     input: u64,
@@ -83,6 +73,20 @@ struct Totals {
     sessions: u64,
     calls: u64,
     ticks: u64,
+}
+
+impl Totals {
+    /// Credits consumed per session, measured over this window.
+    ///
+    /// A session is a coarse unit — they range from two turns to hundreds — so
+    /// the sample size travels with it and core presents the result as an
+    /// estimate, never a promise.
+    fn session_cost_credits(&self) -> Option<f64> {
+        if self.sessions == 0 || self.ticks == 0 {
+            return None;
+        }
+        Some((self.ticks as f64 / TICKS_PER_CREDIT) / self.sessions as f64)
+    }
 }
 
 /// Pull the usage block out of one `updates.jsonl` line.
@@ -175,7 +179,7 @@ fn parse_rfc3339(value: &str) -> Option<i64> {
 }
 
 /// The monthly included allowance, from the billing endpoint.
-fn monthly_resource(billing: &serde_json::Value) -> Option<Resource> {
+fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resource> {
     let c = billing.get("config")?;
     let val = |k: &str| c.get(k).and_then(|v| v.get("val")).and_then(|v| v.as_f64());
     let limit = val("monthlyLimit")?;
@@ -194,11 +198,14 @@ fn monthly_resource(billing: &serde_json::Value) -> Option<Resource> {
             limit: Some(Measure::new(limit, "credits")),
             resets_at: end,
             window_secs: match (start, end) { (Some(s), Some(e)) => Some(e - s), _ => None },
-            // The human translation of the vendor's credit unit.
-            monetary: Some(Monetary {
-                currency: "USD".to_string(),
-                spent: Some(used * USD_PER_CREDIT),
-                cap: Some(limit * USD_PER_CREDIT),
+            // The human translation. NOT money: this allowance is prepaid by a
+            // flat subscription fee, so pricing it at API list rates would
+            // invent a figure that is never paid and imply a spend that is not
+            // happening. What a prepaid allowance actually buys is *work*.
+            work_unit: week.session_cost_credits().map(|cost| WorkUnit {
+                label: "session".to_string(),
+                cost,
+                observed: week.sessions,
             }),
             // An included monthly allowance does not roll over. With
             // `onDemandCap` at 0 there are no purchased credits behind it
@@ -237,7 +244,7 @@ fn probe() -> Observation {
 
     let t = scan(&root, week_start);
 
-    // -- the readable half: monthly credits ---------------------------------
+    // -- the readable half: monthly allowance --------------------------------
     let mut resources = vec![];
     let mut billing_note = serde_json::Value::Null;
     match read_token() {
@@ -251,7 +258,7 @@ fn probe() -> Observation {
                     |t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()),
                 ) {
                     Ok(billing) => {
-                        if let Some(r) = monthly_resource(&billing) {
+                        if let Some(r) = monthly_resource(&billing, &t) {
                             resources.push(r);
                         }
                         billing_note = billing;
@@ -292,11 +299,10 @@ fn probe() -> Observation {
             // so the two rows can be read against each other. The ceiling for
             // this pool is still unknown, so no limit is asserted.
             consumed: Some(Measure::new(t.ticks as f64 / TICKS_PER_CREDIT, "credits")),
-            // costUsdTicks / 1e9 is already dollars, straight from the vendor.
-            monetary: Some(Monetary {
-                currency: "USD".to_string(),
-                spent: Some(t.ticks as f64 / 1.0e9),
-                cap: None,
+            work_unit: t.session_cost_credits().map(|cost| WorkUnit {
+                label: "session".to_string(),
+                cost,
+                observed: t.sessions,
             }),
             // remaining, limit, utilization: deliberately absent. The vendor
             // exposes no ceiling locally, so we assert none.
@@ -375,6 +381,27 @@ mod tests {
     }
 
     #[test]
+    fn a_prepaid_allowance_carries_work_not_money() {
+        let week = Totals { sessions: 16, ticks: 391_402_543_200, ..Default::default() };
+        let r = monthly_resource(&live_shape(), &week).expect("parsed");
+        assert!(r.facets.monetary.is_none(), "a flat-rate allowance must not be priced");
+        let w = r.facets.work_unit.as_ref().expect("work unit");
+        assert_eq!(w.label, "session");
+        assert_eq!(w.observed, 16);
+        // 6,523 credits over 16 sessions.
+        assert!((w.cost - 6_523.4 / 16.0).abs() < 1.0, "got {}", w.cost);
+        // 3,942 remaining => about 9 sessions.
+        let left = (r.facets.remaining.as_ref().unwrap().value / w.cost).floor();
+        assert_eq!(left, 9.0, "got {left}");
+    }
+
+    #[test]
+    fn no_sessions_observed_means_no_work_estimate() {
+        let r = monthly_resource(&live_shape(), &Totals::default()).expect("parsed");
+        assert!(r.facets.work_unit.is_none(), "must not divide by zero sessions");
+    }
+
+    #[test]
     fn ticks_convert_to_credits_at_the_reconciled_rate() {
         // August on nimbini reconciled to within 1.2% of the billed figure.
         let august_ticks = 702_130_641_560f64;
@@ -386,7 +413,7 @@ mod tests {
 
     #[test]
     fn monthly_allowance_yields_real_remaining() {
-        let r = monthly_resource(&live_shape()).expect("parsed");
+        let r = monthly_resource(&live_shape(), &Totals::default()).expect("parsed");
         let u = r.facets.utilization.expect("utilization");
         assert!((u - 11558.0 / 15500.0).abs() < 1e-9, "got {u}");
         assert_eq!(r.facets.remaining.as_ref().unwrap().value, 15500.0 - 11558.0);
@@ -398,7 +425,7 @@ mod tests {
 
     #[test]
     fn monthly_allowance_perishes_so_might_as_well_applies() {
-        let r = monthly_resource(&live_shape()).expect("parsed");
+        let r = monthly_resource(&live_shape(), &Totals::default()).expect("parsed");
         assert_eq!(r.facets.expires_unused, Some(true));
 
         // Two days before the period ends, still under 80% used: surplus that
@@ -411,8 +438,8 @@ mod tests {
     #[test]
     fn a_billing_payload_without_a_limit_is_not_invented() {
         let bad = serde_json::json!({"config":{"used":{"val":10}}});
-        assert!(monthly_resource(&bad).is_none());
-        assert!(monthly_resource(&serde_json::json!({})).is_none());
+        assert!(monthly_resource(&bad, &Totals::default()).is_none());
+        assert!(monthly_resource(&serde_json::json!({}), &Totals::default()).is_none());
     }
 
     #[test]

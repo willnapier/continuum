@@ -18,7 +18,7 @@ pub mod store;
 
 pub use envelope::{
     Facets, FailureKind, KindHint, Measure, Monetary, Observation, ObservationCost, Outcome,
-    ProbeInfo, Resource, SideEffect, StoredObservation, SCHEMA_VERSION,
+    ProbeInfo, Resource, SideEffect, StoredObservation, WorkUnit, SCHEMA_VERSION,
 };
 pub use policy::{assess, Assessment, AxisState, Policy, POLICY_VERSION};
 pub use store::Store;
