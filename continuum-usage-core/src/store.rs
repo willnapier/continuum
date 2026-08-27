@@ -191,6 +191,7 @@ impl Store {
             .open(&path)
             .with_context(|| format!("appending to {}", path.display()))?;
         writeln!(f, "{line}")?;
+        restrict(&path);
 
         // Convenience pointer for cheap reads; the JSONL remains authoritative.
         let latest = self
@@ -206,6 +207,7 @@ impl Store {
         let path = self.quarantine_dir().join(format!("{reason}.jsonl"));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(f, "{}", serde_json::to_string(observation)?)?;
+        restrict(&path);
         Ok(())
     }
 
@@ -350,6 +352,22 @@ fn newest_by_probe(
     out
 }
 
+/// Restrict a file the store owns to owner-only.
+///
+/// Everything here lands in a Syncthing-replicated tree shared across machines
+/// and assistants, and default 0644 makes it readable by every local account.
+/// Observations are not secret by design, but a failure message can carry
+/// whatever a vendor library put in it, so the store defends in depth rather
+/// than trusting every probe to be careful.
+#[cfg(unix)]
+fn restrict(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path) {}
+
 fn sanitize(input: &str) -> String {
     input
         .chars()
@@ -369,6 +387,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id()
     ));
     fs::write(&tmp, bytes)?;
+    restrict(&tmp);
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -394,6 +413,24 @@ mod tests {
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.malformed, 0);
         assert!(report.rows[0].sequence >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root("perms");
+        let store = Store::new(&root);
+        store
+            .append(Observation::ok("codex", "0.1.0", "openai", SideEffect::Passive, vec![]))
+            .unwrap();
+        for dir in ["observations", "latest"] {
+            for e in fs::read_dir(root.join(dir)).unwrap().filter_map(|e| e.ok()) {
+                let mode = e.metadata().unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{:?} is {:o}", e.path(), mode);
+            }
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

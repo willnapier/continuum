@@ -55,10 +55,20 @@ fn read_key() -> Result<String, Observation> {
             format!("cannot read {path}: {e}"),
         )
     })?;
-    let doc: toml::Value = text.parse().map_err(|e| {
+    // NEVER interpolate the toml error's Display here. Unlike serde_json,
+    // `toml`'s Display echoes the offending SOURCE LINE verbatim — for a
+    // truncated or mis-quoted secrets.toml that line is `api_key = "sk-ant-...`,
+    // and this message travels into an append-only store inside a
+    // Syncthing-replicated tree. `message()` carries the reason without the
+    // source. Verified 2026-08-27: Display prints the key, message() does not.
+    let doc: toml::Value = text.parse::<toml::Value>().map_err(|e| {
         fail(
             FailureKind::InvalidCredentials,
-            format!("{path} is not valid TOML: {e}"),
+            format!(
+                "{path} is not valid TOML at line {}: {}",
+                e.span().map(|s| s.start).unwrap_or(0),
+                e.message()
+            ),
         )
     })?;
     doc.get("ai")

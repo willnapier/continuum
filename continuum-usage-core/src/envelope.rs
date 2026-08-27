@@ -317,7 +317,23 @@ impl Observation {
         }
     }
 
+    /// Hard cap on a failure message.
+    ///
+    /// Failure messages are the one place arbitrary vendor text reaches an
+    /// append-only store inside a replicated tree. Probes interpolate library
+    /// errors, JSON-RPC error objects and HTTP bodies into them, and any of
+    /// those can be unbounded or can echo their own input. Capping centrally
+    /// means no probe can bypass it by forgetting to truncate.
+    pub const MAX_FAILURE_MESSAGE: usize = 400;
+
     pub fn failure(probe: &str, version: &str, provider: &str, kind: FailureKind, msg: impl Into<String>) -> Self {
+        let msg: String = msg.into();
+        let msg = if msg.chars().count() > Self::MAX_FAILURE_MESSAGE {
+            let kept: String = msg.chars().take(Self::MAX_FAILURE_MESSAGE).collect();
+            format!("{kept}… [truncated]")
+        } else {
+            msg
+        };
         Self {
             schema_version: SCHEMA_VERSION,
             probe: ProbeInfo {
@@ -330,7 +346,7 @@ impl Observation {
             observed_at: now_rfc3339(),
             outcome: Outcome::Failure {
                 kind,
-                message: msg.into(),
+                message: msg,
                 raw: None,
             },
         }
@@ -431,6 +447,27 @@ mod tests {
         assert!(json.contains("quota-denied"));
         let back: Observation = serde_json::from_str(&json).unwrap();
         assert_eq!(obs, back);
+    }
+
+    #[test]
+    fn a_long_failure_message_is_capped() {
+        // Vendor error objects and HTTP bodies are unbounded; the store is not.
+        let huge = "x".repeat(10_000);
+        let obs = Observation::failure("codex", "1", "openai", FailureKind::Unknown, huge);
+        let Outcome::Failure { message, .. } = &obs.outcome else {
+            panic!("expected failure")
+        };
+        assert!(message.chars().count() <= Observation::MAX_FAILURE_MESSAGE + 16);
+        assert!(message.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn a_short_failure_message_is_untouched() {
+        let obs = Observation::failure("codex", "1", "openai", FailureKind::QuotaDenied, "402");
+        let Outcome::Failure { message, .. } = &obs.outcome else {
+            panic!("expected failure")
+        };
+        assert_eq!(message, "402");
     }
 
     #[test]
