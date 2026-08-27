@@ -17,7 +17,7 @@ use std::process::Command;
 use color_eyre::eyre::Result;
 
 use crate::envelope::{FailureKind, Outcome, StoredObservation};
-use crate::policy::{assess, AxisState, Policy};
+use crate::policy::{assess_with_history, Baselines, AxisState, Policy};
 
 /// Set this to silence delivery while keeping the decision logic live — useful
 /// in timers under test, and the escape hatch if the alerts ever get noisy.
@@ -55,7 +55,12 @@ fn window_key(resets_at: Option<i64>) -> String {
 /// Only `Approaching`, `Critical` and `Opportunity` qualify. `NotAssessable`
 /// never alerts — an unmeasurable resource is not an emergency, and crying wolf
 /// about Grok every ten minutes would train the alerts to be ignored.
-pub fn events(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec<Event> {
+pub fn events(
+    rows: &[StoredObservation],
+    baselines: &Baselines,
+    policy: &Policy,
+    now_unix: i64,
+) -> Vec<Event> {
     let mut out = vec![];
 
     for row in rows {
@@ -86,7 +91,7 @@ pub fn events(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec
         }
 
         for r in obs.resources() {
-            let a = assess(r, policy, now_unix, age);
+            let a = assess_with_history(probe, r, baselines, policy, now_unix, age);
             let wk = window_key(r.facets.resets_at);
             let used = a
                 .utilization
@@ -107,6 +112,16 @@ pub fn events(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec
                 _ => {}
             }
 
+            if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
+                out.push(Event {
+                    id: format!("{probe}:{}:scarcity:burnrate:{wk}", r.id),
+                    title: format!("{} burning fast", r.label),
+                    body: format!(
+                        "{used} used, but at the current rate it runs out {}h before the reset.",
+                        (a.seconds_to_reset.unwrap_or(0) - p.seconds_of_headroom) / 3600
+                    ),
+                });
+            }
             if a.perishability == AxisState::Opportunity {
                 let left = a
                     .seconds_to_reset
@@ -227,11 +242,11 @@ mod tests {
         let a = events(
             &[stored(Observation::ok("claude", "1", "anthropic", SideEffect::QuotaConsuming,
                 vec![window("w", 0.90, 600, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         let b = events(
             &[stored(Observation::ok("claude", "1", "anthropic", SideEffect::QuotaConsuming,
                 vec![window("w", 0.95, 600, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].id, b[0].id, "one window must yield one event");
 
@@ -239,7 +254,7 @@ mod tests {
         let c = events(
             &[stored(Observation::ok("claude", "1", "anthropic", SideEffect::QuotaConsuming,
                 vec![window("w", 0.90, 600 + 18_000, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert_ne!(a[0].id, c[0].id, "a new window is a new event");
     }
 
@@ -250,11 +265,11 @@ mod tests {
         let a = events(
             &[stored(Observation::ok("claude", "1", "anthropic", SideEffect::QuotaConsuming,
                 vec![window("w", 0.90, 600, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         let drifted = events(
             &[stored(Observation::ok("claude", "1", "anthropic", SideEffect::QuotaConsuming,
                 vec![window("w", 0.90, 603, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(a[0].id, drifted[0].id, "3s of drift must not be a new window");
     }
 
@@ -263,11 +278,11 @@ mod tests {
         let approaching = events(
             &[stored(Observation::ok("codex", "1", "openai", SideEffect::Passive,
                 vec![window("w", 0.78, 900, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         let critical = events(
             &[stored(Observation::ok("codex", "1", "openai", SideEffect::Passive,
                 vec![window("w", 0.90, 900, 18_000)]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert_ne!(approaching[0].id, critical[0].id, "escalation must not be deduped away");
     }
 
@@ -288,7 +303,7 @@ mod tests {
                     vendor_status: None,
                     vendor_representative: false,
                 }]))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert!(e.is_empty(), "{e:?}");
     }
 
@@ -296,14 +311,14 @@ mod tests {
     fn quota_denied_alerts_but_a_cadence_skip_does_not() {
         let denied = events(
             &[stored(Observation::failure("grok", "1", "xai", FailureKind::QuotaDenied, "402"))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(denied.len(), 1);
         assert!(denied[0].title.contains("exhausted"));
 
         let skipped = events(
             &[stored(Observation::failure("claude", "core", "anthropic",
                 FailureKind::SkippedByCadence, "too soon"))],
-            &Policy::default(), NOW);
+            &Baselines::new(), &Policy::default(), NOW);
         assert!(skipped.is_empty());
     }
 

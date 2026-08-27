@@ -8,7 +8,7 @@
 //! weekly one.
 
 use crate::envelope::{FailureKind, KindHint, Outcome, StoredObservation};
-use crate::policy::{assess, AxisState, Policy};
+use crate::policy::{assess_with_history, Baselines, AxisState, Policy};
 
 pub fn axis_cell(state: AxisState) -> String {
     match state {
@@ -60,7 +60,12 @@ fn pct(u: Option<f64>) -> String {
 }
 
 /// Full status across every probe with a stored observation.
-pub fn status(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> String {
+pub fn status(
+    rows: &[StoredObservation],
+    baselines: &Baselines,
+    policy: &Policy,
+    now_unix: i64,
+) -> String {
     let mut out = String::new();
     if rows.is_empty() {
         out.push_str("No observations yet. Run `usagewatch refresh`.\n");
@@ -98,7 +103,7 @@ pub fn status(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Str
                     "resource", "used", "scarcity", "perishable", "resets in"
                 ));
                 for r in resources {
-                    let a = assess(r, policy, now_unix, age);
+                    let a = assess_with_history(&obs.probe.name, r, baselines, policy, now_unix, age);
                     let star = if r.vendor_representative { " *" } else { "" };
                     out.push_str(&format!(
                         "  {:<22} {:>6}  {:<13} {:<13} {}{}\n",
@@ -109,6 +114,16 @@ pub fn status(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Str
                         reset_cell(r.kind_hint, a.seconds_to_reset),
                         star
                     ));
+                    if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
+                        out.push_str(&format!(
+                            "  {:<22} ↳ at the current rate this runs out in {}, {} before it resets\n",
+                            "",
+                            human_duration(p.seconds_of_headroom),
+                            human_duration(
+                                a.seconds_to_reset.unwrap_or(0) - p.seconds_of_headroom
+                            )
+                        ));
+                    }
                 }
             }
         }
@@ -119,7 +134,12 @@ pub fn status(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Str
 }
 
 /// Only what is worth interrupting William for.
-pub fn alerts(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec<String> {
+pub fn alerts(
+    rows: &[StoredObservation],
+    baselines: &Baselines,
+    policy: &Policy,
+    now_unix: i64,
+) -> Vec<String> {
     let mut out = vec![];
     for row in rows {
         let obs = &row.observation;
@@ -137,7 +157,7 @@ pub fn alerts(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec
         }
 
         for r in obs.resources() {
-            let a = assess(r, policy, now_unix, age);
+            let a = assess_with_history(&obs.probe.name, r, baselines, policy, now_unix, age);
             match a.scarcity {
                 AxisState::Critical => out.push(format!(
                     "{} / {}: {} used — approaching the ceiling",
@@ -152,6 +172,16 @@ pub fn alerts(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Vec
                     pct(a.utilization)
                 )),
                 _ => {}
+            }
+            if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
+                out.push(format!(
+                    "{} / {}: burning fast — {} used, runs out in {} but resets in {}",
+                    obs.probe.name,
+                    r.label,
+                    pct(a.utilization),
+                    human_duration(p.seconds_of_headroom),
+                    a.seconds_to_reset.map(human_duration).unwrap_or_default()
+                ));
             }
             if a.perishability == AxisState::Opportunity {
                 out.push(format!(
@@ -246,7 +276,7 @@ mod tests {
                 },
             )],
         );
-        let a = alerts(&[stored(obs, 10, NOW)], &Policy::default(), NOW);
+        let a = alerts(&[stored(obs, 10, NOW)], &Baselines::new(), &Policy::default(), NOW);
         assert!(a.is_empty(), "must never advise burning credit: {a:?}");
     }
 
@@ -269,7 +299,7 @@ mod tests {
                 },
             )],
         );
-        let a = alerts(&[stored(obs, 10, NOW)], &Policy::default(), NOW);
+        let a = alerts(&[stored(obs, 10, NOW)], &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(a.len(), 1);
         assert!(a[0].contains("might as well"), "{a:?}");
     }
@@ -283,7 +313,7 @@ mod tests {
             FailureKind::QuotaDenied,
             "402 balance exhausted",
         );
-        let a = alerts(&[stored(obs, 10, NOW)], &Policy::default(), NOW);
+        let a = alerts(&[stored(obs, 10, NOW)], &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(a.len(), 1);
         assert!(a[0].contains("EXHAUSTED"), "{a:?}");
     }
@@ -297,6 +327,6 @@ mod tests {
             FailureKind::SkippedByCadence,
             "too soon",
         );
-        assert!(alerts(&[stored(obs, 10, NOW)], &Policy::default(), NOW).is_empty());
+        assert!(alerts(&[stored(obs, 10, NOW)], &Baselines::new(), &Policy::default(), NOW).is_empty());
     }
 }

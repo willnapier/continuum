@@ -18,7 +18,58 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{Facets, KindHint, Resource};
+use std::collections::BTreeMap;
+
+use crate::envelope::{Facets, KindHint, Outcome, Resource, StoredObservation};
+
+/// Earliest reading of each resource within its *current* window, keyed by
+/// `(probe, resource id)`. The window is matched on `resets_at`, so a rollover
+/// starts a fresh baseline instead of averaging across two windows.
+pub type Baselines = BTreeMap<(String, String), (Resource, i64)>;
+
+/// Build baselines from stored history.
+pub fn baselines(rows: &[StoredObservation]) -> Baselines {
+    let mut out: Baselines = BTreeMap::new();
+    for row in rows {
+        let Outcome::Ok { resources, .. } = &row.observation.outcome else {
+            continue;
+        };
+        for r in resources {
+            let key = (row.observation.probe.name.clone(), r.id.clone());
+            match out.get(&key) {
+                // Same window and older: it is the better baseline.
+                Some((existing, at))
+                    if existing.facets.resets_at == r.facets.resets_at
+                        && *at <= row.ingested_at_unix => {}
+                // Different window: the old baseline belongs to a spent cycle.
+                Some((existing, _)) if existing.facets.resets_at != r.facets.resets_at => {
+                    out.insert(key, (r.clone(), row.ingested_at_unix));
+                }
+                _ => {
+                    out.insert(key, (r.clone(), row.ingested_at_unix));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Assess a resource, folding in a burn-rate projection when history allows.
+pub fn assess_with_history(
+    probe: &str,
+    resource: &Resource,
+    baselines: &Baselines,
+    policy: &Policy,
+    now_unix: i64,
+    age_secs: i64,
+) -> Assessment {
+    let base = assess(resource, policy, now_unix, age_secs);
+    let projection = baselines
+        .get(&(probe.to_string(), resource.id.clone()))
+        .filter(|(earlier, _)| earlier.facets.resets_at == resource.facets.resets_at)
+        .and_then(|(earlier, at)| project(earlier, *at, resource, now_unix));
+    apply_projection(base, projection)
+}
 
 /// Bump when thresholds or rules change. Recorded alongside every rendered
 /// verdict so an old assessment can be told apart from a current one.
@@ -145,6 +196,25 @@ impl Default for Policy {
     }
 }
 
+/// A burn-rate projection for one resource.
+///
+/// Utilization alone is a **lagging average** and it hides a burst. A monthly
+/// allowance can read a comfortable 75% while the last four days are running
+/// at seven times the earlier daily rate, so the remaining quarter will be gone
+/// days before the reset. Scarcity that only reads the level, never the slope,
+/// says "fine" right up until it says "empty".
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Projection {
+    /// Units consumed per second, measured between two observations.
+    pub rate_per_sec: f64,
+    /// When the remaining allowance runs out at that rate.
+    pub exhausted_at_unix: i64,
+    /// Whether that lands before the window resets.
+    pub exhausts_before_reset: bool,
+    /// Seconds of headroom left at the current rate.
+    pub seconds_of_headroom: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Assessment {
     pub resource_id: String,
@@ -153,6 +223,8 @@ pub struct Assessment {
     /// Seconds until the window turns over, when known.
     pub seconds_to_reset: Option<i64>,
     pub utilization: Option<f64>,
+    /// Present only when two observations in the same window allow a rate.
+    pub projection: Option<Projection>,
     pub policy_version: u32,
 }
 
@@ -160,6 +232,69 @@ impl Assessment {
     pub fn is_notable(&self) -> bool {
         self.scarcity.is_notable() || self.perishability.is_notable()
     }
+}
+
+/// Measure the burn rate between an earlier and a current reading of the same
+/// resource, and project it forward to the reset.
+///
+/// Returns `None` unless both readings carry a consumption figure in the same
+/// unit, the interval is positive, and consumption actually rose — a flat or
+/// falling counter means the window turned over and the comparison is void.
+pub fn project(
+    earlier: &Resource,
+    earlier_at: i64,
+    current: &Resource,
+    now_unix: i64,
+) -> Option<Projection> {
+    let (a, b) = (earlier.facets.consumed.as_ref()?, current.facets.consumed.as_ref()?);
+    if a.unit != b.unit {
+        return None;
+    }
+    let elapsed = now_unix - earlier_at;
+    let burned = b.value - a.value;
+    if elapsed <= 0 || burned <= 0.0 {
+        return None;
+    }
+    let remaining = match current.facets.remaining.as_ref() {
+        Some(r) if r.unit == b.unit => r.value,
+        _ => {
+            let limit = current.facets.limit.as_ref().filter(|l| l.unit == b.unit)?;
+            (limit.value - b.value).max(0.0)
+        }
+    };
+    let rate = burned / elapsed as f64;
+    let headroom = (remaining / rate) as i64;
+    let exhausted_at = now_unix + headroom;
+    Some(Projection {
+        rate_per_sec: rate,
+        exhausted_at_unix: exhausted_at,
+        exhausts_before_reset: current
+            .facets
+            .resets_at
+            .map(|r| exhausted_at < r)
+            .unwrap_or(false),
+        seconds_of_headroom: headroom,
+    })
+}
+
+/// Fold a projection into an existing assessment.
+///
+/// A resource projected to run dry before its window resets is `Critical`
+/// however low its current utilization reads — that is the whole point.
+pub fn apply_projection(mut assessment: Assessment, projection: Option<Projection>) -> Assessment {
+    if let Some(p) = projection {
+        if p.exhausts_before_reset
+            && matches!(assessment.scarcity, AxisState::Healthy | AxisState::Approaching)
+        {
+            assessment.scarcity = AxisState::Critical;
+        }
+        // Surplus you are on course to spend is not surplus.
+        if p.exhausts_before_reset && assessment.perishability == AxisState::Opportunity {
+            assessment.perishability = AxisState::Healthy;
+        }
+        assessment.projection = Some(p);
+    }
+    assessment
 }
 
 /// Derive a utilization for scarcity purposes, from whatever the probe supplied.
@@ -197,6 +332,7 @@ pub fn assess(resource: &Resource, policy: &Policy, now_unix: i64, age_secs: i64
             perishability: AxisState::Stale,
             seconds_to_reset,
             utilization: util,
+            projection: None,
             policy_version: policy.version,
         };
     }
@@ -261,6 +397,7 @@ pub fn assess(resource: &Resource, policy: &Policy, now_unix: i64, age_secs: i64
         perishability,
         seconds_to_reset,
         utilization: util,
+        projection: None,
         policy_version: policy.version,
     }
 }
@@ -412,6 +549,85 @@ mod tests {
         assert_eq!(a.utilization, Some(0.8));
         assert_eq!(a.scarcity, AxisState::Approaching);
         assert_eq!(a.perishability, AxisState::Inapplicable);
+    }
+
+    #[test]
+    fn a_burst_is_caught_even_though_utilization_reads_comfortable() {
+        // William's real Grok numbers, 2026-08-27. 11,558 of 15,500 credits
+        // used = 75%, under the 75% threshold, and four days to the reset.
+        // But 6,523 of that burned in the last four days: at that rate the
+        // remaining 3,942 lasts about 2.4 days, not 4.
+        let mk = |consumed: f64| Resource {
+            id: "grok-monthly-credits".into(),
+            label: "Monthly allowance".into(),
+            kind_hint: KindHint::ResetWindow,
+            facets: Facets {
+                utilization: Some(consumed / 15_500.0),
+                consumed: Some(Measure::new(consumed, "credits")),
+                remaining: Some(Measure::new(15_500.0 - consumed, "credits")),
+                limit: Some(Measure::new(15_500.0, "credits")),
+                resets_at: Some(1_788_220_800),
+                window_secs: Some(31 * 86_400),
+                expires_unused: Some(true),
+                ..Default::default()
+            },
+            vendor_status: None,
+            vendor_representative: true,
+        };
+        let four_days_ago = 1_788_220_800 - 8 * 86_400;
+        let now = 1_788_220_800 - 4 * 86_400;
+        let earlier = mk(11_558.0 - 6_523.0);
+        let current = mk(11_558.0);
+
+        let plain = assess(&current, &Policy::default(), now, 0);
+        assert_eq!(plain.scarcity, AxisState::Healthy, "the level alone looks fine");
+
+        let p = project(&earlier, four_days_ago, &current, now).expect("projection");
+        assert!(p.exhausts_before_reset, "must see it running dry early");
+        // ~2.4 days of headroom against 4 days to the reset.
+        assert!(p.seconds_of_headroom < 3 * 86_400, "got {}s", p.seconds_of_headroom);
+
+        let with = apply_projection(plain, Some(p));
+        assert_eq!(with.scarcity, AxisState::Critical, "the slope must override the level");
+    }
+
+    #[test]
+    fn a_projection_that_lands_after_the_reset_changes_nothing() {
+        let mk = |consumed: f64| Resource {
+            id: "r".into(),
+            label: "r".into(),
+            kind_hint: KindHint::ResetWindow,
+            facets: Facets {
+                utilization: Some(consumed / 1000.0),
+                consumed: Some(Measure::new(consumed, "credits")),
+                remaining: Some(Measure::new(1000.0 - consumed, "credits")),
+                resets_at: Some(NOW + 86_400),
+                expires_unused: Some(true),
+                ..Default::default()
+            },
+            vendor_status: None,
+            vendor_representative: false,
+        };
+        let p = project(&mk(10.0), NOW - 3600, &mk(11.0), NOW).expect("projection");
+        assert!(!p.exhausts_before_reset);
+        let a = apply_projection(assess(&mk(11.0), &Policy::default(), NOW, 0), Some(p));
+        assert_eq!(a.scarcity, AxisState::Healthy);
+    }
+
+    #[test]
+    fn a_window_rollover_voids_the_comparison() {
+        // Consumption fell, so the counter reset. No rate can be inferred.
+        let mk = |consumed: f64| Resource {
+            id: "r".into(), label: "r".into(), kind_hint: KindHint::ResetWindow,
+            facets: Facets {
+                consumed: Some(Measure::new(consumed, "credits")),
+                remaining: Some(Measure::new(100.0, "credits")),
+                ..Default::default()
+            },
+            vendor_status: None, vendor_representative: false,
+        };
+        assert!(project(&mk(900.0), NOW - 3600, &mk(5.0), NOW).is_none());
+        assert!(project(&mk(50.0), NOW - 3600, &mk(50.0), NOW).is_none(), "flat is not a rate");
     }
 
     #[test]

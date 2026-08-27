@@ -52,6 +52,18 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
     Observation::failure(PROBE, VERSION, PROVIDER, kind, msg)
 }
 
+/// Ticks per credit.
+///
+/// `costUsdTicks / 1e9` is a USD-like figure the TUI reports per turn. The
+/// billing endpoint's `used` counter runs in credits, and the two reconcile at
+/// this divisor: August on nimbini summed to 702,130,641,560 ticks = 11,702
+/// credits against a billed `used` of 11,558 — within 1.2%. So one credit is
+/// roughly six cents of list-price inference.
+///
+/// Derived by reconciliation, not documented by the vendor. Treat the credit
+/// figure as an estimate and the billing endpoint as authoritative.
+const TICKS_PER_CREDIT: f64 = 6.0e7;
+
 #[derive(Default)]
 struct Totals {
     input: u64,
@@ -59,6 +71,22 @@ struct Totals {
     cached: u64,
     turns: u64,
     sessions: u64,
+    calls: u64,
+    ticks: u64,
+}
+
+/// Pull the usage block out of one `updates.jsonl` line.
+///
+/// The record is `params.update.usage` with **camelCase** fields. An earlier
+/// version of this probe guessed `turn_completed.usage` with snake_case and
+/// silently summed zero for every session — which is why `extract` is a named,
+/// tested function rather than an inline chain.
+fn extract(line: &str) -> Option<(serde_json::Value, i64)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let usage = v.pointer("/params/update/usage")?.clone();
+    // Seconds, not millis — `_meta.agentTimestampMs` is the millisecond one.
+    let ts = v.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+    Some((usage, ts))
 }
 
 /// Walk `~/.grok/sessions/**/updates.jsonl`, summing completed turns since
@@ -79,16 +107,6 @@ fn scan(root: &PathBuf, since_unix: i64) -> Totals {
             if path.file_name().and_then(|n| n.to_str()) != Some("updates.jsonl") {
                 continue;
             }
-            // Cheap pre-filter: a file untouched since the cutoff holds nothing new.
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) {
-                        if (age.as_secs() as i64) < since_unix {
-                            continue;
-                        }
-                    }
-                }
-            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -97,21 +115,26 @@ fn scan(root: &PathBuf, since_unix: i64) -> Totals {
                 if !line.contains("turn_completed") {
                     continue;
                 }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                // Filter on the record's own timestamp, not the file's mtime:
+                // a long-lived session file spans weeks, so mtime would either
+                // include the whole file or exclude all of it.
+                let Some((usage, ts)) = extract(line) else {
                     continue;
                 };
-                let Some(usage) = v.pointer("/turn_completed/usage") else {
+                if ts < since_unix {
                     continue;
-                };
+                }
                 t.turns += 1;
                 if !counted_session {
                     t.sessions += 1;
                     counted_session = true;
                 }
                 let n = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                t.input += n("input_tokens");
-                t.output += n("output_tokens");
-                t.cached += n("cached_read_tokens") + n("cache_read_input_tokens");
+                t.input += n("inputTokens");
+                t.output += n("outputTokens");
+                t.cached += n("cachedReadTokens");
+                t.calls += n("modelCalls");
+                t.ticks += n("costUsdTicks");
             }
         }
     }
@@ -249,7 +272,10 @@ fn probe() -> Observation {
         // core to say "cannot measure" instead of inventing a percentage.
         kind_hint: KindHint::Consumption,
         facets: Facets {
-            consumed: Some(Measure::new((t.input + t.output) as f64, "tokens")),
+            // Expressed in *credits*, the same unit as the monthly allowance,
+            // so the two rows can be read against each other. The ceiling for
+            // this pool is still unknown, so no limit is asserted.
+            consumed: Some(Measure::new(t.ticks as f64 / TICKS_PER_CREDIT, "credits")),
             // remaining, limit, utilization: deliberately absent. The vendor
             // exposes no ceiling locally, so we assert none.
             //
@@ -282,9 +308,12 @@ fn probe() -> Observation {
                      Remaining balance is not exposed locally — read /usage in the TUI.",
             "turns": t.turns,
             "sessions": t.sessions,
+            "model_calls": t.calls,
             "input_tokens": t.input,
             "output_tokens": t.output,
             "cached_read_tokens": t.cached,
+            "cost_usd_ticks": t.ticks,
+            "credits_estimate": t.ticks as f64 / TICKS_PER_CREDIT,
             "billing": billing_note,
         }));
     }
@@ -305,6 +334,32 @@ mod tests {
             "billingPeriodStart":"2026-08-01T00:00:00+00:00",
             "billingPeriodEnd":"2026-09-01T00:00:00+00:00",
             "history":[]}})
+    }
+
+    // A real line from ~/.grok/sessions/**/updates.jsonl, trimmed.
+    const REAL_LINE: &str = r#"{"timestamp":1787829919,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p","stop_reason":"end_turn","usage":{"inputTokens":17191,"outputTokens":478,"totalTokens":17669,"cachedReadTokens":11520,"cacheCreationTokens":0,"reasoningTokens":433,"modelCalls":1,"apiDurationMs":7416,"costUsdTicks":33949000}}}}"#;
+
+    #[test]
+    fn extract_reads_the_real_record_shape() {
+        // Regression guard. The first version of this probe looked for
+        // `turn_completed.usage` with snake_case fields, matched nothing, and
+        // reported zero consumption for every session without erroring.
+        let (usage, ts) = extract(REAL_LINE).expect("usage extracted");
+        assert_eq!(usage.get("inputTokens").and_then(|v| v.as_u64()), Some(17191));
+        assert_eq!(usage.get("costUsdTicks").and_then(|v| v.as_u64()), Some(33_949_000));
+        assert_eq!(ts, 1_787_829_919, "timestamp is seconds, not millis");
+        assert!(extract("{}").is_none());
+        assert!(extract("not json").is_none());
+    }
+
+    #[test]
+    fn ticks_convert_to_credits_at_the_reconciled_rate() {
+        // August on nimbini reconciled to within 1.2% of the billed figure.
+        let august_ticks = 702_130_641_560f64;
+        let credits = august_ticks / TICKS_PER_CREDIT;
+        assert!((credits - 11_702.0).abs() < 1.0, "got {credits}");
+        let billed = 11_558.0;
+        assert!((credits - billed).abs() / billed < 0.02, "drifted from the billed figure");
     }
 
     #[test]

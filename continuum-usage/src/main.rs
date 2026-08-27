@@ -12,7 +12,7 @@ use color_eyre::eyre::Result;
 use continuum_usage_core::{
     discover::{self, Probe},
     envelope::{FailureKind, Outcome},
-    policy::Policy,
+    policy::{self, Policy},
     notify::{self, DedupLog},
     render,
     store::Store,
@@ -75,13 +75,17 @@ fn main() -> Result<()> {
         Command::Status => {
             // Readings, not cadence markers — a skip means the existing reading
             // is still fresh, so blanking the view would be backwards.
+            let history = store.read_all()?.rows;
+            let base = policy::baselines(&history);
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
-            print!("{}", render::status(&latest, &policy, now));
+            print!("{}", render::status(&latest, &base, &policy, now));
         }
 
         Command::Alerts => {
+            let history = store.read_all()?.rows;
+            let base = policy::baselines(&history);
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
-            let alerts = render::alerts(&latest, &policy, now);
+            let alerts = render::alerts(&latest, &base, &policy, now);
             if alerts.is_empty() {
                 println!("Nothing to flag.");
             }
@@ -92,7 +96,8 @@ fn main() -> Result<()> {
 
         Command::Notify { dry_run } => {
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
-            let events = notify::events(&latest, &policy, now);
+            let base = policy::baselines(&store.read_all()?.rows);
+            let events = notify::events(&latest, &base, &policy, now);
             let machine = Store::machine_id().unwrap_or_else(|| "unknown".into());
             let mut log = DedupLog::load(&store.state_dir_public(), &machine);
 
