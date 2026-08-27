@@ -98,6 +98,33 @@ fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
     }
 }
 
+/// Note when a resource's ceiling has moved during the current window.
+///
+/// A limit that rises mid-period is not a neutral fact: **somebody bought
+/// more.** Grok raises `monthlyLimit` by one top-up block per purchase, so the
+/// ceiling is the only visible trace of a charge — the API exposes no purchase
+/// history and no prepaid balance. Detecting the movement is therefore the only
+/// way the observatory can see real money being spent on that account.
+///
+/// Vendor-neutral by construction: it compares a resource against its own
+/// earlier reading and knows nothing about who raised it or why.
+fn limit_change(baseline: Option<&crate::envelope::Resource>, current: &crate::envelope::Resource) -> Option<String> {
+    let (was, now) = (
+        baseline?.facets.limit.as_ref()?,
+        current.facets.limit.as_ref()?,
+    );
+    if now.value <= was.value || was.unit != now.unit {
+        return None;
+    }
+    Some(format!(
+        "ceiling raised {} → {} {} this period (+{}) — something was purchased",
+        scale(was.value),
+        scale(now.value),
+        now.unit,
+        scale(now.value - was.value)
+    ))
+}
+
 /// Round large counts to something readable: 139000000 -> 139M.
 fn scale(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -173,6 +200,14 @@ pub fn status(
                     ));
                     if let Some(g) = human_gloss(r) {
                         out.push_str(&format!("  {:<22} ↳ {g}\n", ""));
+                    }
+                    if let Some(c) = limit_change(
+                        baselines
+                            .get(&(obs.probe.name.clone(), r.id.clone()))
+                            .map(|(res, _)| res),
+                        r,
+                    ) {
+                        out.push_str(&format!("  {:<22} ↳ {c}\n", ""));
                     }
                     if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
                         out.push_str(&format!(
@@ -334,6 +369,29 @@ mod tests {
             },
         );
         assert_eq!(human_gloss(&r).as_deref(), Some("£41.18 spent"));
+    }
+
+    #[test]
+    fn a_raised_ceiling_is_reported_as_a_purchase() {
+        // Grok raises monthlyLimit by one 5,000-credit block per $50 top-up,
+        // and that movement is the only trace of the charge the API offers.
+        let mk = |limit: f64| res(
+            "grok-monthly-credits",
+            KindHint::ResetWindow,
+            Facets {
+                limit: Some(crate::envelope::Measure::new(limit, "credits")),
+                ..Default::default()
+            },
+        );
+        let note = limit_change(Some(&mk(10_500.0)), &mk(15_500.0)).expect("change noted");
+        assert!(note.contains("10k"), "{note}");
+        assert!(note.contains("16k") || note.contains("15k"), "{note}");
+        assert!(note.contains("purchased"), "{note}");
+
+        // Unchanged, or falling (a reset), is not a purchase.
+        assert!(limit_change(Some(&mk(15_500.0)), &mk(15_500.0)).is_none());
+        assert!(limit_change(Some(&mk(15_500.0)), &mk(5_500.0)).is_none());
+        assert!(limit_change(None, &mk(15_500.0)).is_none());
     }
 
     #[test]
