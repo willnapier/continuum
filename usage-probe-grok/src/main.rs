@@ -97,6 +97,31 @@ impl Totals {
         }
         Some((self.ticks as f64 / TICKS_PER_CREDIT) / self.sessions as f64)
     }
+
+    /// Credits per token, at the mix actually observed.
+    ///
+    /// Not a published rate and not a constant: it depends heavily on how much
+    /// of the context is cache-read, which for these sessions is around 93%. It
+    /// is an honest answer to "how many tokens is my allowance worth" only for
+    /// work shaped like the work already done.
+    fn token_cost_credits(&self) -> Option<f64> {
+        let tokens = self.input + self.output;
+        if tokens == 0 || self.ticks == 0 {
+            return None;
+        }
+        Some((self.ticks as f64 / TICKS_PER_CREDIT) / tokens as f64)
+    }
+
+    fn work_units(&self) -> Vec<WorkUnit> {
+        let mut out = vec![];
+        if let Some(cost) = self.token_cost_credits() {
+            out.push(WorkUnit { label: "token".to_string(), cost, observed: self.sessions });
+        }
+        if let Some(cost) = self.session_cost_credits() {
+            out.push(WorkUnit { label: "session".to_string(), cost, observed: self.sessions });
+        }
+        out
+    }
 }
 
 /// Pull the usage block out of one `updates.jsonl` line.
@@ -190,6 +215,16 @@ fn parse_rfc3339(value: &str) -> Option<i64> {
 
 /// The auto top-up rule, when one is configured and enabled.
 ///
+/// **Retained as evidence, not used to derive a resource.** An earlier version
+/// synthesised an "Included (before top-up)" row by treating
+/// `minBeforeHittingSl` as a threshold on the *monthly allowance*, concluding
+/// that purchasing began at 67.7% used. That was an unverified reading: the
+/// field plausibly watches a prepaid balance instead, and the account also
+/// reports `onDemandCap: 0`, which suggests on-demand billing may not be active
+/// at all. Two readings fit the same data, so the row asserted a distinction
+/// that may not exist and has been withdrawn. The rule travels in the raw
+/// payload where it can be read without being interpreted.
+///
 /// This is where **real money** enters. Everything else about a subscription is
 /// prepaid and flat; a top-up is a purchase. The rule matters more than the
 /// balance, because it says *when* the purchasing starts — and it does not start
@@ -211,74 +246,6 @@ fn parse_topup(v: &serde_json::Value) -> Option<TopupRule> {
         // Emitted negative: they are charges against the account.
         amount: val("topupAmount").unwrap_or(0.0).abs(),
         max_per_month: val("maxAmountPerMonth").unwrap_or(0.0).abs(),
-    })
-}
-
-/// The portion of the monthly allowance that is genuinely included — i.e. what
-/// you can spend before auto top-up starts charging you.
-///
-/// This resource exists because the headline percentage is misleading when a
-/// top-up rule is armed. The allowance reads 75% used and sounds comfortable,
-/// but purchasing began at 67.7%: the rule fires when 5,000 remain, not when
-/// zero do. Modelling the free portion as its own resource makes crossing that
-/// line a first-class scarcity signal instead of an invisible one.
-/// Money actually charged for auto top-ups this period.
-///
-/// Whole blocks, because that is how the card is billed, capped by the rule's
-/// monthly ceiling.
-fn purchased_usd(used: f64, free: f64, rule: &TopupRule) -> f64 {
-    let over = (used - free).max(0.0);
-    if over <= 0.0 || rule.amount <= 0.0 {
-        return 0.0;
-    }
-    let blocks = (over / rule.amount).ceil();
-    let max_blocks = if rule.max_per_month > 0.0 {
-        (rule.max_per_month / rule.amount).floor()
-    } else {
-        blocks
-    };
-    (blocks.min(max_blocks) * rule.amount * CENTS_PER_CREDIT) / 100.0
-}
-
-fn included_resource(billing: &serde_json::Value, rule: &TopupRule) -> Option<Resource> {
-    let c = billing.get("config")?;
-    let val = |k: &str| c.get(k).and_then(|v| v.get("val")).and_then(|v| v.as_f64());
-    let limit = val("monthlyLimit")?;
-    let used = val("used")?;
-    let free = (limit - rule.trigger_at_remaining).max(0.0);
-    if free <= 0.0 {
-        return None;
-    }
-    Some(Resource {
-        id: "grok-included-before-topup".to_string(),
-        label: "Included (before top-up)".to_string(),
-        kind_hint: KindHint::ResetWindow,
-        facets: Facets {
-            utilization: Some((used / free).clamp(0.0, 1.0)),
-            consumed: Some(Measure::new(used, "credits")),
-            remaining: Some(Measure::new((free - used).max(0.0), "credits")),
-            limit: Some(Measure::new(free, "credits")),
-            resets_at: c.get("billingPeriodEnd").and_then(|v| v.as_str()).and_then(parse_rfc3339),
-            // Past this line you are buying, so unspent headroom below it is
-            // money not yet spent rather than surplus about to be lost.
-            expires_unused: Some(false),
-            monetary: Some(Monetary {
-                currency: "USD".to_string(),
-                // What has actually been CHARGED, not what has been consumed.
-                //
-                // Top-ups are lumpy: crossing the trigger buys a whole $50
-                // block immediately, whether or not it gets used. William's
-                // balance read $41.31 of a $50 block while consumption past the
-                // included line was only ~$10.58 — so reporting consumption
-                // would understate the card charge by design. Round up to whole
-                // blocks, and cap at what the rule permits per month.
-                spent: Some(purchased_usd(used, free, rule)),
-                cap: Some((rule.max_per_month * CENTS_PER_CREDIT) / 100.0),
-            }),
-            ..Default::default()
-        },
-        vendor_status: None,
-        vendor_representative: false,
     })
 }
 
@@ -306,11 +273,7 @@ fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resour
             // flat subscription fee, so pricing it at API list rates would
             // invent a figure that is never paid and imply a spend that is not
             // happening. What a prepaid allowance actually buys is *work*.
-            work_unit: week.session_cost_credits().map(|cost| WorkUnit {
-                label: "session".to_string(),
-                cost,
-                observed: week.sessions,
-            }),
+            work_units: week.work_units(),
             // An included monthly allowance does not roll over. With
             // `onDemandCap` at 0 there are no purchased credits behind it
             // either, so unspent allowance is simply lost at the period end —
@@ -378,11 +341,6 @@ fn probe() -> Observation {
                                 }
                             }
                         }
-                        if let Some(rule) = &topup_rule {
-                            if let Some(r) = included_resource(&billing, rule) {
-                                resources.push(r);
-                            }
-                        }
                         if let Some(r) = monthly_resource(&billing, &t) {
                             resources.push(r);
                         }
@@ -424,11 +382,7 @@ fn probe() -> Observation {
             // so the two rows can be read against each other. The ceiling for
             // this pool is still unknown, so no limit is asserted.
             consumed: Some(Measure::new(t.ticks as f64 / TICKS_PER_CREDIT, "credits")),
-            work_unit: t.session_cost_credits().map(|cost| WorkUnit {
-                label: "session".to_string(),
-                cost,
-                observed: t.sessions,
-            }),
+            work_units: t.work_units(),
             // remaining, limit, utilization: deliberately absent. The vendor
             // exposes no ceiling locally, so we assert none.
             //
@@ -532,78 +486,10 @@ mod tests {
         assert!(parse_topup(&serde_json::json!({})).is_none());
     }
 
-    #[test]
-    fn crossing_the_topup_trigger_is_critical_though_the_headline_looks_fine() {
-        // The whole point. 11,558 of 15,500 reads 75% and sounds comfortable,
-        // but the rule buys more once 5,000 remain — so the genuinely included
-        // portion is 10,500, and that was exhausted at 67.7%.
-        let rule = parse_topup(&live_rule()).unwrap();
-        let r = included_resource(&live_shape(), &rule).expect("resource");
-        assert_eq!(r.facets.limit.as_ref().unwrap().value, 10_500.0);
-        assert_eq!(r.facets.utilization, Some(1.0));
-        assert_eq!(r.facets.remaining.as_ref().unwrap().value, 0.0);
-
-        let a = assess(&r, &Policy::default(), 1_787_900_000, 0);
-        assert_eq!(a.scarcity, AxisState::Critical);
-        // Past this line you are buying; headroom below it is not perishable
-        // surplus, so "might as well" must not fire.
-        assert_eq!(a.perishability, AxisState::Inapplicable);
-
-        // 1,058 credits past the line triggers ONE whole $50 block, which is
-        // what the card is charged — not the $10.58 actually consumed.
-        let m = r.facets.monetary.as_ref().unwrap();
-        assert_eq!(m.spent, Some(50.0), "top-ups are billed in whole blocks");
-        assert_eq!(m.cap, Some(100.0));
-    }
-
-    #[test]
-    fn purchases_are_whole_blocks_and_respect_the_monthly_ceiling() {
-        let rule = parse_topup(&live_rule()).unwrap();
-        // Nothing past the line: no charge.
-        assert_eq!(purchased_usd(10_000.0, 10_500.0, &rule), 0.0);
-        // A single credit past it still buys a whole $50 block.
-        assert_eq!(purchased_usd(10_501.0, 10_500.0, &rule), 50.0);
-        // Exactly 5,000 past the line is still one block, not two.
-        assert_eq!(purchased_usd(15_500.0, 10_500.0, &rule), 50.0);
-        // Past 10,000 over, a second block is bought.
-        assert_eq!(purchased_usd(15_501.0, 10_500.0, &rule), 100.0);
-        // The rule permits at most two blocks a month, however far past you go.
-        assert_eq!(purchased_usd(99_999.0, 10_500.0, &rule), 100.0);
-    }
-
-    #[test]
-    fn below_the_trigger_nothing_has_been_bought() {
-        let rule = parse_topup(&live_rule()).unwrap();
-        let early = serde_json::json!({"config":{
-            "monthlyLimit":{"val":15500},"used":{"val":4000},
-            "billingPeriodEnd":"2026-09-01T00:00:00+00:00"}});
-        let r = included_resource(&early, &rule).expect("resource");
-        assert_eq!(r.facets.monetary.as_ref().unwrap().spent, Some(0.0));
-        assert_eq!(
-            assess(&r, &Policy::default(), 1_787_900_000, 0).scarcity,
-            AxisState::Healthy
-        );
-    }
-
-    #[test]
-    fn a_prepaid_allowance_carries_work_not_money() {
-        let week = Totals { sessions: 16, ticks: 391_402_543_200, ..Default::default() };
-        let r = monthly_resource(&live_shape(), &week).expect("parsed");
-        assert!(r.facets.monetary.is_none(), "a flat-rate allowance must not be priced");
-        let w = r.facets.work_unit.as_ref().expect("work unit");
-        assert_eq!(w.label, "session");
-        assert_eq!(w.observed, 16);
-        // 6,523 credits over 16 sessions.
-        assert!((w.cost - 6_523.4 / 16.0).abs() < 1.0, "got {}", w.cost);
-        // 3,942 remaining => about 9 sessions.
-        let left = (r.facets.remaining.as_ref().unwrap().value / w.cost).floor();
-        assert_eq!(left, 9.0, "got {left}");
-    }
-
-    #[test]
-    fn no_sessions_observed_means_no_work_estimate() {
+        #[test]
+    fn no_observations_means_no_work_estimate() {
         let r = monthly_resource(&live_shape(), &Totals::default()).expect("parsed");
-        assert!(r.facets.work_unit.is_none(), "must not divide by zero sessions");
+        assert!(r.facets.work_units.is_empty(), "must not divide by zero");
     }
 
     #[test]

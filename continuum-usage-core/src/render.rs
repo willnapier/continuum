@@ -64,18 +64,25 @@ fn reset_cell(kind: KindHint, seconds: Option<i64>) -> String {
 /// believed.
 fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
     // Work first: it is the question a prepaid allowance actually answers.
-    if let Some(w) = &r.facets.work_unit {
-        if w.cost > 0.0 {
-            if let Some(rem) = &r.facets.remaining {
-                let units = (rem.value / w.cost).floor() as i64;
-                let plural = if units == 1 { "" } else { "s" };
-                return Some(format!(
-                    "≈ {units} more {}{plural} at your recent size (from {} this week)",
-                    w.label, w.observed
-                ));
-            }
-            return Some(format!("{} {}s this week", w.observed, w.label));
-        }
+    let parts: Vec<String> = r
+        .facets
+        .work_units
+        .iter()
+        .filter(|w| w.cost > 0.0)
+        .filter_map(|w| match (&r.facets.remaining, &r.facets.consumed) {
+            // A ceiling is known: say how much more work is left.
+            (Some(rem), _) => Some(format!("≈ {} more {}s", scale(rem.value / w.cost), w.label)),
+            // No ceiling: the only honest statement is what has been used. Note
+            // this converts the resource's own consumption, never the sample
+            // count — showing "16 tokens" because 16 sessions were observed is
+            // the sort of nonsense that discredits the whole display.
+            (None, Some(used)) => Some(format!("{} {}s used", scale(used.value / w.cost), w.label)),
+            (None, None) => None,
+        })
+        .collect();
+    if !parts.is_empty() {
+        let n = r.facets.work_units.first().map(|w| w.observed).unwrap_or(0);
+        return Some(format!("{} — at your recent mix, from {n} sessions", parts.join(" · ")));
     }
     let m = r.facets.monetary.as_ref()?;
     let sym = match m.currency.as_str() {
@@ -88,6 +95,17 @@ fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
         (Some(spent), Some(cap)) => Some(format!("{sym}{spent:.2} of {sym}{cap:.2} spent")),
         (Some(spent), None) => Some(format!("{sym}{spent:.2} spent")),
         _ => None,
+    }
+}
+
+/// Round large counts to something readable: 139000000 -> 139M.
+fn scale(n: f64) -> String {
+    if n >= 1_000_000.0 {
+        format!("{:.0}M", n / 1_000_000.0)
+    } else if n >= 1_000.0 {
+        format!("{:.0}k", n / 1_000.0)
+    } else {
+        format!("{}", n.floor() as i64)
     }
 }
 
@@ -286,18 +304,18 @@ mod tests {
             KindHint::ResetWindow,
             Facets {
                 remaining: Some(crate::envelope::Measure::new(3_942.0, "credits")),
-                work_unit: Some(crate::envelope::WorkUnit {
+                work_units: vec![crate::envelope::WorkUnit {
                     label: "session".into(),
                     cost: 6_523.0 / 16.0,
                     observed: 16,
-                }),
+                }],
                 ..Default::default()
             },
         );
         let g = human_gloss(&r).expect("gloss");
         assert!(g.starts_with("≈ 9 more sessions"), "got {g}");
         assert!(!g.contains('$'), "a flat-rate allowance must not be priced: {g}");
-        assert!(g.contains("from 16 this week"), "sample size must be visible: {g}");
+        assert!(g.contains("from 16 sessions"), "sample size must be visible: {g}");
     }
 
     #[test]
@@ -316,6 +334,27 @@ mod tests {
             },
         );
         assert_eq!(human_gloss(&r).as_deref(), Some("£41.18 spent"));
+    }
+
+    #[test]
+    fn a_ceilingless_resource_converts_consumption_not_the_sample_count() {
+        // Regression: the token row once read "16 tokens this week" because it
+        // printed the session count instead of converting consumption.
+        let r = res(
+            "grok-build-week",
+            KindHint::Consumption,
+            Facets {
+                consumed: Some(crate::envelope::Measure::new(6_523.0, "credits")),
+                work_units: vec![crate::envelope::WorkUnit {
+                    label: "token".into(),
+                    cost: 6_523.0 / 346_028_596.0,
+                    observed: 16,
+                }],
+                ..Default::default()
+            },
+        );
+        let g = human_gloss(&r).expect("gloss");
+        assert!(g.starts_with("346M tokens used"), "got {g}");
     }
 
     #[test]

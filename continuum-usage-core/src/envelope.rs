@@ -197,9 +197,13 @@ pub struct Facets {
     pub expires_unused: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monetary: Option<Monetary>,
-    /// Translation from this resource's unit into units of real work.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub work_unit: Option<WorkUnit>,
+    /// Translations from this resource's unit into units of real work.
+    ///
+    /// A list, because one allowance is legitimately expressible several ways —
+    /// tokens for a sense of raw scale, sessions for a sense of how many more
+    /// pieces of work it buys. Neither is more correct than the other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_units: Vec<WorkUnit>,
 }
 
 /// One measurable thing within a provider account.
