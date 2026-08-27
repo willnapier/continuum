@@ -60,6 +60,13 @@ impl Store {
     /// Default location: alongside the v1 tree, not on top of it. The v1 files
     /// stay readable for migration and are never written again.
     pub fn default_root() -> Result<PathBuf> {
+        // Override exists so the whole pipeline can be exercised end to end
+        // against a scratch tree, without polluting real history.
+        if let Ok(v) = std::env::var("USAGEWATCH_STORE") {
+            if !v.trim().is_empty() {
+                return Ok(PathBuf::from(v));
+            }
+        }
         let home = std::env::var("HOME").context("HOME is not set")?;
         Ok(PathBuf::from(home).join("Assistants/continuum-usage/v2"))
     }
@@ -78,6 +85,11 @@ impl Store {
 
     fn quarantine_dir(&self) -> PathBuf {
         self.root.join(QUARANTINE_DIR)
+    }
+
+    /// Exposed so notification dedup state lives beside the rest of the store.
+    pub fn state_dir_public(&self) -> PathBuf {
+        self.state_dir()
     }
 
     fn state_dir(&self) -> PathBuf {

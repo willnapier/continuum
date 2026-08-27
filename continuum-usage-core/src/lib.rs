@@ -11,6 +11,7 @@
 
 pub mod discover;
 pub mod envelope;
+pub mod notify;
 pub mod policy;
 pub mod render;
 pub mod store;

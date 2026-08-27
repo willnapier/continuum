@@ -13,6 +13,7 @@ use continuum_usage_core::{
     discover::{self, Probe},
     envelope::{FailureKind, Outcome},
     policy::Policy,
+    notify::{self, DedupLog},
     render,
     store::Store,
 };
@@ -44,6 +45,12 @@ enum Command {
     },
     /// Only what is worth interrupting for.
     Alerts,
+    /// Deliver desktop notifications for anything not already announced.
+    Notify {
+        /// Decide and print, but deliver nothing and remember nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List the probes discovered on PATH.
     Probes,
     /// Print the newest stored envelope for a probe, verbatim.
@@ -80,6 +87,34 @@ fn main() -> Result<()> {
             }
             for line in alerts {
                 println!("{line}");
+            }
+        }
+
+        Command::Notify { dry_run } => {
+            let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
+            let events = notify::events(&latest, &policy, now);
+            let machine = Store::machine_id().unwrap_or_else(|| "unknown".into());
+            let mut log = DedupLog::load(&store.state_dir_public(), &machine);
+
+            let mut sent = 0;
+            for event in &events {
+                if log.already_sent(&event.id) {
+                    continue;
+                }
+                if dry_run {
+                    println!("would send: {} — {}", event.title, event.body);
+                } else {
+                    notify::deliver(event)?;
+                    log.mark(&event.id, now);
+                    println!("sent: {} — {}", event.title, event.body);
+                }
+                sent += 1;
+            }
+            if !dry_run {
+                log.save(now)?;
+            }
+            if sent == 0 {
+                println!("nothing new to announce ({} event(s) already seen)", events.len());
             }
         }
 
