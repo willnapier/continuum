@@ -7,7 +7,7 @@
 //! the account — otherwise a permissive five-hour claim could mask a threatened
 //! weekly one.
 
-use crate::envelope::{FailureKind, Outcome, StoredObservation};
+use crate::envelope::{FailureKind, KindHint, Outcome, StoredObservation};
 use crate::policy::{assess, AxisState, Policy};
 
 pub fn axis_cell(state: AxisState) -> String {
@@ -35,6 +35,20 @@ fn human_duration(secs: i64) -> String {
         format!("{h}h {m}m")
     } else {
         format!("{m}m")
+    }
+}
+
+/// How to show the reset column.
+///
+/// A rolling bucket's "reset" is the instant the current bucket is fully
+/// recovered — which, when it is already full, is *now*. Rendering that as
+/// "due" implies something is pending and reads as a warning. It is not: the
+/// bucket recovers continuously whether or not you draw on it.
+fn reset_cell(kind: KindHint, seconds: Option<i64>) -> String {
+    match (kind, seconds) {
+        (KindHint::RollingRecovery, Some(s)) if s <= 0 => "rolling".into(),
+        (_, Some(s)) => human_duration(s),
+        (_, None) => "—".into(),
     }
 }
 
@@ -92,9 +106,7 @@ pub fn status(rows: &[StoredObservation], policy: &Policy, now_unix: i64) -> Str
                         pct(a.utilization),
                         axis_cell(a.scarcity),
                         axis_cell(a.perishability),
-                        a.seconds_to_reset
-                            .map(human_duration)
-                            .unwrap_or_else(|| "—".into()),
+                        reset_cell(r.kind_hint, a.seconds_to_reset),
                         star
                     ));
                 }
@@ -190,6 +202,15 @@ mod tests {
     }
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn a_full_rolling_bucket_reads_as_rolling_not_due() {
+        assert_eq!(reset_cell(KindHint::RollingRecovery, Some(0)), "rolling");
+        assert_eq!(reset_cell(KindHint::RollingRecovery, Some(-5)), "rolling");
+        // A reset window genuinely at its instant is a different matter.
+        assert_eq!(reset_cell(KindHint::ResetWindow, Some(0)), "due");
+        assert_eq!(reset_cell(KindHint::ResetWindow, Some(3600)), "1h 0m");
+    }
 
     #[test]
     fn inapplicable_never_renders_as_a_tick() {

@@ -1,0 +1,15 @@
+[package]
+name = "usage-probe-anthropic-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "usage-probe-anthropic-api"
+path = "src/main.rs"
+
+[dependencies]
+continuum-usage-core = { path = "../continuum-usage-core" }
+serde_json = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true }
