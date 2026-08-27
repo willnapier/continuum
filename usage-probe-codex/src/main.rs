@@ -9,20 +9,31 @@
 //! untyped `Value`, because the shape could only hold one window. Here both are
 //! ordinary resources, and neither is privileged.
 
-use std::process::ExitCode;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
+use color_eyre::{
+    eyre::{bail, Context, ContextCompat},
+    Result,
+};
 use continuum_usage_core::envelope::{
     Facets, FailureKind, KindHint, Measure, Monetary, Observation, Outcome, Resource, SideEffect,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const PROBE: &str = "codex";
 const PROVIDER: &str = "openai";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn main() -> ExitCode {
     let obs = probe();
-    println!("{}", serde_json::to_string(&obs).expect("envelope serialises"));
+    println!(
+        "{}",
+        serde_json::to_string(&obs).expect("envelope serialises")
+    );
     match obs.outcome {
         Outcome::Ok { .. } => ExitCode::SUCCESS,
         Outcome::Failure { .. } => ExitCode::FAILURE,
@@ -61,12 +72,18 @@ fn window(raw: &Value, key: &str, id: &str, label: &str, representative: bool) -
 /// spending a credit balance faster is never an opportunity.
 fn credits(raw: &Value) -> Option<Resource> {
     let c = raw.get("credits")?.as_object()?;
-    if !c.get("hasCredits").and_then(Value::as_bool).unwrap_or(false) {
+    if !c
+        .get("hasCredits")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
-    let balance = c
-        .get("balance")
-        .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()));
+    let balance = c.get("balance").and_then(|v| {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| v.as_f64())
+    });
     Some(Resource {
         id: "codex-credits".to_string(),
         label: "Purchased credits".to_string(),
@@ -87,8 +104,8 @@ fn credits(raw: &Value) -> Option<Resource> {
 }
 
 fn probe() -> Observation {
-    let v1 = match continuum_core::usage::refresh_codex_usage("usage-probe-codex") {
-        Ok(o) => o,
+    let raw = match read_codex_rate_limits() {
+        Ok(raw) => raw,
         Err(e) => {
             let msg = e.to_string();
             // Classify rather than collapsing everything into "it broke".
@@ -104,8 +121,6 @@ fn probe() -> Observation {
             return fail(kind, msg);
         }
     };
-
-    let raw = &v1.vendor.raw_snapshot;
 
     // The vendor reports a throttle explicitly; that is a reading, not a fault.
     if let Some(reached) = raw.get("rateLimitReachedType").and_then(Value::as_str) {
@@ -123,13 +138,13 @@ fn probe() -> Observation {
 
     let mut resources = vec![];
     // Neither window is privileged. v1 could only express one.
-    if let Some(r) = window(raw, "primary", "codex-primary", "Session window", true) {
+    if let Some(r) = window(&raw, "primary", "codex-primary", "Session window", true) {
         resources.push(r);
     }
-    if let Some(r) = window(raw, "secondary", "codex-secondary", "Weekly window", false) {
+    if let Some(r) = window(&raw, "secondary", "codex-secondary", "Weekly window", false) {
         resources.push(r);
     }
-    if let Some(r) = credits(raw) {
+    if let Some(r) = credits(&raw) {
         resources.push(r);
     }
 
@@ -140,13 +155,97 @@ fn probe() -> Observation {
         );
     }
 
-    let mut obs = Observation::ok(PROBE, VERSION, PROVIDER, SideEffect::RequestConsuming, resources);
+    let mut obs = Observation::ok(
+        PROBE,
+        VERSION,
+        PROVIDER,
+        SideEffect::RequestConsuming,
+        resources,
+    );
     obs.assistant = Some("codex".to_string());
-    obs.account = v1.vendor.plan_type.clone();
+    obs.account = raw
+        .get("planType")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Outcome::Ok { raw: r, .. } = &mut obs.outcome {
         *r = Some(raw.clone());
     }
     obs
+}
+
+fn read_codex_rate_limits() -> Result<Value> {
+    let codex = continuum_core::codex_cli::resolve_codex(None)?.path;
+    let mut child = Command::new(codex)
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start Codex app-server usage probe")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Codex probe stdin unavailable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Codex probe stdout unavailable")?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({"method":"initialize","id":0,"params":{"clientInfo":{"name":"usage_probe_codex","title":"Continuum Usage Probe: Codex","version":VERSION}}})
+    )?;
+    stdin.flush()?;
+
+    let result = (|| -> Result<Value> {
+        loop {
+            let line = rx
+                .recv_timeout(PROBE_TIMEOUT)
+                .context("timed out initializing Codex usage probe")??;
+            let value: Value = serde_json::from_str(&line)?;
+            if value.get("id").and_then(Value::as_i64) == Some(0) {
+                if let Some(error) = value.get("error") {
+                    bail!("Codex usage probe initialization failed: {error}")
+                }
+                break;
+            }
+        }
+        writeln!(stdin, "{}", json!({"method":"initialized","params":{}}))?;
+        writeln!(
+            stdin,
+            "{}",
+            json!({"method":"account/rateLimits/read","id":1})
+        )?;
+        stdin.flush()?;
+        loop {
+            let line = rx
+                .recv_timeout(PROBE_TIMEOUT)
+                .context("timed out reading Codex rate limits")??;
+            let value: Value = serde_json::from_str(&line)?;
+            if value.get("id").and_then(Value::as_i64) == Some(1) {
+                if let Some(error) = value.get("error") {
+                    bail!("Codex usage probe failed: {error}")
+                }
+                return value
+                    .get("result")
+                    .and_then(|r| r.get("rateLimits"))
+                    .cloned()
+                    .context("Codex usage response omitted result.rateLimits");
+            }
+        }
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 #[cfg(test)]

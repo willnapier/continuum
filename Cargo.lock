@@ -294,7 +294,6 @@ dependencies = [
  "continuum-core",
  "serde_json",
  "tokio",
- "which",
 ]
 
 [[package]]
@@ -1381,6 +1380,7 @@ dependencies = [
 name = "usage-probe-codex"
 version = "0.1.0"
 dependencies = [
+ "color-eyre",
  "continuum-core",
  "continuum-usage-core",
  "serde_json",

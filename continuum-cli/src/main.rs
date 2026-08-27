@@ -19,7 +19,6 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::Import(cmd) => handle_import(cmd)?,
         Command::Stats => handle_stats()?,
-        Command::Usage(cmd) => handle_usage(cmd)?,
         Command::Codex(cmd) => handle_codex(cmd)?,
     }
     Ok(())
@@ -44,8 +43,6 @@ enum Command {
     Import(ImportArgs),
     /// Show statistics about stored conversations
     Stats,
-    /// Inspect or refresh assistant allocation usage
-    Usage(UsageArgs),
     /// Manage the real Codex CLI used by Continuum
     Codex(CodexArgs),
 }
@@ -150,45 +147,6 @@ impl Drop for UpdateLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-#[derive(Args, Debug)]
-struct UsageArgs {
-    /// Assistant whose allocation should be inspected
-    #[arg(default_value = "codex")]
-    assistant: String,
-    /// Fetch a fresh observation from the assistant
-    #[arg(long)]
-    refresh: bool,
-    /// Deliver newly eligible desktop notifications
-    #[arg(long, requires = "refresh")]
-    notify: bool,
-    /// Suppress the human-readable report
-    #[arg(long)]
-    quiet: bool,
-    /// Source of this observation (manual, scheduled, session-start, session-exit)
-    #[arg(long, default_value = "manual")]
-    provenance: String,
-}
-
-fn handle_usage(args: &UsageArgs) -> Result<()> {
-    let assistant = args.assistant.to_lowercase();
-    if assistant != "codex" {
-        color_eyre::eyre::bail!(
-            "usage monitoring is not yet implemented for '{}'; currently supported: codex",
-            args.assistant
-        );
-    }
-    if args.refresh {
-        let observation = continuum_core::usage::refresh_codex_usage(&args.provenance)?;
-        if args.notify {
-            continuum_core::usage::notify_transitions(&observation)?;
-        }
-    }
-    if !args.quiet {
-        println!("{}", continuum_core::usage::render_usage(&assistant)?);
-    }
-    Ok(())
 }
 
 #[derive(Args, Debug)]

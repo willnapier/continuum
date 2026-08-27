@@ -12,3 +12,4 @@ path = "src/main.rs"
 continuum-usage-core = { path = "../continuum-usage-core" }
 continuum-core = { path = "../continuum-core" }
 serde_json = { workspace = true }
+color-eyre = { workspace = true }

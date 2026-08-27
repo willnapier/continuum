@@ -48,13 +48,6 @@ fn main() -> Result<()> {
 
     let before_session = find_latest_session_file(&sessions_dir);
 
-    let interactive_launch = is_new_interactive_session(&args);
-    if interactive_launch {
-        if let Ok(Some(banner)) = continuum_core::usage::cached_banner("codex") {
-            eprintln!("{banner}");
-        }
-    }
-
     // Spawn codex as a child process
     let mut child = Command::new(&real_codex)
         .args(&args)
@@ -64,9 +57,7 @@ fn main() -> Result<()> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to spawn codex process")?;
-    refresh_usage_detached("session-start");
     let status = child.wait()?;
-    refresh_usage_detached("session-exit");
 
     // After codex exits, find the session that was just modified
     let after_session = find_latest_session_file(&sessions_dir);
@@ -101,65 +92,6 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(status.code().unwrap_or(1))
-}
-
-fn is_new_interactive_session(args: &[String]) -> bool {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
-    {
-        return false;
-    }
-    let subcommands = [
-        "exec",
-        "review",
-        "login",
-        "logout",
-        "mcp",
-        "plugin",
-        "mcp-server",
-        "app-server",
-        "remote-control",
-        "completion",
-        "update",
-        "doctor",
-        "sandbox",
-        "debug",
-        "apply",
-        "resume",
-        "archive",
-        "delete",
-        "unarchive",
-        "fork",
-        "cloud",
-        "exec-server",
-        "features",
-        "help",
-    ];
-    !args.iter().any(|arg| subcommands.contains(&arg.as_str()))
-}
-
-fn refresh_usage_detached(provenance: &str) {
-    let continuum = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("continuum")))
-        .filter(|path| path.exists())
-        .or_else(|| which::which("continuum").ok());
-    let Some(continuum) = continuum else { return };
-    let _ = Command::new(continuum)
-        .args([
-            "usage",
-            "codex",
-            "--refresh",
-            "--notify",
-            "--quiet",
-            "--provenance",
-            provenance,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {
