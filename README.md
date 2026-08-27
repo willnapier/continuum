@@ -106,7 +106,8 @@ cp target/release/continuum-gemini ~/.local/bin/
 # DO NOT `ln -sf continuum-codex ~/.local/bin/codex` (or the same for claude/goose).
 # That shadows the real CLI on PATH and used to re-spawn the wrapper forever.
 # Wire capture via shell functions/aliases instead (nushell already has
-# `def --wrapped codex` → continuum-codex; real OpenAI CLI stays at /usr/bin/codex).
+# `def --wrapped codex` → continuum-codex. Install the real OpenAI CLI in
+# Continuum's managed, off-PATH prefix with `continuum codex update`.
 
 # Source Nushell functions
 echo "source ~/continuum/continuum.nu" >> ~/.config/nushell/config.nu
@@ -166,6 +167,20 @@ The Codex wrapper prints a concise cached allocation banner when a new interacti
 The initial policy sends an opportunity notification when a fixed-reset window is in its final two-sevenths (capped at 48 hours) and at most 80% has been used, a later reminder halfway through that opportunity period (capped at six hours), and a reserve warning once usage reaches 85%. Scaling matters because Codex may expose both five-hour and weekly windows: a fresh short window should not be called imminent. Notifications are deduplicated locally per vendor window. They are advisory: Continuum does not turn `/fast` on, restart a session, or notify a phone.
 
 Raw vendor observations are retained losslessly under `~/Assistants/continuum-usage/observations/<machine>.jsonl`; the launch banner reads `~/Assistants/continuum-usage/latest/`. Notification delivery state remains machine-local under `~/.local/state/continuum/usage/`. This split permits future assistant adapters to preserve their own semantics while Continuum owns global history and presentation.
+
+### Managed Codex CLI
+
+Continuum installs the real OpenAI Codex CLI outside `PATH`, under `${XDG_DATA_HOME:-~/.local/share}/continuum/codex`. The capture wrapper and allocation probe share one resolver, so they cannot silently select different Codex versions.
+
+```bash
+# Install or update the managed CLI without writing to /usr
+continuum codex update
+
+# Show the selected binary, source, and canonical managed target
+continuum codex which
+```
+
+Resolver precedence is: `CONTINUUM_CODEX_BIN` override, managed install, legacy user install, identity-filtered `PATH`, then system paths as a warned compatibility fallback. The wrapper sets a depth guard before launching the real CLI, turning a copied or misnamed wrapper into a clear error instead of recursive spawning. Codex's built-in npm self-update is not the managed update path; use `continuum codex update`.
 
 ### Import Web Conversations
 

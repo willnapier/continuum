@@ -7,16 +7,30 @@
 // itself forever. Resolution now skips our own executable by identity.
 
 use color_eyre::{eyre::Context, Result};
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    if std::env::var_os(continuum_core::codex_cli::CODEX_DEPTH_ENV).is_some() {
+        color_eyre::eyre::bail!(
+            "refusing recursive continuum-codex launch; check the resolved real Codex path"
+        );
+    }
+
     // Get all arguments passed to continuum-codex
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let real_codex = find_real_codex()?.to_string_lossy().into_owned();
+    let self_exe = std::env::current_exe().ok();
+    let resolution = continuum_core::codex_cli::resolve_codex(self_exe.as_deref())?;
+    if !resolution.is_managed() {
+        eprintln!(
+            "Warning: Codex resolved from {} at {}; run `continuum codex update` to install the managed copy",
+            resolution.source,
+            resolution.path.display()
+        );
+    }
+    let real_codex = resolution.path.to_string_lossy().into_owned();
 
     // Check for no-save marker file
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -44,6 +58,7 @@ fn main() -> Result<()> {
     // Spawn codex as a child process
     let mut child = Command::new(&real_codex)
         .args(&args)
+        .env(continuum_core::codex_cli::CODEX_DEPTH_ENV, "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -145,64 +160,6 @@ fn refresh_usage_detached(provenance: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-/// Locate the real OpenAI Codex CLI, never this wrapper (by any name).
-fn find_real_codex() -> Result<PathBuf> {
-    let self_exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok());
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-
-    // Prefer known real-install locations over PATH (PATH may point at a
-    // misnamed copy of this wrapper, historically `~/.local/bin/codex`).
-    let preferred = [
-        PathBuf::from("/usr/bin/codex"),
-        PathBuf::from("/usr/local/bin/codex"),
-        PathBuf::from(format!("{}/.local/bin/codex-real", home)),
-        PathBuf::from("/opt/homebrew/bin/codex"),
-        PathBuf::from("/opt/homebrew/opt/codex/bin/codex"),
-    ];
-
-    for candidate in &preferred {
-        if candidate.exists() && !is_this_wrapper(candidate, self_exe.as_ref()) {
-            return Ok(candidate.clone());
-        }
-    }
-
-    // Scan every PATH hit; skip ourselves and any continuum-named binary.
-    for candidate in which::which_all("codex").context("Failed to search PATH for codex")? {
-        if !is_this_wrapper(&candidate, self_exe.as_ref()) {
-            return Ok(candidate);
-        }
-    }
-
-    color_eyre::eyre::bail!(
-        "Could not find real codex binary. Tried preferred paths and every `codex` on PATH \
-         (skipped this wrapper). Install @openai/codex or place the real CLI at /usr/bin/codex."
-    )
-}
-
-fn is_this_wrapper(path: &Path, self_exe: Option<&PathBuf>) -> bool {
-    // Name-based: deployed as continuum-codex, or an obvious wrapper backup.
-    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-        if name.contains("continuum-codex") || name.contains("misdeployed") {
-            return true;
-        }
-    }
-
-    // Identity-based: same canonical path as the running binary (covers the
-    // failure mode where this wrapper was copied to ~/.local/bin/codex).
-    if let Some(self_path) = self_exe {
-        if let Ok(resolved) = std::fs::canonicalize(path) {
-            if resolved == *self_path {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {

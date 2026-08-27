@@ -2,6 +2,7 @@
 // Manages conversation logs stored as JSONL files in ~/Assistants/continuum-logs
 
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::{eyre::Context, Result};
@@ -19,6 +20,7 @@ fn main() -> Result<()> {
         Command::Import(cmd) => handle_import(cmd)?,
         Command::Stats => handle_stats()?,
         Command::Usage(cmd) => handle_usage(cmd)?,
+        Command::Codex(cmd) => handle_codex(cmd)?,
     }
     Ok(())
 }
@@ -44,6 +46,110 @@ enum Command {
     Stats,
     /// Inspect or refresh assistant allocation usage
     Usage(UsageArgs),
+    /// Manage the real Codex CLI used by Continuum
+    Codex(CodexArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodexArgs {
+    #[command(subcommand)]
+    command: CodexCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum CodexCommand {
+    /// Show the resolved real Codex CLI and its ownership source
+    Which,
+    /// Install or update the Continuum-managed Codex CLI
+    Update,
+}
+
+fn handle_codex(args: &CodexArgs) -> Result<()> {
+    match args.command {
+        CodexCommand::Which => {
+            let resolution = continuum_core::codex_cli::resolve_codex(None)?;
+            println!("path: {}", resolution.path.display());
+            println!("source: {}", resolution.source);
+            println!("managed: {}", resolution.is_managed());
+            println!(
+                "managed target: {}",
+                continuum_core::codex_cli::managed_codex_bin()?.display()
+            );
+        }
+        CodexCommand::Update => update_managed_codex()?,
+    }
+    Ok(())
+}
+
+fn update_managed_codex() -> Result<()> {
+    let prefix = continuum_core::codex_cli::managed_codex_prefix()?;
+    std::fs::create_dir_all(&prefix)
+        .with_context(|| format!("failed to create {}", prefix.display()))?;
+    let _lock = UpdateLock::acquire(prefix.join(".update.lock"))?;
+    eprintln!(
+        "Installing @openai/codex@latest into {}...",
+        prefix.display()
+    );
+    let status = ProcessCommand::new("npm")
+        .args(["install", "--global", "--prefix"])
+        .arg(&prefix)
+        .arg("@openai/codex@latest")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to launch npm")?;
+    if !status.success() {
+        color_eyre::eyre::bail!("npm failed with status {status}");
+    }
+
+    let resolution = continuum_core::codex_cli::resolve_codex(None)?;
+    if !resolution.is_managed() {
+        color_eyre::eyre::bail!(
+            "managed install completed but resolver selected {} from {}",
+            resolution.path.display(),
+            resolution.source
+        );
+    }
+    let version = ProcessCommand::new(&resolution.path)
+        .arg("--version")
+        .output()
+        .context("failed to verify managed Codex")?;
+    if !version.status.success() {
+        color_eyre::eyre::bail!("managed Codex failed its version check");
+    }
+    print!("{}", String::from_utf8_lossy(&version.stdout));
+    eprintln!("Managed Codex ready at {}", resolution.path.display());
+    Ok(())
+}
+
+struct UpdateLock {
+    path: PathBuf,
+}
+
+impl UpdateLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "another Codex update may be running (lock: {}); if no updater is active, remove this stale lock",
+                    path.display()
+                )
+            })?;
+        writeln!(file, "pid={}", std::process::id())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Args, Debug)]

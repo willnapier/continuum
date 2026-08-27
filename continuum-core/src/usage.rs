@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -510,17 +510,7 @@ fn read_codex_rate_limits() -> Result<Value> {
 }
 
 fn find_real_codex() -> Result<PathBuf> {
-    for path in [
-        "/usr/bin/codex",
-        "/usr/local/bin/codex",
-        "/opt/homebrew/bin/codex",
-    ] {
-        let candidate = Path::new(path);
-        if candidate.exists() {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-    which::which("codex").context("could not find the real Codex CLI")
+    Ok(crate::codex_cli::resolve_codex(None)?.path)
 }
 
 fn sanitize_component(value: &str) -> String {

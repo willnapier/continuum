@@ -1,6 +1,7 @@
 // Continuum Core Library
 // Shared types, adapters, and plain-text storage for assistant session management
 
+pub mod codex_cli;
 pub mod types;
 pub mod adapters;
 pub mod compression;
