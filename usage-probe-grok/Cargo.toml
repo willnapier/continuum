@@ -12,3 +12,4 @@ path = "src/main.rs"
 continuum-usage-core = { path = "../continuum-usage-core" }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+ureq = { workspace = true }

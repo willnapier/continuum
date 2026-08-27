@@ -1393,6 +1393,7 @@ dependencies = [
  "chrono",
  "continuum-usage-core",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
