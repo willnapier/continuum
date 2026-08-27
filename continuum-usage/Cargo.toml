@@ -1,0 +1,16 @@
+[package]
+name = "continuum-usage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "usagewatch"
+path = "src/main.rs"
+
+[dependencies]
+continuum-usage-core = { path = "../continuum-usage-core" }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

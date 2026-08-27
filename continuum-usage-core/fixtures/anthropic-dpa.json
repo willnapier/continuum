@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "probe": { "name": "anthropic-api", "version": "fixture" },
+  "provider": "anthropic",
+  "assistant": "practiceforge",
+  "account": "dpa-metered",
+  "observed_at": "2026-08-27T14:00:00+00:00",
+  "outcome": "ok",
+  "side_effect": "request-consuming",
+  "cost": { "requests": 1, "note": "headers read from an ordinary API call" },
+  "resources": [
+    {
+      "id": "requests-per-minute",
+      "label": "Requests / minute",
+      "kind_hint": "rolling-recovery",
+      "facets": {
+        "remaining": { "value": 48.0, "unit": "requests" },
+        "limit": { "value": 50.0, "unit": "requests" },
+        "resets_at": 1787832000,
+        "expires_unused": false
+      },
+      "vendor_status": "allowed",
+      "vendor_representative": false
+    },
+    {
+      "id": "input-tokens-per-minute",
+      "label": "Input tokens / minute",
+      "kind_hint": "rolling-recovery",
+      "facets": {
+        "remaining": { "value": 18000.0, "unit": "tokens" },
+        "limit": { "value": 20000.0, "unit": "tokens" },
+        "resets_at": 1787832000,
+        "expires_unused": false
+      },
+      "vendor_status": "allowed",
+      "vendor_representative": true
+    },
+    {
+      "id": "month-to-date-spend",
+      "label": "Month-to-date spend",
+      "kind_hint": "continuous",
+      "facets": {
+        "expires_unused": false,
+        "monetary": { "currency": "USD", "spent": 41.18 }
+      },
+      "vendor_representative": false
+    }
+  ]
+}

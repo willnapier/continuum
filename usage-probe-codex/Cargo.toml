@@ -1,0 +1,14 @@
+[package]
+name = "usage-probe-codex"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "usage-probe-codex"
+path = "src/main.rs"
+
+[dependencies]
+continuum-usage-core = { path = "../continuum-usage-core" }
+continuum-core = { path = "../continuum-core" }
+serde_json = { workspace = true }

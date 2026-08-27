@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "probe": { "name": "claude", "version": "fixture" },
+  "provider": "anthropic",
+  "assistant": "claude-code",
+  "account": "max",
+  "observed_at": "2026-08-27T10:26:00+00:00",
+  "outcome": "ok",
+  "side_effect": "quota-consuming",
+  "cost": { "requests": 1, "tokens": 1 },
+  "resources": [
+    {
+      "id": "unified-5h",
+      "label": "Session (5 hours)",
+      "kind_hint": "reset-window",
+      "facets": { "utilization": 0.03, "resets_at": 1787841000, "window_secs": 18000, "expires_unused": true },
+      "vendor_status": "allowed",
+      "vendor_representative": true
+    },
+    {
+      "id": "unified-7d",
+      "label": "Weekly (7 days)",
+      "kind_hint": "reset-window",
+      "facets": { "utilization": 0.03, "resets_at": 1788184800, "window_secs": 604800, "expires_unused": true },
+      "vendor_status": "allowed",
+      "vendor_representative": false
+    },
+    {
+      "id": "unified-overage",
+      "label": "Overage (credit spend)",
+      "kind_hint": "continuous",
+      "facets": {
+        "utilization": 0.0,
+        "resets_at": 1788220800,
+        "expires_unused": false,
+        "monetary": { "currency": "USD" }
+      },
+      "vendor_status": "allowed",
+      "vendor_representative": false
+    }
+  ]
+}
