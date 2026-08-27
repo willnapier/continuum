@@ -52,6 +52,26 @@ fn reset_cell(kind: KindHint, seconds: Option<i64>) -> String {
     }
 }
 
+/// Translate a resource into terms a person actually reasons in.
+///
+/// Vendor units — "credits", "ticks" — are meaningless outside the vendor's own
+/// accounting. Money and time are not. Where a resource carries a monetary
+/// facet, show it; where a burn rate exists, show how long the remainder lasts.
+fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
+    let m = r.facets.monetary.as_ref()?;
+    let sym = match m.currency.as_str() {
+        "USD" => "$",
+        "GBP" => "£",
+        "EUR" => "€",
+        other => return Some(format!("{other} {:.0} spent", m.spent?)),
+    };
+    match (m.spent, m.cap) {
+        (Some(spent), Some(cap)) => Some(format!("≈ {sym}{spent:.0} of {sym}{cap:.0}")),
+        (Some(spent), None) => Some(format!("≈ {sym}{spent:.0} spent")),
+        _ => None,
+    }
+}
+
 fn pct(u: Option<f64>) -> String {
     match u {
         Some(v) => format!("{:.0}%", v * 100.0),
@@ -114,6 +134,9 @@ pub fn status(
                         reset_cell(r.kind_hint, a.seconds_to_reset),
                         star
                     ));
+                    if let Some(g) = human_gloss(r) {
+                        out.push_str(&format!("  {:<22} ↳ {g}\n", ""));
+                    }
                     if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
                         out.push_str(&format!(
                             "  {:<22} ↳ at the current rate this runs out in {}, {} before it resets\n",
@@ -174,11 +197,13 @@ pub fn alerts(
                 _ => {}
             }
             if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
+                let gloss = human_gloss(r).map(|g| format!(" ({g})")).unwrap_or_default();
                 out.push(format!(
-                    "{} / {}: burning fast — {} used, runs out in {} but resets in {}",
+                    "{} / {}: burning fast — {} used{}, runs out in {} but resets in {}",
                     obs.probe.name,
                     r.label,
                     pct(a.utilization),
+                    gloss,
                     human_duration(p.seconds_of_headroom),
                     a.seconds_to_reset.map(human_duration).unwrap_or_default()
                 ));
@@ -232,6 +257,30 @@ mod tests {
     }
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn money_is_shown_instead_of_a_meaningless_vendor_unit() {
+        let r = res(
+            "grok-monthly-credits",
+            KindHint::ResetWindow,
+            Facets {
+                consumed: Some(crate::envelope::Measure::new(11_558.0, "credits")),
+                monetary: Some(Monetary {
+                    currency: "USD".into(),
+                    spent: Some(702.13),
+                    cap: Some(941.75),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(human_gloss(&r).as_deref(), Some("≈ $702 of $942"));
+    }
+
+    #[test]
+    fn a_resource_with_no_money_facet_gets_no_gloss() {
+        let r = res("x", KindHint::ResetWindow, Facets::default());
+        assert!(human_gloss(&r).is_none());
+    }
 
     #[test]
     fn a_full_rolling_bucket_reads_as_rolling_not_due() {

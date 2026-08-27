@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Observation, Outcome, Resource, SideEffect,
+    Facets, FailureKind, KindHint, Measure, Monetary, Observation, Outcome, Resource, SideEffect,
 };
 
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
@@ -63,6 +63,16 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
 /// Derived by reconciliation, not documented by the vendor. Treat the credit
 /// figure as an estimate and the billing endpoint as authoritative.
 const TICKS_PER_CREDIT: f64 = 6.0e7;
+
+/// US dollars of list-price inference per credit.
+///
+/// `costUsdTicks / 1e9` is already a USD figure, so this is just
+/// `1e9 / TICKS_PER_CREDIT` expressed the useful way round: **a credit is about
+/// six cents**. "Credits" is a vendor unit that means nothing to a human; money
+/// and time do. The vendor unit stays in `consumed`/`limit` because that is what
+/// the endpoint actually said, and the translation rides alongside in
+/// `monetary` rather than replacing it.
+const USD_PER_CREDIT: f64 = TICKS_PER_CREDIT / 1.0e9;
 
 #[derive(Default)]
 struct Totals {
@@ -184,6 +194,12 @@ fn monthly_resource(billing: &serde_json::Value) -> Option<Resource> {
             limit: Some(Measure::new(limit, "credits")),
             resets_at: end,
             window_secs: match (start, end) { (Some(s), Some(e)) => Some(e - s), _ => None },
+            // The human translation of the vendor's credit unit.
+            monetary: Some(Monetary {
+                currency: "USD".to_string(),
+                spent: Some(used * USD_PER_CREDIT),
+                cap: Some(limit * USD_PER_CREDIT),
+            }),
             // An included monthly allowance does not roll over. With
             // `onDemandCap` at 0 there are no purchased credits behind it
             // either, so unspent allowance is simply lost at the period end —
@@ -276,6 +292,12 @@ fn probe() -> Observation {
             // so the two rows can be read against each other. The ceiling for
             // this pool is still unknown, so no limit is asserted.
             consumed: Some(Measure::new(t.ticks as f64 / TICKS_PER_CREDIT, "credits")),
+            // costUsdTicks / 1e9 is already dollars, straight from the vendor.
+            monetary: Some(Monetary {
+                currency: "USD".to_string(),
+                spent: Some(t.ticks as f64 / 1.0e9),
+                cap: None,
+            }),
             // remaining, limit, utilization: deliberately absent. The vendor
             // exposes no ceiling locally, so we assert none.
             //
