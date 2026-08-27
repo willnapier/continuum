@@ -98,7 +98,17 @@ fn main() -> Result<()> {
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
             let base = policy::baselines(&store.read_all()?.rows);
             let events = notify::events(&latest, &base, &policy, now);
-            let machine = Store::machine_id().unwrap_or_else(|| "unknown".into());
+            // Must not fall back to a placeholder: two unresolvable machines
+            // would share one dedup log and silently suppress each other's
+            // alerts. Identity that can fail open is not identity.
+            let Some(machine) = Store::machine_id() else {
+                println!(
+                    "machine identity could not be resolved — refusing to notify, \
+                     because a shared dedup log would suppress alerts across machines. \
+                     Set CONTINUUM_MACHINE_ID."
+                );
+                return Ok(());
+            };
             let mut log = DedupLog::load(&store.state_dir_public(), &machine);
 
             let mut sent = 0;
@@ -220,6 +230,10 @@ fn main() -> Result<()> {
             println!("observations:       {}", report.rows.len());
             println!("malformed rows:     {}", report.malformed);
             println!("quarantined rows:   {}", report.quarantined);
+            println!("unreadable files:   {}", report.unreadable_files.len());
+            for name in &report.unreadable_files {
+                println!("  ! {name}");
+            }
             println!(
                 "sync-conflict files skipped: {}",
                 report.sync_conflicts_skipped.len()

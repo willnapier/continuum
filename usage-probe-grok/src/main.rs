@@ -274,11 +274,18 @@ fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resour
             // invent a figure that is never paid and imply a spend that is not
             // happening. What a prepaid allowance actually buys is *work*.
             work_units: week.work_units(),
-            // An included monthly allowance does not roll over. With
-            // `onDemandCap` at 0 there are no purchased credits behind it
-            // either, so unspent allowance is simply lost at the period end —
-            // which is exactly what makes "might as well" meaningful here.
-            expires_unused: Some(true),
+            // UNKNOWN, deliberately — not `true`.
+            //
+            // An unspent included allowance does not roll over, which argues
+            // for `true`. But this account has an ENABLED auto-top-up rule
+            // (fetched below), and two $50 blocks have already been charged in
+            // August. `true` makes `policy::assess` emit `Opportunity` —
+            // "might as well burn it" — on a meter whose consumption triggers
+            // real purchases. Whether `minBeforeHittingSl` watches this meter
+            // or a prepaid balance is unresolved: two readings fit the same
+            // data. Ambiguity about whether spending costs money argues for
+            // `None` (not assessable), never for an invitation to spend.
+            expires_unused: None,
             ..Default::default()
         },
         vendor_status: None,
@@ -515,15 +522,18 @@ mod tests {
     }
 
     #[test]
-    fn monthly_allowance_perishes_so_might_as_well_applies() {
+    fn the_monthly_allowance_never_invites_spending() {
+        // An enabled auto-top-up rule means consumption here can trigger real
+        // purchases, and whether the trigger watches this meter or a prepaid
+        // balance is unresolved. Under that ambiguity the tool must never say
+        // "might as well" — it would be inviting a charge.
         let r = monthly_resource(&live_shape(), &Totals::default()).expect("parsed");
-        assert_eq!(r.facets.expires_unused, Some(true));
+        assert_eq!(r.facets.expires_unused, None);
 
-        // Two days before the period ends, still under 80% used: surplus that
-        // will be lost. This is precisely the "might as well" case.
         let two_days_before = r.facets.resets_at.unwrap() - 2 * 86_400;
         let a = assess(&r, &Policy::default(), two_days_before, 0);
-        assert_eq!(a.perishability, AxisState::Opportunity);
+        assert_ne!(a.perishability, AxisState::Opportunity);
+        assert_eq!(a.perishability, AxisState::NotAssessable);
     }
 
     #[test]

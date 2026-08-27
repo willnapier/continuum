@@ -10,7 +10,9 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
 
@@ -19,6 +21,16 @@ use crate::policy::Policy;
 use crate::store::ProbeMeta;
 
 pub const PROBE_PREFIX: &str = "usage-probe-";
+
+/// Hard wall-clock cap on a single probe run.
+///
+/// `Command::output()` has no timeout and blocks until stdout reaches EOF, so a
+/// probe that hangs — or whose own child hangs — wedges the entire run with no
+/// envelope and no diagnostic. systemd will not start a second instance of a
+/// still-running oneshot, so the effect is that the monitor stops working,
+/// quietly, until someone notices. The probe is killed at this deadline and the
+/// failure recorded like any other.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Probe {
@@ -116,34 +128,106 @@ pub fn may_run(
 /// observation — a structured failure one. Losing that distinction is how a
 /// `402 quota exhausted` becomes indistinguishable from a segfault.
 pub fn run(probe: &Probe) -> Observation {
-    let output = Command::new(&probe.path).output();
+    let fail = |kind, msg: String| {
+        Observation::failure(&probe.name, "unknown", "unknown", kind, msg)
+    };
 
-    let output = match output {
-        Ok(o) => o,
+    let mut child = match Command::new(&probe.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(e) => {
-            return Observation::failure(
-                &probe.name,
-                "unknown",
-                "unknown",
+            return fail(
                 FailureKind::Unknown,
                 format!("could not execute {}: {e}", probe.path.display()),
             )
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Drain both pipes on threads: waiting on the child while a full pipe
+    // blocks it would deadlock, and reading one pipe to EOF before the other
+    // has the same problem.
+    // Results come back over channels, not by joining.
+    //
+    // Killing the child does NOT necessarily close these pipes: a shell probe's
+    // grandchild inherits the same descriptors and keeps them open, so
+    // `read_to_end` blocks past the kill and a `join()` would hang exactly as
+    // long as the original defect did. Verified — the first version of this fix
+    // still had to be killed externally at 90s.
+    let mut out_handle = child.stdout.take();
+    let mut err_handle = child.stderr.take();
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(h) = out_handle.as_mut() {
+            let _ = h.read_to_end(&mut b);
+        }
+        let _ = out_tx.send(b);
+    });
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(h) = err_handle.as_mut() {
+            let _ = h.read_to_end(&mut b);
+        }
+        let _ = err_tx.send(b);
+    });
+
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail(FailureKind::Unknown, format!("waiting on probe failed: {e}"));
+            }
+        }
+    };
+
+    // Short grace for the readers to drain after exit-or-kill, then give up on
+    // them. A leaked reader thread on a pipe held open by an orphan is harmless
+    // — the process is about to exit — whereas waiting on it is the hang.
+    let grace = Duration::from_secs(2);
+    let stdout_bytes = out_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr_bytes = err_rx.recv_timeout(grace).unwrap_or_default();
+
+    let Some(status) = status else {
+        return fail(
+            FailureKind::ProviderOutage,
+            format!(
+                "probe exceeded {}s and was killed: {}",
+                RUN_TIMEOUT.as_secs(),
+                String::from_utf8_lossy(&stderr_bytes)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ),
+        );
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let trimmed = stdout.trim();
 
     if trimmed.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Observation::failure(
-            &probe.name,
-            "unknown",
-            "unknown",
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        return fail(
             FailureKind::MalformedResponse,
             format!(
                 "probe produced no JSON (exit {}): {}",
-                output.status.code().unwrap_or(-1),
+                status.code().unwrap_or(-1),
                 stderr.trim().chars().take(300).collect::<String>()
             ),
         );
@@ -151,10 +235,7 @@ pub fn run(probe: &Probe) -> Observation {
 
     match serde_json::from_str::<Observation>(trimmed) {
         Ok(obs) => obs,
-        Err(e) => Observation::failure(
-            &probe.name,
-            "unknown",
-            "unknown",
+        Err(e) => fail(
             FailureKind::MalformedResponse,
             format!("probe output did not parse as a v2 envelope: {e}"),
         ),

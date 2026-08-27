@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{Observation, SideEffect, StoredObservation};
@@ -50,6 +51,8 @@ pub struct ReadReport {
     pub malformed: usize,
     /// Rows sitting in quarantine, excluded from `rows`.
     pub quarantined: usize,
+    /// Files that could not be opened at all. Surfaced, not swallowed.
+    pub unreadable_files: Vec<String>,
 }
 
 impl Store {
@@ -118,26 +121,24 @@ impl Store {
     /// an identity that can fail open is not an identity.
     pub fn machine_id() -> Option<String> {
         if let Ok(v) = std::env::var("CONTINUUM_MACHINE_ID") {
-            if !v.trim().is_empty() {
-                return Some(sanitize(v.trim()));
+            if let Some(id) = distinctive(&v) {
+                return Some(id);
             }
         }
         if let Ok(v) = fs::read_to_string("/etc/hostname") {
-            if !v.trim().is_empty() {
-                return Some(sanitize(v.trim()));
+            // First line only: a commented or multi-line file would otherwise
+            // sanitize to something stable, plausible and wrong.
+            if let Some(id) = v.lines().next().and_then(distinctive) {
+                return Some(id);
             }
         }
         let out = std::process::Command::new("hostname").output().ok()?;
         if !out.status.success() {
             return None;
         }
-        let v = String::from_utf8(out.stdout).ok()?;
-        let v = v.trim();
-        if v.is_empty() {
-            None
-        } else {
-            Some(sanitize(v))
-        }
+        String::from_utf8(out.stdout)
+            .ok()
+            .and_then(|v| v.lines().next().and_then(distinctive))
     }
 
     // -- sequence ------------------------------------------------------------
@@ -145,15 +146,49 @@ impl Store {
     /// Monotonic per machine. Ordering *within* a machine is sound; ordering
     /// across machines is not, because clocks skew — hence a sequence rather
     /// than a timestamp.
+    ///
+    /// The caller must hold the write lock: this is a read-modify-write, and
+    /// two unsynchronised callers would both read N and both stamp N+1. A
+    /// duplicate sequence is worse than it sounds — `newest_by_probe` compares
+    /// `(ingested_at_unix, sequence)`, so equal tuples compare equal, `newer`
+    /// stays false, and the *first-encountered* row wins. That is the older
+    /// one, so `status` silently shows a stale reading.
     fn next_sequence(&self, machine: &str) -> Result<u64> {
         let path = self.state_dir().join(format!("sequence-{machine}"));
-        let current: u64 = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        let raw = fs::read_to_string(&path).unwrap_or_default();
+        let current: u64 = if raw.trim().is_empty() {
+            0
+        } else {
+            raw.trim().parse().map_err(|_| {
+                color_eyre::eyre::eyre!(
+                    "sequence counter {} is corrupt ({:?}); refusing to restart numbering \
+                     and silently reissue sequences that already exist in the log",
+                    path.display(),
+                    raw.trim().chars().take(40).collect::<String>()
+                )
+            })?
+        };
         let next = current + 1;
         write_atomic(&path, next.to_string().as_bytes())?;
         Ok(next)
+    }
+
+    /// Take the per-machine write lock.
+    ///
+    /// Guards the sequence read-modify-write and the append together, so a
+    /// scheduled run and a hand-run `refresh` cannot interleave. Advisory
+    /// `flock`, released by the OS when the handle closes — so a killed process
+    /// never leaves a stale lock, which a lockfile-with-retry would.
+    fn lock(&self, machine: &str) -> Result<File> {
+        let path = self.state_dir().join(format!("write-{machine}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
     }
 
     // -- writing -------------------------------------------------------------
@@ -175,6 +210,9 @@ impl Store {
             }
         };
 
+        // Held across sequence allocation AND the append.
+        let _guard = self.lock(&machine)?;
+
         let stored = StoredObservation {
             observation,
             machine_id: machine.clone(),
@@ -183,14 +221,8 @@ impl Store {
             ingested_at_unix: now.timestamp(),
         };
 
-        let line = serde_json::to_string(&stored)?;
         let path = self.observations_dir().join(format!("{machine}.jsonl"));
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("appending to {}", path.display()))?;
-        writeln!(f, "{line}")?;
+        append_line(&path, &serde_json::to_string(&stored)?)?;
         restrict(&path);
 
         // Convenience pointer for cheap reads; the JSONL remains authoritative.
@@ -205,8 +237,7 @@ impl Store {
     fn quarantine(&self, reason: &str, observation: &Observation) -> Result<()> {
         self.ensure_dirs()?;
         let path = self.quarantine_dir().join(format!("{reason}.jsonl"));
-        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(f, "{}", serde_json::to_string(observation)?)?;
+        append_line(&path, &serde_json::to_string(observation)?)?;
         restrict(&path);
         Ok(())
     }
@@ -233,9 +264,19 @@ impl Store {
             if !name.ends_with(".jsonl") {
                 continue;
             }
-            let file = File::open(entry.path())?;
+            // A file that will not open, or a line that is not UTF-8, must not
+            // abort the whole read. `doctor` routes through here, so propagating
+            // would kill the diagnostic on exactly the corruption it exists to
+            // report — and would skip every machine whose file sorts later.
+            let Ok(file) = File::open(entry.path()) else {
+                report.unreadable_files.push(name);
+                continue;
+            };
             for line in BufReader::new(file).lines() {
-                let line = line?;
+                let Ok(line) = line else {
+                    report.malformed += 1;
+                    continue;
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -288,8 +329,16 @@ impl Store {
 
     // -- probe metadata ------------------------------------------------------
 
+    /// Per machine, like `sequence-` and `notified-`.
+    ///
+    /// A shared file here is a two-writer read-whole/modify-whole under
+    /// Syncthing: one machine's update silently reverts the other's, and this
+    /// file gates the *chargeable* and *quota-consuming* probes, so a lost
+    /// update buys extra billed calls. It also made the cadence gate global —
+    /// one machine's run suppressing the other's for an hour.
     fn meta_path(&self) -> PathBuf {
-        self.state_dir().join("probe-meta.json")
+        let machine = Self::machine_id().unwrap_or_else(|| "unresolved".into());
+        self.state_dir().join(format!("probe-meta-{machine}.json"))
     }
 
     pub fn probe_meta(&self) -> BTreeMap<String, ProbeMeta> {
@@ -368,11 +417,56 @@ fn restrict(path: &Path) {
 #[cfg(not(unix))]
 fn restrict(_path: &Path) {}
 
+/// Names that identify no particular machine.
+///
+/// `localhost` is non-empty, so the old code accepted it — which reinstates the
+/// `unknown-machine` pooling that Rule 3 exists to abolish, under a different
+/// name. Two hosts would share one file and one counter.
+const NON_DISTINCTIVE: &[&str] = &["localhost", "localhost-localdomain", "unknown", "-", ""];
+
+/// Sanitize and reject anything that does not actually identify a machine.
+fn distinctive(raw: &str) -> Option<String> {
+    let id = sanitize(raw.trim());
+    if id.is_empty() || NON_DISTINCTIVE.contains(&id.as_str()) {
+        return None;
+    }
+    Some(id)
+}
+
+/// Lower-cased deliberately.
+///
+/// The store is replicated to a case-insensitive filesystem (APFS). Two ids
+/// differing only in case are two files on Linux and one on the Mac, which
+/// Syncthing surfaces as a case conflict it cannot resolve — and the folder
+/// stops syncing. Folding case costs a theoretical collision between hosts
+/// named `Foo` and `foo`, which is not a real configuration.
 fn sanitize(input: &str) -> String {
     input
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect()
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Append one line with a single `write_all`.
+///
+/// `writeln!` issues the payload and the newline as two `write(2)` calls.
+/// `O_APPEND` makes each call atomic but not the pair, so two concurrent
+/// appenders interleave: measured at 756 intact lines out of 40,000 across two
+/// processes. Building the line with its newline and issuing one write restores
+/// atomicity for records below the pipe buffer, which these are (~1.3 KB).
+fn append_line(path: &Path, line: &str) -> Result<()> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("appending to {}", path.display()))?;
+    f.write_all(buf.as_bytes())
+        .with_context(|| format!("writing to {}", path.display()))?;
+    Ok(())
 }
 
 /// Write via a temp file in the same directory, then rename. A rename within
@@ -445,6 +539,101 @@ mod tests {
         }
         assert_eq!(seen, vec![seen[0], seen[0] + 1, seen[0] + 2]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_interleave_or_collide() {
+        // The defect this replaces was measured at 756 intact lines out of
+        // 40,000 across two processes. Threads share the process lock, so this
+        // guards the single-write_all change and the sequence lock together.
+        let root = tmp_root("concurrent");
+        fs::create_dir_all(root.join("state")).unwrap();
+        let n = 40;
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let store = Store::new(&root);
+                    for _ in 0..n {
+                        store
+                            .append(Observation::ok(
+                                "codex", "0.1.0", "openai", SideEffect::Passive, vec![],
+                            ))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let report = store_at(&root).read_all().unwrap();
+        assert_eq!(report.rows.len(), 4 * n, "every line must survive intact");
+        assert_eq!(report.malformed, 0, "no interleaved or truncated lines");
+
+        let mut seqs: Vec<u64> = report.rows.iter().map(|r| r.sequence).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 4 * n, "sequences must be unique");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn store_at(root: &PathBuf) -> Store {
+        Store::new(root)
+    }
+
+    #[test]
+    fn a_corrupt_sequence_counter_is_an_error_not_a_silent_restart() {
+        let root = tmp_root("corruptseq");
+        let store = Store::new(&root);
+        store
+            .append(Observation::ok("codex", "0.1.0", "openai", SideEffect::Passive, vec![]))
+            .unwrap();
+        let machine = Store::machine_id().unwrap();
+        fs::write(root.join("state").join(format!("sequence-{machine}")), "garbage").unwrap();
+        // Restarting at 1 would reissue sequences that already exist in the log.
+        assert!(store
+            .append(Observation::ok("codex", "0.1.0", "openai", SideEffect::Passive, vec![]))
+            .is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bad_line_does_not_abort_the_whole_read() {
+        use std::io::Write as _;
+        let root = tmp_root("badbyte");
+        let store = Store::new(&root);
+        store
+            .append(Observation::ok("codex", "0.1.0", "openai", SideEffect::Passive, vec![]))
+            .unwrap();
+        // Invalid UTF-8 mid-file, then a further valid row.
+        let machine = Store::machine_id().unwrap();
+        let path = root.join("observations").join(format!("{machine}.jsonl"));
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        }
+        store
+            .append(Observation::ok("grok", "0.1.0", "xai", SideEffect::Passive, vec![]))
+            .unwrap();
+
+        let report = store.read_all().expect("read must not abort");
+        assert_eq!(report.rows.len(), 2, "rows either side of the bad line survive");
+        assert_eq!(report.malformed, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_distinctive_hostnames_are_rejected() {
+        // `localhost` reinstates the unknown-machine pooling under another name.
+        assert!(distinctive("localhost").is_none());
+        assert!(distinctive("  ").is_none());
+        assert!(distinctive("unknown").is_none());
+        assert_eq!(distinctive("nimbini").as_deref(), Some("nimbini"));
+        // First line only, and case folded for APFS.
+        assert_eq!(distinctive("Williams-MacBook-Air.local").as_deref(),
+                   Some("williams-macbook-air-local"));
     }
 
     #[test]
