@@ -1,4 +1,4 @@
-//! `usage-probe-anthropic-api` — the metered Anthropic API key (PracticeForge DPA).
+//! `usage-probe-anthropic-api` — a metered (pay-per-use) Anthropic API key.
 //!
 //! The fourth ontology, and the discriminating one. Everything else in the
 //! observatory so far is a subscription with reset windows. This is:
@@ -13,15 +13,20 @@
 //! required no schema change, which is the acceptance evidence the forum asked
 //! for.
 //!
-//! **This key is the PracticeForge clinical billing stream.** The probe sends a
-//! single fixed token ("hi") and reads response headers. It transmits no
-//! patient data and reads none — but it does spend a fraction of a cent, so it
-//! declares `chargeable` and core holds it to the costly cadence.
+//! **The key may belong to another application's billing stream.** The probe
+//! sends a single fixed token ("hi") and reads response headers. It transmits
+//! nothing else and reads nothing else — but it does spend a fraction of a
+//! cent, so it declares `chargeable` and core holds it to the costly cadence.
+//!
+//! Configuration (see `read_key`): `~/.config/continuum/anthropic-api.toml`,
+//! overridable with `CONTINUUM_ANTHROPIC_API_CONFIG`, or the key itself in
+//! `CONTINUUM_ANTHROPIC_API_KEY`. `--check-key` resolves the configuration and
+//! prints where the key came from without calling the API.
 
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Monetary, Observation, ObservationCost, Outcome,
+    Facets, FailureKind, KindHint, Measure, Observation, ObservationCost, Outcome,
     Resource, SideEffect,
 };
 
@@ -32,6 +37,24 @@ const API: &str = "https://api.anthropic.com/v1/messages";
 const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 fn main() -> ExitCode {
+    if std::env::args().any(|a| a == "--check-key") {
+        return match read_key() {
+            Ok(src) => {
+                println!(
+                    "key: {} chars from {}; assistant={} account={}",
+                    src.key.len(),
+                    src.origin,
+                    src.assistant,
+                    src.account
+                );
+                ExitCode::SUCCESS
+            }
+            Err(obs) => {
+                println!("{}", serde_json::to_string(&obs).expect("envelope serialises"));
+                ExitCode::FAILURE
+            }
+        };
+    }
     let obs = probe();
     println!("{}", serde_json::to_string(&obs).expect("envelope serialises"));
     match obs.outcome {
@@ -44,24 +67,37 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
     Observation::failure(PROBE, VERSION, PROVIDER, kind, msg)
 }
 
-/// The DPA key lives in PracticeForge's secrets file under `[ai] api_key`.
-/// Only the probe process ever holds it; core never sees a credential.
-fn read_key() -> Result<String, Observation> {
-    let home = std::env::var("HOME").map_err(|_| fail(FailureKind::Unknown, "HOME is not set"))?;
-    let path = format!("{home}/.config/practiceforge/secrets.toml");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        fail(
-            FailureKind::InvalidCredentials,
-            format!("cannot read {path}: {e}"),
-        )
-    })?;
-    // NEVER interpolate the toml error's Display here. Unlike serde_json,
-    // `toml`'s Display echoes the offending SOURCE LINE verbatim — for a
-    // truncated or mis-quoted secrets.toml that line is `api_key = "sk-ant-...`,
-    // and this message travels into an append-only store inside a
-    // Syncthing-replicated tree. `message()` carries the reason without the
-    // source. Verified 2026-08-27: Display prints the key, message() does not.
-    let doc: toml::Value = text.parse::<toml::Value>().map_err(|e| {
+/// Resolved credential plus the labels the observation carries.
+struct KeySource {
+    key: String,
+    /// Observation label (`assistant`), default `anthropic-api`
+    assistant: String,
+    /// Observation label (`account`) — a label, never the key or an org id
+    account: String,
+    /// Human-readable provenance for `--check-key`
+    origin: String,
+}
+
+const DEFAULT_ASSISTANT: &str = "anthropic-api";
+const DEFAULT_ACCOUNT: &str = "metered";
+
+fn expand_tilde(p: &str, home: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => format!("{home}/{rest}"),
+        None => p.to_string(),
+    }
+}
+
+/// Parse TOML without ever echoing the source. NEVER interpolate the toml
+/// error's Display: unlike serde_json, it echoes the offending SOURCE LINE
+/// verbatim — for a truncated or mis-quoted secrets file that line is
+/// `api_key = "sk-ant-...`, and this message travels into an append-only
+/// store inside a file-synced tree. `message()` carries the reason without the
+/// source. Verified 2026-08-27: Display prints the key, message() does not.
+fn parse_toml_file(path: &str) -> Result<toml::Value, Observation> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| fail(FailureKind::InvalidCredentials, format!("cannot read {path}: {e}")))?;
+    text.parse::<toml::Value>().map_err(|e| {
         fail(
             FailureKind::InvalidCredentials,
             format!(
@@ -70,13 +106,71 @@ fn read_key() -> Result<String, Observation> {
                 e.message()
             ),
         )
-    })?;
-    doc.get("ai")
-        .and_then(|ai| ai.get("api_key"))
+    })
+}
+
+/// `api_key` at the top level or under `[ai]`, non-empty.
+fn key_in(doc: &toml::Value) -> Option<String> {
+    doc.get("api_key")
+        .or_else(|| doc.get("ai").and_then(|ai| ai.get("api_key")))
         .and_then(|k| k.as_str())
-        .filter(|k| !k.trim().is_empty())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| fail(FailureKind::InvalidCredentials, "[ai] api_key is absent or empty"))
+}
+
+/// Where the key comes from, in order:
+///
+/// 1. `CONTINUUM_ANTHROPIC_API_KEY` — the key itself (containers, CI).
+/// 2. A TOML config at `CONTINUUM_ANTHROPIC_API_CONFIG`, else
+///    `~/.config/continuum/anthropic-api.toml`, carrying either
+///    `api_key = "…"` or `key_file = "~/path/to/other.toml"` — a file whose
+///    top-level or `[ai]` `api_key` holds the key, so a key shared with another
+///    application is referenced rather than copied. Optional `assistant` and
+///    `account` labels tag the observation.
+///
+/// Only the probe process ever holds the key; core never sees a credential.
+fn read_key() -> Result<KeySource, Observation> {
+    let home = std::env::var("HOME").map_err(|_| fail(FailureKind::Unknown, "HOME is not set"))?;
+
+    if let Ok(k) = std::env::var("CONTINUUM_ANTHROPIC_API_KEY") {
+        if !k.trim().is_empty() {
+            return Ok(KeySource {
+                key: k.trim().to_string(),
+                assistant: DEFAULT_ASSISTANT.into(),
+                account: DEFAULT_ACCOUNT.into(),
+                origin: "CONTINUUM_ANTHROPIC_API_KEY".into(),
+            });
+        }
+    }
+
+    let config_path = std::env::var("CONTINUUM_ANTHROPIC_API_CONFIG")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| expand_tilde(&p, &home))
+        .unwrap_or_else(|| format!("{home}/.config/continuum/anthropic-api.toml"));
+    let config = parse_toml_file(&config_path)?;
+
+    let label = |name: &str, default: &str| -> String {
+        config.get(name).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default).to_string()
+    };
+    let assistant = label("assistant", DEFAULT_ASSISTANT);
+    let account = label("account", DEFAULT_ACCOUNT);
+
+    if let Some(key) = key_in(&config) {
+        return Ok(KeySource { key, assistant, account, origin: config_path });
+    }
+    if let Some(key_file) = config.get("key_file").and_then(|v| v.as_str()).map(|p| expand_tilde(p, &home)) {
+        let doc = parse_toml_file(&key_file)?;
+        return match key_in(&doc) {
+            Some(key) => Ok(KeySource { key, assistant, account, origin: format!("{config_path} → key_file {key_file}") }),
+            None => Err(fail(FailureKind::InvalidCredentials, format!("{key_file}: api_key is absent or empty"))),
+        };
+    }
+    Err(fail(
+        FailureKind::InvalidCredentials,
+        format!("{config_path}: neither api_key nor key_file is set"),
+    ))
 }
 
 /// Build a rolling-bucket resource from the `-limit` / `-remaining` / `-reset`
@@ -139,10 +233,11 @@ fn chrono_parse(value: &str) -> Option<i64> {
 }
 
 fn probe() -> Observation {
-    let key = match read_key() {
+    let src = match read_key() {
         Ok(k) => k,
         Err(obs) => return obs,
     };
+    let key = src.key.clone();
 
     let body = serde_json::json!({
         "model": PROBE_MODEL,
@@ -210,9 +305,9 @@ fn probe() -> Observation {
     }
 
     let mut obs = Observation::ok(PROBE, VERSION, PROVIDER, SideEffect::Chargeable, resources);
-    obs.assistant = Some("practiceforge".to_string());
-    // A label, not the key and not an org id.
-    obs.account = Some("dpa-metered".to_string());
+    // Labels from the config (never the key and never an org id).
+    obs.assistant = Some(src.assistant.clone());
+    obs.account = Some(src.account.clone());
     if let Outcome::Ok { cost, raw, .. } = &mut obs.outcome {
         *cost = Some(ObservationCost {
             requests: Some(1),

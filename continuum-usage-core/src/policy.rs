@@ -9,7 +9,7 @@
 //!
 //! * **Scarcity** — how close am I to being unable to work?
 //! * **Perishability** — is there surplus that expires unused if I don't spend
-//!   it now? This is William's "might as well" case.
+//!   it now? This is the "might as well" case.
 //!
 //! They are orthogonal. A metered API key has scarcity (rate limits) and no
 //! perishability (spending faster is never an opportunity). Grok has neither
@@ -105,7 +105,7 @@ pub enum AxisState {
 }
 
 impl AxisState {
-    /// Worth putting in front of William unprompted.
+    /// Worth putting in front of the user unprompted.
     pub fn is_notable(self) -> bool {
         matches!(
             self,
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn a_burst_is_caught_even_though_utilization_reads_comfortable() {
-        // William's real Grok numbers, 2026-08-27. 11,558 of 15,500 credits
+        // Real Grok numbers observed 2026-08-27. 11,558 of 15,500 credits
         // used = 75%, under the 75% threshold, and four days to the reset.
         // But 6,523 of that burned in the last four days: at that rate the
         // remaining 3,942 lasts about 2.4 days, not 4.

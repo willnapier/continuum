@@ -280,7 +280,7 @@ mod tests {
         // The actual pattern from the runaway session (4 messages)
         let mut messages = Vec::new();
         for _ in 0..50 {
-            messages.push(("user".to_string(), "Please read documentation in ~/Assistants/shared".to_string()));
+            messages.push(("user".to_string(), "Please read documentation in ~/docs/shared".to_string()));
             messages.push(("assistant".to_string(), "Key points after reading the shared docs: Universal knowledge base...".to_string()));
             messages.push(("user".to_string(), "Please read through all documentation relevant to continuum".to_string()));
             messages.push(("assistant".to_string(), "Continuum documentation highlights (all read): Current state...".to_string()));

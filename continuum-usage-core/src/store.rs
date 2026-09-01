@@ -70,8 +70,20 @@ impl Store {
                 return Ok(PathBuf::from(v));
             }
         }
+        Ok(Self::continuum_home()?.join("continuum-usage/v2"))
+    }
+
+    /// Root under which Continuum keeps its trees. `CONTINUUM_HOME` overrides;
+    /// the default is `$HOME/Assistants`, the layout the documentation describes.
+    fn continuum_home() -> Result<PathBuf> {
+        if let Some(v) = std::env::var_os("CONTINUUM_HOME") {
+            let v = PathBuf::from(v);
+            if !v.as_os_str().is_empty() {
+                return Ok(v);
+            }
+        }
         let home = std::env::var("HOME").context("HOME is not set")?;
-        Ok(PathBuf::from(home).join("Assistants/continuum-usage/v2"))
+        Ok(PathBuf::from(home).join("Assistants"))
     }
 
     pub fn open_default() -> Result<Self> {
@@ -364,11 +376,10 @@ impl Store {
     /// Move v1's `unknown-machine.jsonl` into quarantine.
     ///
     /// Quarantined, not merged: a short history you can attribute beats a longer
-    /// one you cannot. William accepted that data loss explicitly.
+    /// one you cannot. The owner accepted that data loss explicitly.
     pub fn quarantine_v1_unknown_machine(&self) -> Result<usize> {
         self.ensure_dirs()?;
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        let v1 = PathBuf::from(&home).join("Assistants/continuum-usage/observations/unknown-machine.jsonl");
+        let v1 = Self::continuum_home()?.join("continuum-usage/observations/unknown-machine.jsonl");
         if !v1.exists() {
             return Ok(0);
         }
@@ -386,10 +397,10 @@ impl Store {
     /// this host *emits* but migrated nothing already on disk, and on macOS that
     /// went unnoticed: **APFS is case-insensitive**, so the new lowercase path
     /// resolved straight onto the existing capitalised files. Newly-created
-    /// files took the folded name while `observations/Williams-MacBook-Air-local.jsonl`
+    /// files took the folded name while `observations/Some-MacBook-Air-local.jsonl`
     /// kept being appended to — leaving **one file holding two ids**, the older
-    /// rows under `Williams-MacBook-Air-local` and the newer under
-    /// `williams-macbook-air-local`. Anything grouping by `machine_id` then
+    /// rows under `Some-MacBook-Air-local` and the newer under
+    /// `some-macbook-air-local`. Anything grouping by `machine_id` then
     /// counts one machine as two. On a case-sensitive filesystem the same change
     /// yields two separate files instead — the same split, differently shaped.
     ///
@@ -804,10 +815,10 @@ mod tests {
         assert!(distinctive("localhost").is_none());
         assert!(distinctive("  ").is_none());
         assert!(distinctive("unknown").is_none());
-        assert_eq!(distinctive("nimbini").as_deref(), Some("nimbini"));
+        assert_eq!(distinctive("desk").as_deref(), Some("desk"));
         // First line only, and case folded for APFS.
-        assert_eq!(distinctive("Williams-MacBook-Air.local").as_deref(),
-                   Some("williams-macbook-air-local"));
+        assert_eq!(distinctive("Some-MacBook-Air.local").as_deref(),
+                   Some("some-macbook-air-local"));
     }
 
     #[test]
@@ -826,7 +837,7 @@ mod tests {
             .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
             .unwrap()
             .path();
-        let conflict = dir.join("nimbini.sync-conflict-20260827-120000-ABCDEFG.jsonl");
+        let conflict = dir.join("desk.sync-conflict-20260827-120000-ABCDEFG.jsonl");
         fs::copy(&real, &conflict).unwrap();
 
         let report = store.read_all().unwrap();
@@ -937,7 +948,7 @@ mod fold_tests {
     #[test]
     fn folds_filename_and_every_row() {
         let root = tmp_root("basic");
-        let store = seed(&root, "Williams-MacBook-Air-local");
+        let store = seed(&root, "Some-MacBook-Air-local");
 
         let r = store.fold_machine_ids().unwrap();
         assert_eq!(r.rows_rewritten, 2);
@@ -945,19 +956,19 @@ mod fold_tests {
 
         let folded = store
             .observations_dir()
-            .join("williams-macbook-air-local.jsonl");
+            .join("some-macbook-air-local.jsonl");
         let text = fs::read_to_string(&folded).unwrap();
-        assert!(text.contains(r#""machine_id":"williams-macbook-air-local""#));
-        assert!(!text.contains("Williams-MacBook-Air-local"));
+        assert!(text.contains(r#""machine_id":"some-macbook-air-local""#));
+        assert!(!text.contains("Some-MacBook-Air-local"));
 
         // The state files must move with it, or the counter is orphaned.
         assert!(store
             .state_dir()
-            .join("sequence-williams-macbook-air-local")
+            .join("sequence-some-macbook-air-local")
             .exists());
         assert!(store
             .state_dir()
-            .join("notified-williams-macbook-air-local.json")
+            .join("notified-some-macbook-air-local.json")
             .exists());
 
         // On APFS the old spelling resolves to the same inode, so `exists()`
@@ -966,7 +977,7 @@ mod fold_tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["williams-macbook-air-local.jsonl".to_string()]);
+        assert_eq!(names, vec!["some-macbook-air-local.jsonl".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }

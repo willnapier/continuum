@@ -117,6 +117,20 @@ Your conversations are now **automatically saved** to `~/Assistants/continuum-lo
 
 ## Usage
 
+### Configuration
+
+Everything has a default; nothing is hard-wired to one machine or user.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `CONTINUUM_HOME` | `~/Assistants` | Root under which `continuum-logs/` and `continuum-usage/` live |
+| `USAGEWATCH_STORE` | `$CONTINUUM_HOME/continuum-usage/v2` | Usage observation store (override for scratch runs) |
+| `CONTINUUM_MACHINE_ID` | hostname | Machine identity used to namespace per-machine files |
+| `CONTINUUM_ANTHROPIC_API_KEY` | unset | Metered Anthropic key for `usage-probe-anthropic-api` (containers, CI) |
+| `CONTINUUM_ANTHROPIC_API_CONFIG` | `~/.config/continuum/anthropic-api.toml` | TOML with `api_key = "…"` **or** `key_file = "~/other/app/secrets.toml"` (whose top-level or `[ai]` `api_key` is used, so a key shared with another application is referenced, not copied), plus optional `assistant` / `account` labels |
+
+`usage-probe-anthropic-api --check-key` resolves that configuration and reports where the key came from without calling the API.
+
 ### Automatic Capture (All Assistants)
 
 **Every conversation is automatically captured:**

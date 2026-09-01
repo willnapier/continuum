@@ -289,7 +289,7 @@ mod tests {
     use super::*;
 
     fn snapshot() -> Value {
-        // Shape taken verbatim from a live nimbini observation, 2026-08-27.
+        // Shape taken verbatim from a live observation, 2026-08-27.
         serde_json::json!({
             "limitId": "codex",
             "planType": "plus",

@@ -39,7 +39,7 @@ const TOPUP_URL: &str = "https://cli-chat-proxy.grok.com/v1/auto-topup-rule";
 
 /// The vendor's credit unit is **cents**.
 ///
-/// Confirmed by William 2026-08-27: the TUI renders his balance as `$41.31`,
+/// Confirmed by observation 2026-08-27: a balance the TUI rendered as `$41.31` was
 /// i.e. 4,131 credits. So a 15,500 monthly limit is $155.00 and the auto
 /// top-up rule reads $50 trigger / $50 top-up / $100 monthly cap. Undocumented
 /// by xAI, established by observation.
@@ -66,7 +66,7 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
 ///
 /// `costUsdTicks / 1e9` is a USD-like figure the TUI reports per turn. The
 /// billing endpoint's `used` counter runs in credits, and the two reconcile at
-/// this divisor: August on nimbini summed to 702,130,641,560 ticks = 11,702
+/// this divisor: One month of observations summed to 702,130,641,560 ticks = 11,702
 /// credits against a billed `used` of 11,558 — within 1.2%. So one credit is
 /// roughly six cents of list-price inference.
 ///
@@ -443,7 +443,7 @@ mod tests {
     use continuum_usage_core::policy::{assess, AxisState, Policy};
 
     fn live_shape() -> serde_json::Value {
-        // Verbatim shape from GET /v1/billing on nimbini, 2026-08-27.
+        // Verbatim shape from GET /v1/billing from a live observation, 2026-08-27.
         serde_json::json!({"config":{
             "monthlyLimit":{"val":15500},
             "used":{"val":11558},
@@ -469,7 +469,7 @@ mod tests {
         assert!(extract("not json").is_none());
     }
 
-    // Verbatim from GET /v1/auto-topup-rule on nimbini, 2026-08-27.
+    // Verbatim from GET /v1/auto-topup-rule from a live observation, 2026-08-27.
     fn live_rule() -> serde_json::Value {
         serde_json::json!({"rule":{
             "enabled": true,
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn ticks_convert_to_credits_at_the_reconciled_rate() {
-        // August on nimbini reconciled to within 1.2% of the billed figure.
+        // One observed month reconciled to within 1.2% of the billed figure.
         let august_ticks = 702_130_641_560f64;
         let credits = august_ticks / TICKS_PER_CREDIT;
         assert!((credits - 11_702.0).abs() < 1.0, "got {credits}");

@@ -12,11 +12,25 @@ pub struct PlainTextWriter {
     base_dir: PathBuf,
 }
 
+/// Root under which Continuum keeps its trees (`continuum-logs/`,
+/// `continuum-usage/`). `CONTINUUM_HOME` overrides it; the default is
+/// `$HOME/Assistants`, the layout the documentation describes.
+pub fn continuum_home() -> Result<PathBuf> {
+    if let Some(v) = std::env::var_os("CONTINUUM_HOME") {
+        let v = PathBuf::from(v);
+        if !v.as_os_str().is_empty() {
+            return Ok(v);
+        }
+    }
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join("Assistants"))
+}
+
 impl PlainTextWriter {
-    /// Create a new writer with default base directory
+    /// Create a new writer with the default base directory
+    /// (`$CONTINUUM_HOME/continuum-logs`, i.e. `~/Assistants/continuum-logs`)
     pub fn new() -> Result<Self> {
-        let home = std::env::var("HOME").context("HOME not set")?;
-        let base_dir = PathBuf::from(home).join("Assistants").join("continuum-logs");
+        let base_dir = continuum_home()?.join("continuum-logs");
         Ok(PlainTextWriter { base_dir })
     }
 

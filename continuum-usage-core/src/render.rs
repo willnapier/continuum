@@ -228,7 +228,7 @@ pub fn status(
     out
 }
 
-/// Only what is worth interrupting William for.
+/// Only what is worth interrupting the user for.
 pub fn alerts(
     rows: &[StoredObservation],
     baselines: &Baselines,
@@ -310,7 +310,7 @@ mod tests {
     fn stored(obs: Observation, age: i64, now: i64) -> StoredObservation {
         StoredObservation {
             observation: obs,
-            machine_id: "nimbini".into(),
+            machine_id: "desk".into(),
             sequence: 1,
             ingested_at: "".into(),
             ingested_at_unix: now - age,
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn a_prepaid_allowance_is_glossed_as_work_not_money() {
-        // William's real Grok numbers: 3,942 credits left, 16 sessions this
+        // Real observed Grok numbers: 3,942 credits left, 16 sessions this
         // week costing 6,523 => about 408 per session => about 9 sessions.
         let r = res(
             "grok-monthly-credits",

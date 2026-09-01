@@ -2,7 +2,7 @@
 //!
 //! Dedup is **per machine**, deliberately. Cross-machine dedup would need shared
 //! mutable state over a file-sync protocol — a distributed lock built on the
-//! wrong primitive. Seeing the same alert on both nimbini and the Mac is the
+//! wrong primitive. Seeing the same alert on both machines is the
 //! honest v1 cost, and it is cheaper than the bug that lock would introduce.
 //!
 //! An event fires once per *window*, not once per observation. The window key
@@ -212,7 +212,7 @@ mod tests {
     fn stored(obs: Observation) -> StoredObservation {
         StoredObservation {
             observation: obs,
-            machine_id: "nimbini".into(),
+            machine_id: "desk".into(),
             sequence: 1,
             ingested_at: String::new(),
             ingested_at_unix: NOW,
@@ -328,12 +328,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut log = DedupLog::load(&dir, "nimbini");
+        let mut log = DedupLog::load(&dir, "desk");
         assert!(!log.already_sent("e1"));
         log.mark("e1", NOW);
         log.save(NOW).unwrap();
 
-        let reloaded = DedupLog::load(&dir, "nimbini");
+        let reloaded = DedupLog::load(&dir, "desk");
         assert!(reloaded.already_sent("e1"));
         assert!(!reloaded.already_sent("e2"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -345,11 +345,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut log = DedupLog::load(&dir, "nimbini");
+        let mut log = DedupLog::load(&dir, "desk");
         log.mark("ancient", NOW);
         log.save(NOW + RETAIN_SECS + 1).unwrap();
 
-        assert!(!DedupLog::load(&dir, "nimbini").already_sent("ancient"));
+        assert!(!DedupLog::load(&dir, "desk").already_sent("ancient"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,8 +2,8 @@
   "schema_version": 2,
   "probe": { "name": "anthropic-api", "version": "fixture" },
   "provider": "anthropic",
-  "assistant": "practiceforge",
-  "account": "dpa-metered",
+  "assistant": "metered-app",
+  "account": "metered",
   "observed_at": "2026-08-27T14:00:00+00:00",
   "outcome": "ok",
   "side_effect": "request-consuming",
@@ -41,7 +41,7 @@
       "kind_hint": "continuous",
       "facets": {
         "expires_unused": false,
-        "monetary": { "currency": "USD", "spent": 41.18 }
+        "monetary": { "currency": "USD", "spent": 12.34 }
       },
       "vendor_representative": false
     }

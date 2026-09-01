@@ -1,7 +1,7 @@
 //! Acceptance: the v2 contract must hold providers with genuinely different
 //! limit ontologies **without a schema bump**.
 //!
-//! Per the forum decision, the Anthropic DPA metered key ships as a checked-in
+//! Per the forum decision, the metered Anthropic API key ships as a checked-in
 //! fixture rather than a live probe in v1. Its job is to be the discriminating
 //! shape: monetary, rolling rather than fixed-reset, and with perishability
 //! structurally absent. If a future change to the envelope breaks it, that is
@@ -112,7 +112,7 @@ fn the_overage_row_keeps_both_its_reset_and_its_money() {
 
 #[test]
 fn weekly_surplus_late_in_the_window_is_an_opportunity() {
-    // The "might as well" case William asked for, on real numbers: 3% used on
+    // The "might as well" case the design asked for, on real numbers: 3% used on
     // the 7-day window with an hour to go before it resets.
     let obs = load("claude-max.json");
     let weekly = obs

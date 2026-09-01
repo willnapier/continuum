@@ -157,7 +157,7 @@ struct ImportArgs {
     /// Session ID to import (uses adapter's latest if not specified)
     #[arg(short, long)]
     session: Option<String>,
-    /// Output directory (default: ~/Assistants/continuum-logs)
+    /// Output directory (default: $CONTINUUM_HOME/continuum-logs, i.e. ~/Assistants/continuum-logs)
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -595,7 +595,8 @@ fn handle_stats() -> Result<()> {
     println!("  continuum-search \"your query\"\n");
     println!("To view timeline:");
     println!("  continuum-timeline 2025-11-09\n");
-    println!("📍 Log location: ~/Assistants/continuum-logs/\n");
+    let log_root = std::env::var("CONTINUUM_HOME").unwrap_or_else(|_| "~/Assistants".to_string());
+    println!("📍 Log location: {log_root}/continuum-logs/\n");
     Ok(())
 }
 
