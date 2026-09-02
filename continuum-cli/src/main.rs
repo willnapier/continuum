@@ -194,6 +194,29 @@ fn handle_import(args: &ImportArgs) -> Result<()> {
     }
 }
 
+/// Number of messages already stored for a session, or `None` if it has
+/// never been imported.
+fn existing_message_count(session_dir: &std::path::Path) -> Option<usize> {
+    let text = std::fs::read_to_string(session_dir.join("messages.jsonl")).ok()?;
+    Some(text.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+#[cfg(test)]
+mod codex_import_tests {
+    use super::existing_message_count;
+
+    #[test]
+    fn message_count_is_none_before_import_and_counts_lines_after() {
+        let dir = std::env::temp_dir().join(format!("continuum-codex-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(existing_message_count(&dir), None);
+        std::fs::write(dir.join("messages.jsonl"), "{\"a\":1}\n{\"b\":2}\n\n").unwrap();
+        assert_eq!(existing_message_count(&dir), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn import_codex_session(
     writer: &PlainTextWriter,
     adapter: &CodexAdapter,
@@ -214,12 +237,18 @@ fn import_codex_session(
 
     let compressor = MessageCompressor::new();
     let mut messages: Vec<(String, String)> = Vec::new();
-    let start_time = chrono::Utc::now().to_rfc3339();
+    // The session's own start time, not the import time (2026-09-02):
+    // stamping with `now` filed the same session under a new date on
+    // every 5-minute re-import, so it surfaced as "new" for weeks.
+    let mut start_time: Option<String> = None;
 
     // Read all messages
     for line_result in adapter.stream_session(&session_path)? {
         let line = line_result?;
         let entry: CodexLogEntry = serde_json::from_str(&line)?;
+        if start_time.is_none() {
+            start_time = entry.timestamp.clone();
+        }
 
         if entry.entry_type == "response_item" {
             if let Some(ref payload) = entry.payload {
@@ -238,9 +267,44 @@ fn import_codex_session(
         }
     }
 
+    let start_time = start_time
+        .or_else(|| {
+            std::fs::metadata(&session_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+        })
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
     // Compress messages to remove noise
     let compressed = compressor.compress_batch(&messages);
     let message_count = compressed.len();
+
+    // Idempotence (2026-09-02): `append_message` appends, so re-importing
+    // an unchanged session used to duplicate every message. If the
+    // session is already on disk with the same message count, do nothing;
+    // if it has grown, rewrite it rather than append to it.
+    let date = PlainTextWriter::extract_date(Some(&start_time));
+    let session_dir = writer.base_dir().join("codex").join(&date).join(session_id);
+    match existing_message_count(&session_dir) {
+        Some(n) if n == message_count => {
+            println!(
+                "= Codex session {} already imported ({} messages, {}); nothing to do",
+                session_id,
+                n,
+                session_dir.display()
+            );
+            return Ok(());
+        }
+        Some(n) => {
+            eprintln!(
+                "Codex session {} grew {} → {} messages; rewriting",
+                session_id, n, message_count
+            );
+            std::fs::remove_file(session_dir.join("messages.jsonl"))?;
+        }
+        None => {}
+    }
 
     // Loop detection - analyze messages before writing
     let detector = LoopDetector::new();
@@ -259,9 +323,6 @@ fn import_codex_session(
         }
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     }
-
-    // Extract date from start time
-    let date = PlainTextWriter::extract_date(Some(&start_time));
 
     // Write session
     writer.write_session(
