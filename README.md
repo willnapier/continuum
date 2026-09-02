@@ -180,7 +180,7 @@ continuum codex update
 continuum codex which
 ```
 
-Resolver precedence is: `CONTINUUM_CODEX_BIN` override, managed install, legacy user install, identity-filtered `PATH`, then system paths as a warned compatibility fallback. The wrapper sets a depth guard before launching the real CLI, turning a copied or misnamed wrapper into a clear error instead of recursive spawning. Codex's built-in npm self-update is not the managed update path; use `continuum codex update`.
+Resolver precedence is: `CONTINUUM_CODEX_BIN` override, managed install, legacy user install, identity-filtered `PATH`, then system paths as a warned compatibility fallback. The wrapper sets a depth guard before launching the real CLI, turning a copied or misnamed wrapper into a clear error instead of recursive spawning. Codex's built-in updater targets the ambient npm installation rather than Continuum's off-PATH copy, so the deployed Codex configuration sets `check_for_update_on_startup = false`; use `continuum codex update` instead.
 
 ### Import Web Conversations
 
