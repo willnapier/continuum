@@ -59,6 +59,13 @@ impl SideEffect {
 #[serde(rename_all = "kebab-case")]
 pub enum FailureKind {
     InvalidCredentials,
+    /// The stored credential has passed its own stated expiry and the tool
+    /// that owns it has not yet renewed it. Claude Code refreshes its OAuth
+    /// access token only while a session is running (about an 8-hour
+    /// lifetime), so an idle machine reaches this state routinely. Not a
+    /// fault and not a reason to re-authenticate: the last real reading
+    /// stands until that tool next runs. Emitted without spending a request.
+    StaleCredentials,
     ProviderOutage,
     MalformedResponse,
     NetworkFailure,
@@ -67,13 +74,22 @@ pub enum FailureKind {
     QuotaDenied,
     /// Core declined to run a costly probe this soon. Not a fault.
     SkippedByCadence,
+    /// Also the landing place for any kind this binary does not know yet: the
+    /// store is shared across machines, and one machine's newer probe must not
+    /// turn its rows into "malformed" on a machine that has not been rebuilt.
+    #[serde(other)]
     Unknown,
 }
 
 impl FailureKind {
-    /// `SkippedByCadence` is bookkeeping; everything else is worth surfacing.
+    /// `SkippedByCadence` and `StaleCredentials` are bookkeeping — the
+    /// reading could not be taken *yet*, and the last real one still stands.
+    /// Everything else is worth surfacing.
     pub fn is_fault(self) -> bool {
-        !matches!(self, FailureKind::SkippedByCadence)
+        !matches!(
+            self,
+            FailureKind::SkippedByCadence | FailureKind::StaleCredentials
+        )
     }
 }
 
@@ -431,6 +447,15 @@ mod tests {
         let json = serde_json::to_string(&obs).unwrap();
         let back: Observation = serde_json::from_str(&json).unwrap();
         assert_eq!(obs, back);
+    }
+
+    /// A kind from a newer binary must deserialise as `Unknown`, not fail the row.
+    #[test]
+    fn unknown_failure_kind_degrades_to_unknown() {
+        let k: FailureKind = serde_json::from_str("\"some-future-kind\"").unwrap();
+        assert_eq!(k, FailureKind::Unknown);
+        let k: FailureKind = serde_json::from_str("\"stale-credentials\"").unwrap();
+        assert_eq!(k, FailureKind::StaleCredentials);
     }
 
     #[test]

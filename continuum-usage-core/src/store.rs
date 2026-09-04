@@ -321,21 +321,20 @@ impl Store {
         Ok(newest_by_probe(self.read_all()?.rows.into_iter()))
     }
 
-    /// The newest *reading* per probe — cadence markers excluded.
+    /// The newest *reading* per probe — bookkeeping failures excluded.
     ///
-    /// A skip is bookkeeping, not a measurement. Letting it displace the last
-    /// real reading would mean any scheduled run blanked the status view, which
-    /// is precisely backwards: the reason we skipped is that the existing
-    /// reading is still fresh enough to use.
+    /// A cadence skip, or a credential that is merely waiting for its owning
+    /// tool to renew it, is bookkeeping, not a measurement. Letting either
+    /// displace the last real reading would blank the status view precisely
+    /// when the existing reading is the best information there is. Genuine
+    /// faults (`FailureKind::is_fault`) still displace it, because a rejected
+    /// token or an outage is news.
     pub fn latest_reading_per_probe(&self) -> Result<BTreeMap<String, StoredObservation>> {
         Ok(newest_by_probe(self.read_all()?.rows.into_iter().filter(|row| {
-            !matches!(
-                &row.observation.outcome,
-                crate::envelope::Outcome::Failure {
-                    kind: crate::envelope::FailureKind::SkippedByCadence,
-                    ..
-                }
-            )
+            match &row.observation.outcome {
+                crate::envelope::Outcome::Failure { kind, .. } => kind.is_fault(),
+                crate::envelope::Outcome::Ok { .. } => true,
+            }
         })))
     }
 
@@ -892,6 +891,45 @@ mod tests {
         assert!(matches!(
             reading["claude"].observation.outcome,
             crate::envelope::Outcome::Ok { .. }
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_credential_does_not_displace_the_last_real_reading() {
+        let root = tmp_root("staledisplace");
+        let store = Store::new(&root);
+        store
+            .append(Observation::ok("claude", "0.1.0", "anthropic", SideEffect::QuotaConsuming, vec![]))
+            .unwrap();
+        store
+            .append(Observation::failure(
+                "claude",
+                "0.1.0",
+                "anthropic",
+                FailureKind::StaleCredentials,
+                "token expired; renews on next session",
+            ))
+            .unwrap();
+        // A genuine rejection, by contrast, must displace it: that is news.
+        let reading = store.latest_reading_per_probe().unwrap();
+        assert!(matches!(
+            reading["claude"].observation.outcome,
+            crate::envelope::Outcome::Ok { .. }
+        ));
+        store
+            .append(Observation::failure(
+                "claude",
+                "0.1.0",
+                "anthropic",
+                FailureKind::InvalidCredentials,
+                "401 with an unexpired token",
+            ))
+            .unwrap();
+        let reading = store.latest_reading_per_probe().unwrap();
+        assert!(matches!(
+            reading["claude"].observation.outcome,
+            crate::envelope::Outcome::Failure { kind: FailureKind::InvalidCredentials, .. }
         ));
         let _ = fs::remove_dir_all(&root);
     }

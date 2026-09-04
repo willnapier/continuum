@@ -46,6 +46,32 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
 struct Credentials {
     access_token: String,
     subscription: Option<String>,
+    /// Claude Code's own `expiresAt` (Unix milliseconds) for the access token.
+    /// Absent from older blobs; when present it is authoritative, and the
+    /// probe refuses to spend a request on a token the vendor will reject.
+    expires_at_ms: Option<i64>,
+}
+
+/// How long the access token has been expired, if it has. `None` when the
+/// blob carries no expiry (older Claude Code) or the token is still live.
+fn expired_for_secs(expires_at_ms: Option<i64>, now_ms: i64) -> Option<i64> {
+    let exp = expires_at_ms?;
+    (now_ms >= exp).then(|| (now_ms - exp) / 1000)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn human_duration(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+    }
 }
 
 /// macOS keychain service under which Claude Code stores the credential blob.
@@ -132,6 +158,11 @@ fn parse_credentials(text: &str) -> Result<Credentials, String> {
             .get("subscriptionType")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        // Claude Code writes this as a JSON number of milliseconds. Tolerate
+        // a float (serde_json may parse large numbers that way) and absence.
+        expires_at_ms: oauth.get("expiresAt").and_then(|v| {
+            v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+        }),
     })
 }
 
@@ -243,6 +274,23 @@ fn probe() -> Observation {
         Err(obs) => return obs,
     };
 
+    // Claude Code refreshes this token only while a session is running, and
+    // it lives about eight hours — so on an idle machine it expires as a
+    // matter of routine. That is not a credential fault: the vendor will say
+    // 401, but the fix is the next Claude Code session, not a re-login. Say so,
+    // spend nothing, and leave the last real reading in place.
+    if let Some(secs) = expired_for_secs(creds.expires_at_ms, now_ms()) {
+        return fail(
+            FailureKind::StaleCredentials,
+            format!(
+                "Claude Code's OAuth access token expired {} ago; it renews itself on this \
+                 machine's next Claude Code session (no re-authentication needed). No \
+                 request spent; the last reading stands.",
+                human_duration(secs)
+            ),
+        );
+    }
+
     let body = serde_json::json!({
         "model": PROBE_MODEL,
         "max_tokens": 1,
@@ -263,9 +311,13 @@ fn probe() -> Observation {
         Ok(r) => (r, false),
         Err(ureq::Error::Status(429, r)) => (r, true),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+            // The expiry pre-check above already handled the routine case, so
+            // a rejection here means an unexpired token was refused: revoked,
+            // rotated elsewhere, or a blob with no expiry field. That one does
+            // warrant a re-login.
             return fail(
                 FailureKind::InvalidCredentials,
-                "Anthropic rejected the OAuth token (401/403); re-authenticate Claude Code",
+                "Anthropic rejected an unexpired OAuth token (401/403); re-authenticate Claude Code",
             )
         }
         Err(ureq::Error::Status(402, r)) => {
@@ -365,6 +417,35 @@ mod tests {
         let c = parse_credentials(BLOB).expect("valid blob parses");
         assert_eq!(c.access_token, "tok-123");
         assert_eq!(c.subscription.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn parses_expiry_when_present_and_tolerates_absence() {
+        let c = parse_credentials(
+            r#"{"claudeAiOauth":{"accessToken":"t","expiresAt":1788553396591}}"#,
+        )
+        .expect("blob with expiry parses");
+        assert_eq!(c.expires_at_ms, Some(1_788_553_396_591));
+        let c = parse_credentials(BLOB).expect("blob without expiry parses");
+        assert_eq!(c.expires_at_ms, None);
+    }
+
+    /// The whole point of the pre-check: an expired token must be reported as
+    /// stale *before* any request, and a live or unknown one must not be.
+    #[test]
+    fn expiry_precheck_is_strict_and_tolerant() {
+        let now = 1_000_000_000_000;
+        assert_eq!(expired_for_secs(Some(now - 90_000), now), Some(90));
+        assert_eq!(expired_for_secs(Some(now), now), Some(0));
+        assert_eq!(expired_for_secs(Some(now + 1), now), None);
+        assert_eq!(expired_for_secs(None, now), None);
+    }
+
+    #[test]
+    fn human_duration_reads_naturally() {
+        assert_eq!(human_duration(45), "45s");
+        assert_eq!(human_duration(600), "10m");
+        assert_eq!(human_duration(3600 * 14 + 120), "14h 2m");
     }
 
     #[test]
