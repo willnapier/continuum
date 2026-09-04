@@ -52,6 +52,26 @@ struct Credentials {
     expires_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialOrigin {
+    Primary,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    MacOsFileFallback,
+}
+
+/// Provenance stays beside the parsed credential so an expired fallback is
+/// described accurately without ever logging the credential itself.
+struct LoadedCredentials {
+    credentials: Credentials,
+    origin: CredentialOrigin,
+}
+
+struct CredentialSource {
+    label: &'static str,
+    origin: CredentialOrigin,
+    load: fn() -> Result<String, String>,
+}
+
 /// How long the access token has been expired, if it has. `None` when the
 /// blob carries no expiry (older Claude Code) or the token is still live.
 fn expired_for_secs(expires_at_ms: Option<i64>, now_ms: i64) -> Option<i64> {
@@ -74,6 +94,23 @@ fn human_duration(secs: i64) -> String {
     }
 }
 
+fn stale_credentials_message(origin: CredentialOrigin, secs: i64) -> String {
+    match origin {
+        CredentialOrigin::MacOsFileFallback => concat!(
+            "macOS keychain unavailable to this probe; fallback token is stale. ",
+            "Claude Code renews the live token on this machine's next Claude Code session ",
+            "(no re-authentication needed). No request spent; the last reading stands."
+        )
+        .to_string(),
+        CredentialOrigin::Primary => format!(
+            "Claude Code's OAuth access token expired {} ago; it renews itself on this \
+             machine's next Claude Code session (no re-authentication needed). No \
+             request spent; the last reading stands.",
+            human_duration(secs)
+        ),
+    }
+}
+
 /// macOS keychain service under which Claude Code stores the credential blob.
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -92,14 +129,31 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// So macOS tries the keychain first and falls back to the file; every other
 /// platform reads the file, as before. Both are parsed by the same code, since
 /// the keychain item holds the same JSON blob.
-fn credential_sources() -> Vec<(&'static str, Box<dyn Fn() -> Result<String, String>>)> {
-    let mut sources: Vec<(&'static str, Box<dyn Fn() -> Result<String, String>>)> = Vec::new();
-
+fn credential_sources() -> Vec<CredentialSource> {
     #[cfg(target_os = "macos")]
-    sources.push(("macOS login keychain", Box::new(read_keychain)));
+    {
+        vec![
+            CredentialSource {
+                label: "macOS login keychain",
+                origin: CredentialOrigin::Primary,
+                load: read_keychain,
+            },
+            CredentialSource {
+                label: "~/.claude/.credentials.json",
+                origin: CredentialOrigin::MacOsFileFallback,
+                load: read_credentials_file,
+            },
+        ]
+    }
 
-    sources.push(("~/.claude/.credentials.json", Box::new(read_credentials_file)));
-    sources
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![CredentialSource {
+            label: "~/.claude/.credentials.json",
+            origin: CredentialOrigin::Primary,
+            load: read_credentials_file,
+        }]
+    }
 }
 
 /// Read the credential blob from the macOS login keychain via `security`.
@@ -166,14 +220,19 @@ fn parse_credentials(text: &str) -> Result<Credentials, String> {
     })
 }
 
-fn read_credentials() -> Result<Credentials, Observation> {
+fn read_credentials() -> Result<LoadedCredentials, Observation> {
     // Report every source tried, so a failure says which stores were consulted
     // rather than implying the one hard-coded path is the only one there is.
     let mut tried: Vec<String> = Vec::new();
-    for (label, load) in credential_sources() {
-        match load().and_then(|text| parse_credentials(&text)) {
-            Ok(creds) => return Ok(creds),
-            Err(why) => tried.push(format!("{label}: {why}")),
+    for source in credential_sources() {
+        match (source.load)().and_then(|text| parse_credentials(&text)) {
+            Ok(credentials) => {
+                return Ok(LoadedCredentials {
+                    credentials,
+                    origin: source.origin,
+                })
+            }
+            Err(why) => tried.push(format!("{}: {why}", source.label)),
         }
     }
     Err(fail(
@@ -269,10 +328,14 @@ fn overage_resource(get: &dyn Fn(&str) -> Option<String>) -> Option<Resource> {
 }
 
 fn probe() -> Observation {
-    let creds = match read_credentials() {
+    let loaded = match read_credentials() {
         Ok(c) => c,
         Err(obs) => return obs,
     };
+    let LoadedCredentials {
+        credentials: creds,
+        origin,
+    } = loaded;
 
     // Claude Code refreshes this token only while a session is running, and
     // it lives about eight hours — so on an idle machine it expires as a
@@ -282,12 +345,7 @@ fn probe() -> Observation {
     if let Some(secs) = expired_for_secs(creds.expires_at_ms, now_ms()) {
         return fail(
             FailureKind::StaleCredentials,
-            format!(
-                "Claude Code's OAuth access token expired {} ago; it renews itself on this \
-                 machine's next Claude Code session (no re-authentication needed). No \
-                 request spent; the last reading stands.",
-                human_duration(secs)
-            ),
+            stale_credentials_message(origin, secs),
         );
     }
 
@@ -449,6 +507,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_fallback_names_the_unavailable_keychain_not_epoch_time() {
+        let message =
+            stale_credentials_message(CredentialOrigin::MacOsFileFallback, 496_820 * 3600);
+        assert!(message.contains("keychain unavailable to this probe"));
+        assert!(message.contains("fallback token is stale"));
+        assert!(!message.contains("496820"));
+        assert!(!message.contains("ago"));
+
+        let primary = stale_credentials_message(CredentialOrigin::Primary, 90);
+        assert!(primary.contains("1m ago"));
+    }
+
+    #[test]
     fn subscription_is_optional() {
         let c = parse_credentials(r#"{"claudeAiOauth":{"accessToken":"t"}}"#)
             .expect("token alone is enough");
@@ -491,11 +562,18 @@ mod tests {
     /// wrong order.
     #[test]
     fn source_order_is_platform_correct() {
-        let labels: Vec<&str> = credential_sources().into_iter().map(|(l, _)| l).collect();
+        let sources = credential_sources();
+        let labels: Vec<&str> = sources.iter().map(|source| source.label).collect();
         assert!(labels.contains(&"~/.claude/.credentials.json"));
         #[cfg(target_os = "macos")]
-        assert_eq!(labels[0], "macOS login keychain");
+        {
+            assert_eq!(labels[0], "macOS login keychain");
+            assert_eq!(sources[1].origin, CredentialOrigin::MacOsFileFallback);
+        }
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(labels.len(), 1);
+        {
+            assert_eq!(labels.len(), 1);
+            assert_eq!(sources[0].origin, CredentialOrigin::Primary);
+        }
     }
 }
