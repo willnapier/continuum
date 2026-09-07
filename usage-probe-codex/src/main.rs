@@ -7,7 +7,9 @@
 //! The mapping is where the old schema's flaw shows: v1 hoisted `primary` to
 //! top-level `used_percent`/`resets_at` fields and shoved `secondary` into an
 //! untyped `Value`, because the shape could only hold one window. Here both are
-//! ordinary resources, and neither is privileged.
+//! ordinary resources, and neither is privileged. Resource labels follow
+//! `windowDurationMins` (5h session, 7d week, or an explicit unknown), not the
+//! `primary`/`secondary` slot — Pro Lite puts the week in `primary`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
@@ -51,8 +53,43 @@ fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
     Observation::failure(PROBE, VERSION, PROVIDER, kind, msg)
 }
 
+/// ChatGPT Plus used a 5-hour `primary` plus a 7-day `secondary`. Pro Lite
+/// (observed 2026-09-02) puts the 7-day window in `primary` and omits
+/// `secondary`. Labels therefore come from duration, not from the slot name.
+const SESSION_WINDOW_MINS: i64 = 300;
+const WEEKLY_WINDOW_MINS: i64 = 10_080;
+
+fn window_label(mins: Option<i64>) -> String {
+    match mins {
+        Some(SESSION_WINDOW_MINS) => "Session (5 hours)".to_string(),
+        Some(WEEKLY_WINDOW_MINS) => "Weekly (7 days)".to_string(),
+        Some(m) if m > 0 => format!("Window ({})", format_window_mins(m)),
+        _ => "Window (duration unknown)".to_string(),
+    }
+}
+
+fn format_window_mins(mins: i64) -> String {
+    if mins % 1_440 == 0 {
+        let days = mins / 1_440;
+        if days == 1 {
+            "1 day".to_string()
+        } else {
+            format!("{days} days")
+        }
+    } else if mins % 60 == 0 {
+        let hours = mins / 60;
+        if hours == 1 {
+            "1 hour".to_string()
+        } else {
+            format!("{hours} hours")
+        }
+    } else {
+        format!("{mins} minutes")
+    }
+}
+
 /// Map one `{usedPercent, windowDurationMins, resetsAt}` block to a resource.
-fn window(raw: &Value, key: &str, id: &str, label: &str, representative: bool) -> Option<Resource> {
+fn window(raw: &Value, key: &str, id: &str, representative: bool) -> Option<Resource> {
     let block = raw.get(key)?.as_object()?;
     // Range-check rather than clamp. `(used / 100.0).clamp(0.0, 1.0)` always
     // lands inside the plausible range, so if the vendor ever emitted a 0..1
@@ -69,7 +106,7 @@ fn window(raw: &Value, key: &str, id: &str, label: &str, representative: bool) -
 
     Some(Resource {
         id: id.to_string(),
-        label: label.to_string(),
+        label: window_label(mins),
         kind_hint: KindHint::ResetWindow,
         facets: Facets {
             utilization: Some(used / 100.0),
@@ -156,11 +193,12 @@ fn probe() -> Observation {
     }
 
     let mut resources = vec![];
-    // Neither window is privileged. v1 could only express one.
-    if let Some(r) = window(&raw, "primary", "codex-primary", "Session window", true) {
+    // Neither window is privileged. v1 could only express one. Do not name
+    // `primary` a session: Pro Lite puts the weekly window there.
+    if let Some(r) = window(&raw, "primary", "codex-primary", true) {
         resources.push(r);
     }
-    if let Some(r) = window(&raw, "secondary", "codex-secondary", "Weekly window", false) {
+    if let Some(r) = window(&raw, "secondary", "codex-secondary", false) {
         resources.push(r);
     }
     if let Some(r) = credits(&raw) {
@@ -303,14 +341,56 @@ mod tests {
     #[test]
     fn both_windows_survive_the_migration() {
         let raw = snapshot();
-        let p = window(&raw, "primary", "codex-primary", "Session", true).unwrap();
-        let s = window(&raw, "secondary", "codex-secondary", "Weekly", false).unwrap();
+        let p = window(&raw, "primary", "codex-primary", true).unwrap();
+        let s = window(&raw, "secondary", "codex-secondary", false).unwrap();
         assert_eq!(p.facets.utilization, Some(0.34));
         assert_eq!(s.facets.utilization, Some(0.14));
         assert_eq!(p.facets.window_secs, Some(18_000));
         assert_eq!(s.facets.window_secs, Some(604_800));
+        assert_eq!(p.label, "Session (5 hours)");
+        assert_eq!(s.label, "Weekly (7 days)");
         // v1 could hold exactly one of these; that was the whole defect.
         assert_ne!(p.id, s.id);
+    }
+
+    #[test]
+    fn a_seven_day_primary_is_weekly_not_a_session() {
+        // Live Pro Lite shape, 2026-09-07: weekly allowance in `primary`,
+        // `secondary` absent. Hardcoding "Session window" on primary made
+        // usagewatch report 58% of a 5-hour session that had not been used.
+        let raw = serde_json::json!({
+            "planType": "prolite",
+            "primary": {"resetsAt": 1788996441, "usedPercent": 58, "windowDurationMins": 10080},
+            "secondary": null,
+            "credits": {"balance": "0", "hasCredits": false, "unlimited": false}
+        });
+        let p = window(&raw, "primary", "codex-primary", true).unwrap();
+        assert_eq!(p.label, "Weekly (7 days)");
+        assert_eq!(p.facets.window_secs, Some(604_800));
+        assert_eq!(p.facets.utilization, Some(0.58));
+        assert!(window(&raw, "secondary", "codex-secondary", false).is_none());
+    }
+
+    #[test]
+    fn unknown_or_odd_durations_are_not_named_session_or_weekly() {
+        assert_eq!(window_label(None), "Window (duration unknown)");
+        assert_eq!(window_label(Some(0)), "Window (duration unknown)");
+        assert_eq!(window_label(Some(-1)), "Window (duration unknown)");
+        assert_eq!(window_label(Some(240)), "Window (4 hours)");
+        assert_eq!(window_label(Some(1_440)), "Window (1 day)");
+        assert_eq!(window_label(Some(90)), "Window (90 minutes)");
+        let raw = serde_json::json!({
+            "primary": {"usedPercent": 10, "windowDurationMins": 240, "resetsAt": 1}
+        });
+        let p = window(&raw, "primary", "codex-primary", true).unwrap();
+        assert_eq!(p.label, "Window (4 hours)");
+        let missing = serde_json::json!({"primary": {"usedPercent": 10, "resetsAt": 1}});
+        assert_eq!(
+            window(&missing, "primary", "codex-primary", true)
+                .unwrap()
+                .label,
+            "Window (duration unknown)"
+        );
     }
 
     #[test]
@@ -323,13 +403,14 @@ mod tests {
         // the real guard is the out-of-range case plus the mirror check below.
         let over = serde_json::json!({"primary":
             {"usedPercent": 250.0, "windowDurationMins": 300, "resetsAt": 1}});
-        assert!(window(&over, "primary", "p", "P", true).is_none());
+        assert!(window(&over, "primary", "p", true).is_none());
         let nan = serde_json::json!({"primary":
             {"usedPercent": f64::NAN, "windowDurationMins": 300, "resetsAt": 1}});
-        assert!(window(&nan, "primary", "p", "P", true).is_none());
+        assert!(window(&nan, "primary", "p", true).is_none());
         // Sanity: a normal percentage still parses.
-        let ok = window(&fraction, "primary", "p", "P", true).unwrap();
+        let ok = window(&fraction, "primary", "p", true).unwrap();
         assert!(ok.facets.utilization.unwrap() < 0.01);
+        assert_eq!(ok.label, "Session (5 hours)");
     }
 
     #[test]
