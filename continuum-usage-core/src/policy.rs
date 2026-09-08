@@ -12,9 +12,9 @@
 //!   it now? This is the "might as well" case.
 //!
 //! They are orthogonal. A metered API key has scarcity (rate limits) and no
-//! perishability (spending faster is never an opportunity). Grok has neither
-//! that we can currently read. Forcing one enum across both would make every
-//! provider answer a question most cannot coherently be asked.
+//! perishability (spending faster is never an opportunity). Forcing one enum
+//! across both would make every provider answer a question most cannot
+//! coherently be asked.
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +97,9 @@ pub enum AxisState {
     /// would imply we checked.
     Inapplicable,
     /// This axis should exist but the facts needed are missing. Different from
-    /// `Inapplicable` and load-bearing: Grok demonstrably has a weekly ceiling
-    /// (it returned 402 on 2026-08-26), we simply cannot read it.
+    /// `Inapplicable` and load-bearing: a ceiling can exist without the probe
+    /// being able to read it (Grok Build's weekly pool, until the credits-format
+    /// billing payload).
     NotAssessable,
     /// The underlying observation is too old to trust.
     Stale,
@@ -356,9 +357,8 @@ pub fn assess(resource: &Resource, policy: &Policy, now_unix: i64, age_secs: i64
         // Capacity declared but no consumption figure.
         AxisState::NotAssessable
     } else {
-        // Consumption-only: Grok. We know from a live 402 that a weekly ceiling
-        // exists, so this is emphatically NOT `Inapplicable` — that would be
-        // the lie of omission the forum spent two rounds guarding against.
+        // Consumption-only: a ceiling may still exist (Grok Build returned 402
+        // on 2026-08-26 with no readable remaining). Not `Inapplicable`.
         AxisState::NotAssessable
     };
 

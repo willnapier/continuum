@@ -22,7 +22,7 @@ use serde_json::Value;
 /// Bumped only when a field changes meaning. v1 was `VendorUsage`, which hoisted
 /// a single non-optional `used_percent` to the top level and kept an untyped
 /// `secondary` escape hatch — it could not hold Claude (3+ concurrent
-/// resources) or Grok (no remaining concept at all).
+/// resources) or a Grok prepaid remaining with no utilization.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// What running the probe costs. Declared by the probe, enforced by core:
@@ -107,7 +107,8 @@ pub enum KindHint {
     /// Meter runs continuously; a "reset" closes an accounting period rather
     /// than refilling anything.
     Continuous,
-    /// Consumption is observable but no capacity is known. Grok is this.
+    /// Consumption is observable but no capacity is known. Grok prepaid
+    /// remaining (credits left, no wallet cap in the payload) is this.
     Consumption,
     /// Semantics cannot be declared without guessing. Retained and rendered,
     /// never assessed, never coloured. Reserved as a genuine escape hatch —
