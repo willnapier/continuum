@@ -38,8 +38,8 @@ pub struct LoopDetector {
 impl LoopDetector {
     pub fn new() -> Self {
         Self {
-            max_messages_warning: 100,
-            max_messages_critical: 200,
+            max_messages_warning: 200,
+            max_messages_critical: 400,
             min_repetitions: 10,
             max_pattern_size: 10,
         }
@@ -213,8 +213,8 @@ mod tests {
     fn test_high_message_count() {
         let detector = LoopDetector::new();
 
-        // Create 150 messages (over warning threshold)
-        let messages: Vec<(String, String)> = (0..150)
+        // Create 300 messages (over warning threshold, under critical)
+        let messages: Vec<(String, String)> = (0..300)
             .map(|i| ("user".to_string(), format!("Message {}", i)))
             .collect();
 
