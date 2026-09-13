@@ -226,6 +226,11 @@ pub fn status(
                     if let Some(g) = human_gloss(r) {
                         out.push_str(&format!("  {:<22} ↳ {g}\n", ""));
                     }
+                    // The vendor's own words, verbatim. For an opaque resource
+                    // (a smoke test's "OK in 5.0s") they are the whole reading.
+                    if let Some(s) = r.vendor_status.as_deref().filter(|s| !s.trim().is_empty()) {
+                        out.push_str(&format!("  {:<22} ↳ {}\n", "", truncate(s, 100)));
+                    }
                     if let Some(c) = limit_change(
                         baselines
                             .get(&(obs.probe.name.clone(), r.id.clone()))
@@ -273,6 +278,11 @@ pub fn alerts(
             // the account is actually out, right now.
             if *kind == FailureKind::QuotaDenied {
                 out.push(format!("{} ({}): EXHAUSTED — {}", obs.probe.name, obs.provider, message));
+            } else if *kind == FailureKind::RequestRefused {
+                // The vendor's words are the whole diagnosis; a bare kind
+                // would send the reader back to `raw` for the one line that
+                // matters.
+                out.push(format!("{} ({}): REFUSED — {}", obs.probe.name, obs.provider, message));
             } else if kind.is_fault() {
                 out.push(format!("{} ({}): probe failed — {:?}", obs.probe.name, obs.provider, kind));
             }

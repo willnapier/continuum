@@ -72,6 +72,13 @@ pub enum FailureKind {
     /// The provider refused because the account is out of allowance. This is a
     /// *reading about scarcity*, not an error to be swallowed.
     QuotaDenied,
+    /// The provider accepted the credentials, had allowance to spend, and
+    /// still refused the request — a model the installed client is too old
+    /// for, a feature the plan lacks. Invisible to every limits endpoint,
+    /// which is why the smoke probes exist: on 2026-09-13 Codex read 0% of
+    /// its week while every request failed with "requires a newer version of
+    /// Codex", and the refusal was read as an exhausted allowance.
+    RequestRefused,
     /// Core declined to run a costly probe this soon. Not a fault.
     SkippedByCadence,
     /// Also the landing place for any kind this binary does not know yet: the

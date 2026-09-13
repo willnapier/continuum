@@ -6,6 +6,7 @@ members = [
     "usage-probe-anthropic-api",
     "usage-probe-claude",
     "usage-probe-codex",
+    "usage-probe-codex-smoke",
     "usage-probe-grok",
     "continuum-cli",
     "continuum-claude",

@@ -1398,6 +1398,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "usage-probe-codex-smoke"
+version = "0.1.0"
+dependencies = [
+ "continuum-core",
+ "continuum-usage-core",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "usage-probe-grok"
 version = "0.1.0"
 dependencies = [

@@ -93,6 +93,14 @@ pub fn events(
                     title: format!("{} credentials rejected", obs.provider),
                     body: message.chars().take(180).collect(),
                 }),
+                // Allowance fine, credentials fine, requests still failing.
+                // The smoke probes exist for this; once a day until it is
+                // fixed, in the vendor's own words.
+                FailureKind::RequestRefused => out.push(Event {
+                    id: format!("{probe}:probe:refused:{}", row.ingested_at_unix / 86_400),
+                    title: format!("{} refusing requests", obs.provider),
+                    body: message.chars().take(180).collect(),
+                }),
                 // Outages, network blips and cadence skips are not the user's
                 // problem. They show in `usagewatch doctor`.
                 _ => {}
