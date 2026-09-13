@@ -125,6 +125,31 @@ fn limit_change(baseline: Option<&crate::envelope::Resource>, current: &crate::e
     ))
 }
 
+/// Say when a counter fell before the reset it had advertised.
+///
+/// A sudden 0% with days left on the clock reads, at a glance, like the week
+/// has been spent — the exact opposite of what happened. Naming it as a
+/// provider-side reset is the whole value; the verdicts are untouched.
+fn reset_gloss(
+    baselines: &Baselines,
+    probe: &str,
+    resource_id: &str,
+    policy: &Policy,
+    now_unix: i64,
+) -> Option<String> {
+    let r = baselines
+        .reset(probe, resource_id)
+        .filter(|r| r.visible(policy, now_unix))?;
+    Some(format!(
+        "reset early: fell from {} to {} {} ago, {} before the scheduled reset — \
+         a provider-side reset or plan change, not consumption",
+        pct(Some(r.from)),
+        pct(Some(r.to)),
+        human_duration(now_unix - r.at_unix),
+        human_duration(r.early_by_secs())
+    ))
+}
+
 /// Round large counts to something readable: 139000000 -> 139M.
 fn scale(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -209,6 +234,9 @@ pub fn status(
                     ) {
                         out.push_str(&format!("  {:<22} ↳ {c}\n", ""));
                     }
+                    if let Some(g) = reset_gloss(baselines, &obs.probe.name, &r.id, policy, now_unix) {
+                        out.push_str(&format!("  {:<22} ↳ {g}\n", ""));
+                    }
                     if let Some(p) = a.projection.filter(|p| p.exhausts_before_reset) {
                         out.push_str(&format!(
                             "  {:<22} ↳ at the current rate this runs out in {}, {} before it resets\n",
@@ -279,6 +307,9 @@ pub fn alerts(
                     human_duration(p.seconds_of_headroom),
                     a.seconds_to_reset.map(human_duration).unwrap_or_default()
                 ));
+            }
+            if let Some(g) = reset_gloss(baselines, &obs.probe.name, &r.id, policy, now_unix) {
+                out.push(format!("{} / {}: {g}", obs.probe.name, r.label));
             }
             if a.perishability == AxisState::Opportunity {
                 out.push(format!(
@@ -504,6 +535,40 @@ mod tests {
         let a = alerts(&[stored(obs, 10, NOW)], &Baselines::new(), &Policy::default(), NOW);
         assert_eq!(a.len(), 1);
         assert!(a[0].contains("EXHAUSTED"), "{a:?}");
+    }
+
+    #[test]
+    fn an_early_reset_is_named_in_alerts_and_status() {
+        use crate::policy::baselines;
+        let policy = Policy::default();
+        let mk = |util: f64, resets_at: i64| {
+            Observation::ok("codex", "1", "openai", SideEffect::RequestConsuming,
+                vec![res("w", KindHint::ResetWindow, Facets {
+                    utilization: Some(util),
+                    resets_at: Some(resets_at),
+                    window_secs: Some(604_800),
+                    expires_unused: Some(true),
+                    ..Default::default()
+                })])
+        };
+        let rows = [
+            stored(mk(0.77, NOW + 3 * 86_400), 1200, NOW),
+            stored(mk(0.0, NOW + 604_800), 600, NOW),
+        ];
+        let base = baselines(&rows, &policy);
+        let latest = [rows[1].clone()];
+
+        let a = alerts(&latest, &base, &policy, NOW);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert!(a[0].contains("reset early"), "{a:?}");
+        assert!(a[0].contains("77% to 0%"), "{a:?}");
+        assert!(a[0].contains("not consumption"), "{a:?}");
+
+        let s = status(&latest, &base, &policy, NOW);
+        assert!(s.contains("↳ reset early"), "{s}");
+
+        // Nothing to say once it is old news.
+        assert!(alerts(&latest, &base, &policy, NOW + 3 * 86_400).is_empty());
     }
 
     #[test]

@@ -44,6 +44,16 @@ pub struct Event {
 /// two genuinely different resets can never land in the same bucket.
 const WINDOW_BUCKET_SECS: i64 = 300;
 
+/// "2d 17h" or "65h" — enough precision for a notification banner.
+fn days_or_hours(secs: i64) -> String {
+    let h = secs.max(0) / 3600;
+    if h >= 24 {
+        format!("{}d {}h", h / 24, h % 24)
+    } else {
+        format!("{h}h")
+    }
+}
+
 fn window_key(resets_at: Option<i64>) -> String {
     resets_at
         .map(|r| (r / WINDOW_BUCKET_SECS).to_string())
@@ -119,6 +129,28 @@ pub fn events(
                     body: format!(
                         "{used} used, but at the current rate it runs out {}h before the reset.",
                         (a.seconds_to_reset.unwrap_or(0) - p.seconds_of_headroom) / 3600
+                    ),
+                });
+            }
+            // A counter that fell before its advertised reset. Named once per
+            // reset (keyed on when it was seen), and only while it is recent:
+            // a fresh machine with an empty dedup log must not announce a
+            // reset from last month.
+            if let Some(reset) = baselines
+                .reset(probe, &r.id)
+                .filter(|reset| reset.visible(policy, now_unix))
+            {
+                out.push(Event {
+                    id: format!("{probe}:{}:reset:{}", r.id, reset.at_unix / WINDOW_BUCKET_SECS),
+                    title: format!("{} reset early", r.label),
+                    body: format!(
+                        "Fell from {:.0}% to {:.0}% on {} ({}), {} before the scheduled reset — \
+                         a provider-side reset or plan change, not consumption.",
+                        reset.from * 100.0,
+                        reset.to * 100.0,
+                        obs.provider,
+                        probe,
+                        days_or_hours(reset.early_by_secs())
                     ),
                 });
             }
@@ -284,6 +316,35 @@ mod tests {
                 vec![window("w", 0.90, 900, 18_000)]))],
             &Baselines::new(), &Policy::default(), NOW);
         assert_ne!(approaching[0].id, critical[0].id, "escalation must not be deduped away");
+    }
+
+    #[test]
+    fn an_early_reset_is_announced_once_and_only_while_recent() {
+        use crate::policy::baselines;
+        let policy = Policy::default();
+        let scheduled = NOW + 3 * 86_400;
+        let mut before = stored(Observation::ok("codex", "1", "openai", SideEffect::Passive,
+            vec![window("w", 0.77, scheduled - NOW, 604_800)]));
+        before.ingested_at_unix = NOW - 600;
+        let after = stored(Observation::ok("codex", "1", "openai", SideEffect::Passive,
+            vec![window("w", 0.0, 604_800, 604_800)]));
+        let rows = [before, after.clone()];
+        let base = baselines(&rows, &policy);
+
+        let e = events(&[after.clone()], &base, &policy, NOW);
+        let reset: Vec<_> = e.iter().filter(|e| e.id.contains(":reset:")).collect();
+        assert_eq!(reset.len(), 1, "{e:?}");
+        assert!(reset[0].title.contains("reset early"));
+        assert!(reset[0].body.contains("77% to 0%"));
+        assert!(reset[0].body.contains("not consumption"));
+
+        // Same reset seen on a later poll: same id, so dedup swallows it.
+        let later = events(&[after.clone()], &base, &policy, NOW + 3600);
+        assert_eq!(later.iter().find(|e| e.id.contains(":reset:")).map(|e| &e.id), Some(&reset[0].id));
+
+        // Past the display window it is history, not an alert.
+        let old = events(&[after], &base, &policy, NOW + 3 * 86_400);
+        assert!(!old.iter().any(|e| e.id.contains(":reset:")), "{old:?}");
     }
 
     #[test]

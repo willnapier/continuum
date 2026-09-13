@@ -76,14 +76,14 @@ fn main() -> Result<()> {
             // Readings, not cadence markers — a skip means the existing reading
             // is still fresh, so blanking the view would be backwards.
             let history = store.read_all()?.rows;
-            let base = policy::baselines(&history);
+            let base = policy::baselines(&history, &policy);
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
             print!("{}", render::status(&latest, &base, &policy, now));
         }
 
         Command::Alerts => {
             let history = store.read_all()?.rows;
-            let base = policy::baselines(&history);
+            let base = policy::baselines(&history, &policy);
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
             let alerts = render::alerts(&latest, &base, &policy, now);
             if alerts.is_empty() {
@@ -96,7 +96,7 @@ fn main() -> Result<()> {
 
         Command::Notify { dry_run } => {
             let latest: Vec<_> = store.latest_reading_per_probe()?.into_values().collect();
-            let base = policy::baselines(&store.read_all()?.rows);
+            let base = policy::baselines(&store.read_all()?.rows, &policy);
             let events = notify::events(&latest, &base, &policy, now);
             // Must not fall back to a placeholder: two unresolvable machines
             // would share one dedup log and silently suppress each other's

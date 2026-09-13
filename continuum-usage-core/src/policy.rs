@@ -22,33 +22,149 @@ use std::collections::BTreeMap;
 
 use crate::envelope::{Facets, KindHint, Outcome, Resource, StoredObservation};
 
-/// Earliest reading of each resource within its *current* window, keyed by
-/// `(probe, resource id)`. The window is matched on `resets_at`, so a rollover
-/// starts a fresh baseline instead of averaging across two windows.
-pub type Baselines = BTreeMap<(String, String), (Resource, i64)>;
+/// What history says about each resource, keyed by `(probe, resource id)`.
+///
+/// Two things are derived from the append-only store at read time:
+///
+/// * the **baseline** — the earliest reading of each resource within its
+///   *current* window. The window is matched on `resets_at`, so a rollover
+///   starts a fresh baseline instead of averaging across two windows;
+/// * the most recent **early reset** — a counter that fell while its window
+///   had not yet expired. See [`Reset`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Baselines {
+    windows: BTreeMap<(String, String), (Resource, i64)>,
+    resets: BTreeMap<(String, String), Reset>,
+}
 
-/// Build baselines from stored history.
-pub fn baselines(rows: &[StoredObservation]) -> Baselines {
-    let mut out: Baselines = BTreeMap::new();
+impl Baselines {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The earliest reading in the resource's current window, and when it was
+    /// ingested.
+    pub fn get(&self, key: &(String, String)) -> Option<&(Resource, i64)> {
+        self.windows.get(key)
+    }
+
+    /// The latest early reset seen for this resource, if any.
+    pub fn reset(&self, probe: &str, resource_id: &str) -> Option<&Reset> {
+        self.resets.get(&(probe.to_string(), resource_id.to_string()))
+    }
+}
+
+/// A counter that fell while its window had not expired.
+///
+/// A window that turns over on schedule drops to zero *after* `resets_at`;
+/// that is the vendor keeping its promise and is not news. A counter that
+/// falls **before** the reset it advertised is something else: the provider
+/// reset the allowance, the plan changed, or the meter was re-provisioned.
+/// Twice in September 2026 Codex did exactly this (48% → 0% on 2026-09-04,
+/// 77% → 0% on 2026-09-12) and the second was read as "I have burned the
+/// whole week in a day". The history recorded the fall faithfully but nothing
+/// said so. This is the saying-so.
+///
+/// Advisory only: it names what happened and changes no verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Reset {
+    /// Utilization immediately before the fall.
+    pub from: f64,
+    /// Utilization immediately after.
+    pub to: f64,
+    /// When the fall was observed (ingestion time of the lower reading).
+    pub at_unix: i64,
+    /// The reset the earlier reading had advertised — the one that was not
+    /// waited for.
+    pub scheduled_unix: i64,
+}
+
+impl Reset {
+    /// How far ahead of its advertised reset the counter fell.
+    pub fn early_by_secs(&self) -> i64 {
+        self.scheduled_unix - self.at_unix
+    }
+
+    /// Whether this reset is still worth showing.
+    pub fn visible(&self, policy: &Policy, now_unix: i64) -> bool {
+        let age = now_unix - self.at_unix;
+        age >= 0 && age <= policy.thresholds.reset_visible_secs
+    }
+}
+
+/// Build baselines and early-reset records from stored history.
+///
+/// Rows arrive file by file, not in time order, so reset detection sorts a
+/// view of them first. Baseline selection is order-independent already.
+pub fn baselines(rows: &[StoredObservation], policy: &Policy) -> Baselines {
+    let mut out = Baselines::new();
     for row in rows {
         let Outcome::Ok { resources, .. } = &row.observation.outcome else {
             continue;
         };
         for r in resources {
             let key = (row.observation.probe.name.clone(), r.id.clone());
-            match out.get(&key) {
+            match out.windows.get(&key) {
                 // Same window and older: it is the better baseline.
                 Some((existing, at))
                     if existing.facets.resets_at == r.facets.resets_at
                         && *at <= row.ingested_at_unix => {}
                 // Different window: the old baseline belongs to a spent cycle.
                 Some((existing, _)) if existing.facets.resets_at != r.facets.resets_at => {
-                    out.insert(key, (r.clone(), row.ingested_at_unix));
+                    out.windows.insert(key, (r.clone(), row.ingested_at_unix));
                 }
                 _ => {
-                    out.insert(key, (r.clone(), row.ingested_at_unix));
+                    out.windows.insert(key, (r.clone(), row.ingested_at_unix));
                 }
             }
+        }
+    }
+    out.resets = early_resets(rows, policy);
+    out
+}
+
+/// Detect counters that fell before the reset they advertised.
+///
+/// Both machines observe the same accounts, so their rows are merged into one
+/// timeline per resource. The comparison is always against the reading
+/// immediately before, never the baseline: a reset shows as one step down, and
+/// a baseline from earlier in the window would hide the size of it.
+fn early_resets(rows: &[StoredObservation], policy: &Policy) -> BTreeMap<(String, String), Reset> {
+    let t = &policy.thresholds;
+    let mut ordered: Vec<&StoredObservation> = rows
+        .iter()
+        .filter(|row| matches!(row.observation.outcome, Outcome::Ok { .. }))
+        .collect();
+    ordered.sort_by_key(|row| row.ingested_at_unix);
+
+    // Previous reading per resource: (utilization, advertised reset).
+    let mut last: BTreeMap<(String, String), (Option<f64>, Option<i64>)> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for row in ordered {
+        for r in row.observation.resources() {
+            let key = (row.observation.probe.name.clone(), r.id.clone());
+            let util = effective_utilization(&r.facets);
+            if let Some((Some(before), Some(scheduled))) = last.get(&key) {
+                if let Some(after) = util {
+                    let fell = before - after >= t.reset_drop;
+                    // Strictly before the advertised reset, with a margin for
+                    // probe clocks and vendor rounding. A fall at or after the
+                    // reset is the scheduled rollover doing its job.
+                    let premature = row.ingested_at_unix + t.reset_grace_secs < *scheduled;
+                    if fell && premature {
+                        out.insert(
+                            key.clone(),
+                            Reset {
+                                from: *before,
+                                to: after,
+                                at_unix: row.ingested_at_unix,
+                                scheduled_unix: *scheduled,
+                            },
+                        );
+                    }
+                }
+            }
+            last.insert(key, (util, r.facets.resets_at));
         }
     }
     out
@@ -73,7 +189,7 @@ pub fn assess_with_history(
 
 /// Bump when thresholds or rules change. Recorded alongside every rendered
 /// verdict so an old assessment can be told apart from a current one.
-pub const POLICY_VERSION: u32 = 1;
+pub const POLICY_VERSION: u32 = 2;
 
 /// The state of one axis for one resource.
 ///
@@ -143,6 +259,15 @@ pub struct Thresholds {
     pub opportunity_max_utilization: f64,
     /// Observations older than this cannot be trusted.
     pub stale_after_secs: i64,
+    /// A utilization fall of at least this much, before the advertised reset,
+    /// counts as an early reset. Small wobbles are vendor rounding.
+    pub reset_drop: f64,
+    /// A fall observed within this many seconds of the advertised reset is the
+    /// scheduled rollover, not an early one. Absorbs probe-clock skew and a
+    /// vendor rounding its reset instant.
+    pub reset_grace_secs: i64,
+    /// How long an early reset stays on display and eligible to notify.
+    pub reset_visible_secs: i64,
 }
 
 impl Default for Thresholds {
@@ -156,6 +281,9 @@ impl Default for Thresholds {
             lead_cap_secs: 48 * 3600,
             opportunity_max_utilization: 0.80,
             stale_after_secs: 6 * 3600,
+            reset_drop: 0.10,
+            reset_grace_secs: 600,
+            reset_visible_secs: 48 * 3600,
         }
     }
 }
@@ -628,6 +756,109 @@ mod tests {
         };
         assert!(project(&mk(900.0), NOW - 3600, &mk(5.0), NOW).is_none());
         assert!(project(&mk(50.0), NOW - 3600, &mk(50.0), NOW).is_none(), "flat is not a rate");
+    }
+
+    // ---- Early resets ------------------------------------------------------
+
+    fn stored_at(probe: &str, machine: &str, at: i64, util: f64, resets_at: i64) -> StoredObservation {
+        use crate::envelope::{Observation, SideEffect};
+        StoredObservation {
+            observation: Observation::ok(
+                probe,
+                "1",
+                "openai",
+                SideEffect::RequestConsuming,
+                vec![res(
+                    "w",
+                    KindHint::ResetWindow,
+                    Facets {
+                        utilization: Some(util),
+                        resets_at: Some(resets_at),
+                        window_secs: Some(604_800),
+                        expires_unused: Some(true),
+                        ..Default::default()
+                    },
+                )],
+            ),
+            machine_id: machine.into(),
+            sequence: 1,
+            ingested_at: String::new(),
+            ingested_at_unix: at,
+        }
+    }
+
+    #[test]
+    fn a_counter_that_falls_before_its_reset_is_an_early_reset() {
+        // Codex, 2026-09-12: 77% with the reset due in 2.7 days, then 0% with
+        // a brand-new window. Not consumption — a provider-side reset.
+        let scheduled = NOW + 3 * 86_400;
+        let rows = [
+            stored_at("codex", "mac", NOW - 7200, 0.75, scheduled),
+            stored_at("codex", "mac", NOW - 3600, 0.77, scheduled),
+            stored_at("codex", "mac", NOW, 0.0, NOW + 604_800),
+        ];
+        let b = baselines(&rows, &Policy::default());
+        let r = b.reset("codex", "w").expect("an early reset");
+        assert_eq!((r.from, r.to), (0.77, 0.0), "compared against the reading just before");
+        assert_eq!(r.at_unix, NOW);
+        assert_eq!(r.scheduled_unix, scheduled);
+        assert_eq!(r.early_by_secs(), 3 * 86_400);
+        assert!(r.visible(&Policy::default(), NOW + 3600));
+        assert!(!r.visible(&Policy::default(), NOW + 3 * 86_400), "fades after the display window");
+    }
+
+    #[test]
+    fn a_scheduled_rollover_is_not_an_early_reset() {
+        // Claude's 5-hour window turning over on time: the fall lands after
+        // the advertised reset. That is the vendor keeping its promise.
+        let scheduled = NOW - 60;
+        let rows = [
+            stored_at("claude", "mac", NOW - 3600, 0.60, scheduled),
+            stored_at("claude", "mac", NOW, 0.0, NOW + 18_000),
+        ];
+        assert!(baselines(&rows, &Policy::default()).reset("claude", "w").is_none());
+
+        // Or just inside the grace margin — probe clocks skew.
+        let rows = [
+            stored_at("claude", "mac", NOW - 3600, 0.60, NOW + 300),
+            stored_at("claude", "mac", NOW, 0.0, NOW + 18_300),
+        ];
+        assert!(baselines(&rows, &Policy::default()).reset("claude", "w").is_none());
+    }
+
+    #[test]
+    fn a_fall_within_the_same_window_is_also_an_early_reset() {
+        // nimbini, 2026-09-04: 48% then 0% with the *same* reset timestamp.
+        let scheduled = NOW + 2 * 86_400;
+        let rows = [
+            stored_at("codex", "nimbini", NOW - 3600, 0.48, scheduled),
+            stored_at("codex", "nimbini", NOW, 0.0, scheduled),
+        ];
+        let b = baselines(&rows, &Policy::default());
+        assert_eq!(b.reset("codex", "w").map(|r| r.from), Some(0.48));
+    }
+
+    #[test]
+    fn a_small_wobble_is_not_a_reset() {
+        let scheduled = NOW + 2 * 86_400;
+        let rows = [
+            stored_at("grok", "mac", NOW - 3600, 0.61, scheduled),
+            stored_at("grok", "mac", NOW, 0.58, scheduled),
+        ];
+        assert!(baselines(&rows, &Policy::default()).reset("grok", "w").is_none());
+    }
+
+    #[test]
+    fn rows_are_merged_across_machines_in_time_order() {
+        // The store reads nimbini's file before the Mac's. Without sorting,
+        // the Mac's 77% would follow nimbini's 0% and read as a rise.
+        let scheduled = NOW + 3 * 86_400;
+        let rows = [
+            stored_at("codex", "nimbini", NOW, 0.0, NOW + 604_800),
+            stored_at("codex", "mac", NOW - 600, 0.77, scheduled),
+        ];
+        let b = baselines(&rows, &Policy::default());
+        assert_eq!(b.reset("codex", "w").map(|r| (r.from, r.to)), Some((0.77, 0.0)));
     }
 
     #[test]
