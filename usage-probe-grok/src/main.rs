@@ -1,29 +1,26 @@
-//! `usage-probe-grok` — xAI / Grok Build probe.
+//! `usage-probe-grok` — xAI Grok **account** probe.
 //!
-//! Two resources, because xAI meters this account in two different ways.
+//! The weekly pool is one subscription, not one host. Chat, Voice, Imagine and
+//! Build share it across every laptop, grok.com, and the phone apps.
 //!
-//! **1. Grok Build weekly pool — measurable since 2026-09-08.** The TUI `/usage`
-//! modal calls `GET /v1/billing?format=credits`. That payload carries
-//! `productUsage` (GrokBuild percent), `currentPeriod` (`USAGE_PERIOD_TYPE_WEEKLY`)
-//! and `prepaidBalance`. This is the ceiling that returned `402 Grok Build
-//! usage balance exhausted` on 2026-08-26 while the old monthly DTO still had
-//! headroom.
+//! **1. Shared weekly pool** from `GET /v1/billing?format=credits`
+//! (`creditUsagePercent`, `currentPeriod`). Product rows are *shares of that
+//! pool*, not per-product quotas.
 //!
-//! **2. Prepaid credits left.** `prepaidBalance` is remaining credits in the
-//! wallet. It is not a utilization: the unformatted `GET /v1/billing` (no
-//! query) started reporting `used: 0` and `monthlyLimit: <prepaid remaining>`
-//! after the 1 September reset, which made the old parser paint 0% used as a
-//! fact. That URL is retained only as a fallback.
+//! **2. Extra Usage Credits** (`prepaidBalance`, cents → USD) and **Auto Top Up**.
+//! Remaining dollars are remaining dollars. They are not remaining sessions.
 //!
-//! Local `~/.grok/sessions/**/updates.jsonl` still supplies the work-unit mix,
-//! windowed from the vendor period start when we have one, otherwise an ISO-week
-//! proxy. A 402 is reported as `QuotaDenied` rather than swallowed as a crash.
+//! **3. This host's Build mix** from `~/.grok/sessions`, labelled as a sample.
+//! The phone is invisible here and already counted in Chat/Voice/Imagine.
+//!
+//! Unformatted `GET /v1/billing` is fallback only. A 402 is `QuotaDenied`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Observation, Outcome, Resource, SideEffect, WorkUnit,
+    Facets, FailureKind, KindHint, Measure, MeterScope, Monetary, Observation, Outcome, Resource,
+    SideEffect,
 };
 
 /// The TUI `/usage` modal. This is the live Grok Build meter.
@@ -77,49 +74,8 @@ struct Totals {
 }
 
 impl Totals {
-    /// Credits consumed per session, measured over this window.
-    ///
-    /// A session is a coarse unit — they range from two turns to hundreds — so
-    /// the sample size travels with it and core presents the result as an
-    /// estimate, never a promise.
-    fn session_cost_credits(&self) -> Option<f64> {
-        if self.sessions == 0 || self.ticks == 0 {
-            return None;
-        }
-        Some((self.ticks as f64 / TICKS_PER_CREDIT) / self.sessions as f64)
-    }
-
-    /// Credits per token, at the mix actually observed.
-    ///
-    /// Not a published rate and not a constant: it depends heavily on how much
-    /// of the context is cache-read, which for these sessions is around 93%. It
-    /// is an honest answer to "how many tokens is my allowance worth" only for
-    /// work shaped like the work already done.
-    fn token_cost_credits(&self) -> Option<f64> {
-        let tokens = self.input + self.output;
-        if tokens == 0 || self.ticks == 0 {
-            return None;
-        }
-        Some((self.ticks as f64 / TICKS_PER_CREDIT) / tokens as f64)
-    }
-
-    fn work_units(&self) -> Vec<WorkUnit> {
-        let mut out = vec![];
-        if let Some(cost) = self.token_cost_credits() {
-            out.push(WorkUnit {
-                label: "token".to_string(),
-                cost,
-                observed: self.sessions,
-            });
-        }
-        if let Some(cost) = self.session_cost_credits() {
-            out.push(WorkUnit {
-                label: "session".to_string(),
-                cost,
-                observed: self.sessions,
-            });
-        }
-        out
+    fn tokens(&self) -> u64 {
+        self.input + self.output
     }
 }
 
@@ -287,12 +243,44 @@ fn period_bounds(config: &serde_json::Value) -> (Option<i64>, Option<i64>, Optio
     (start, end, window)
 }
 
-fn grok_build_label(window_secs: Option<i64>) -> String {
+fn grok_week_label(window_secs: Option<i64>) -> String {
     match window_secs {
-        Some(s) if (6 * 86_400..8 * 86_400).contains(&s) => "Grok Build (7 days)".to_string(),
-        Some(s) if s >= 86_400 => format!("Grok Build ({} days)", s / 86_400),
-        Some(s) if s >= 3_600 => format!("Grok Build ({} hours)", s / 3_600),
-        _ => "Grok Build (window)".to_string(),
+        Some(s) if (6 * 86_400..8 * 86_400).contains(&s) => "Grok (shared weekly)".to_string(),
+        Some(s) if s >= 86_400 => format!("Grok ({} days)", s / 86_400),
+        Some(s) if s >= 3_600 => format!("Grok ({} hours)", s / 3_600),
+        _ => "Grok (shared window)".to_string(),
+    }
+}
+
+fn product_short_name(name: &str) -> String {
+    match name {
+        "GrokBuild" => "Build".into(),
+        "GrokChat" => "Chat".into(),
+        "GrokVoice" => "Voice".into(),
+        "GrokImagine" => "Imagine".into(),
+        other => other.trim_start_matches("Grok").to_string(),
+    }
+}
+
+fn usd_from_cents(cents: f64) -> f64 {
+    cents.abs() / 100.0
+}
+
+fn format_usd(dollars: f64) -> String {
+    if (dollars - dollars.round()).abs() < 1e-9 {
+        format!("${:.0}", dollars)
+    } else {
+        format!("${:.2}", dollars)
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k tokens", n / 1_000)
+    } else {
+        format!("{n} tokens")
     }
 }
 
@@ -316,77 +304,48 @@ fn is_credits_shape(config: &serde_json::Value) -> bool {
         || config.get("currentPeriod").is_some()
 }
 
-/// The auto top-up rule, when one is configured and enabled.
+/// The auto top-up rule, when one is configured.
 ///
-/// **Retained as evidence, not used to derive a resource.** An earlier version
+/// Amounts arrive negative (they are charges) in cents. An earlier version
 /// synthesised an "Included (before top-up)" row by treating
-/// `minBeforeHittingSl` as a threshold on the *monthly allowance*, concluding
-/// that purchasing began at 67.7% used. That was an unverified reading: the
-/// field plausibly watches a prepaid balance instead, and the account also
-/// reports `onDemandCap: 0`, which suggests on-demand billing may not be active
-/// at all. Two readings fit the same data, so the row asserted a distinction
-/// that may not exist and has been withdrawn. The rule travels in the raw
-/// payload where it can be read without being interpreted.
-#[cfg(test)]
+/// `minBeforeHittingSl` as a threshold on the *monthly allowance*. That was
+/// withdrawn: the field watches the prepaid wallet, not the weekly pool.
 struct TopupRule {
+    enabled: bool,
+    #[allow(dead_code)]
     trigger_at_remaining: f64,
     amount: f64,
     max_per_month: f64,
 }
 
-#[cfg(test)]
 fn parse_topup(v: &serde_json::Value) -> Option<TopupRule> {
     let r = v.get("rule")?;
-    if !r.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
-        return None;
-    }
     let val = |k: &str| r.get(k).and_then(|x| x.get("val")).and_then(|x| x.as_f64());
     Some(TopupRule {
+        enabled: r.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
         trigger_at_remaining: val("minBeforeHittingSl")?.abs(),
-        // Emitted negative: they are charges against the account.
         amount: val("topupAmount").unwrap_or(0.0).abs(),
         max_per_month: val("maxAmountPerMonth").unwrap_or(0.0).abs(),
     })
 }
 
-fn grok_build_week(config: &serde_json::Value, totals: &Totals) -> Option<Resource> {
+/// The shared weekly pool across Chat, Voice, Imagine, and Build — every
+/// laptop, grok.com, and the phone apps. This is the account meter.
+fn shared_week(config: &serde_json::Value) -> Option<Resource> {
     let (_start, end, window_secs) = period_bounds(config);
-    let mut utilization = None;
-    if let Some(products) = config.get("productUsage").and_then(|v| v.as_array()) {
-        for product in products {
-            let name = product
-                .get("product")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if name.eq_ignore_ascii_case("GrokBuild") || products.len() == 1 {
-                utilization = product
-                    .get("usagePercent")
-                    .and_then(|v| v.as_f64())
-                    .and_then(percent_as_utilization);
-                break;
-            }
-        }
-    }
-    if utilization.is_none() {
-        utilization = config
-            .get("creditUsagePercent")
-            .and_then(|v| v.as_f64())
-            .and_then(percent_as_utilization);
-    }
-    let utilization = utilization?;
+    let utilization = config
+        .get("creditUsagePercent")
+        .and_then(|v| v.as_f64())
+        .and_then(percent_as_utilization)?;
 
     Some(Resource {
-        id: "grok-build-week".to_string(),
-        label: grok_build_label(window_secs),
+        id: "grok-week".to_string(),
+        label: grok_week_label(window_secs),
         kind_hint: KindHint::ResetWindow,
         facets: Facets {
             utilization: Some(utilization),
-            work_units: totals.work_units(),
             resets_at: end,
             window_secs,
-            // Weekly Grok Build allowance is lost at the reset. Auto-top-up
-            // watches prepaid balance, not this pool, so "might as well" here
-            // does not invite a purchase.
             expires_unused: Some(true),
             ..Default::default()
         },
@@ -395,21 +354,103 @@ fn grok_build_week(config: &serde_json::Value, totals: &Totals) -> Option<Resour
     })
 }
 
-fn prepaid_balance(config: &serde_json::Value, totals: &Totals) -> Option<Resource> {
-    let remaining = wrapped_val(config, "prepaidBalance")?;
+/// Per-product *share of the shared week*, not a product quota.
+///
+/// GrokBuild 71 + GrokChat 3 + GrokVoice 1 = creditUsagePercent 75. Putting
+/// 71% through scarcity would read as "Build is 71% full". It is not: it is
+/// 71 points of the one weekly pool, including phone Chat/Voice.
+fn product_shares(config: &serde_json::Value) -> Vec<Resource> {
+    let Some(products) = config.get("productUsage").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    products
+        .iter()
+        .filter_map(|product| {
+            let name = product.get("product").and_then(|v| v.as_str())?;
+            let short = product_short_name(name);
+            let status = match product.get("usagePercent").and_then(|v| v.as_f64()) {
+                Some(p) => format!("{p:.0}% of this week's shared pool"),
+                None => "in this week's shared pool (no percent reported)".to_string(),
+            };
+            Some(Resource {
+                id: format!("grok-share-{}", kebab_product(name)),
+                label: format!("{short} · week share"),
+                kind_hint: KindHint::Opaque,
+                facets: Facets::default(),
+                vendor_status: Some(status),
+                vendor_representative: false,
+            })
+        })
+        .collect()
+}
+
+fn prepaid_wallet(config: &serde_json::Value) -> Option<Resource> {
+    let cents = wrapped_val(config, "prepaidBalance")?;
+    let usd = usd_from_cents(cents.max(0.0));
     Some(Resource {
         id: "grok-monthly-credits".to_string(),
-        label: "Credits left".to_string(),
-        // Remaining is known; the wallet's ceiling is not in this payload.
+        label: "Extra Usage Credits".to_string(),
         kind_hint: KindHint::Consumption,
         facets: Facets {
-            remaining: Some(Measure::new(remaining.max(0.0), "credits")),
-            work_units: totals.work_units(),
-            // UNKNOWN: auto-top-up is enabled and may watch this balance.
-            expires_unused: None,
+            remaining: Some(Measure::new(usd, "USD")),
+            monetary: Some(Monetary {
+                currency: "USD".to_string(),
+                spent: None,
+                cap: None,
+            }),
+            expires_unused: Some(false),
             ..Default::default()
         },
         vendor_status: None,
+        vendor_representative: false,
+    })
+}
+
+fn auto_topup_row(topup: &serde_json::Value) -> Option<Resource> {
+    let rule = parse_topup(topup)?;
+    let status = if rule.enabled {
+        format!(
+            "on · {} blocks · {}/month cap",
+            format_usd(usd_from_cents(rule.amount)),
+            format_usd(usd_from_cents(rule.max_per_month))
+        )
+    } else {
+        "off".to_string()
+    };
+    Some(Resource {
+        id: "grok-auto-topup".to_string(),
+        label: "Auto Top Up".to_string(),
+        kind_hint: KindHint::Opaque,
+        facets: Facets {
+            expires_unused: Some(false),
+            ..Default::default()
+        },
+        vendor_status: Some(status),
+        vendor_representative: false,
+    })
+}
+
+/// Local CLI sessions on *this host*. Never remaining capacity: the phone,
+/// the other machine, and grok.com are invisible here.
+fn host_mix(totals: &Totals) -> Option<Resource> {
+    if totals.sessions == 0 {
+        return None;
+    }
+    let status = format!(
+        "{} sessions · {} on this host this week — sample, not remaining capacity",
+        totals.sessions,
+        format_tokens(totals.tokens())
+    );
+    Some(Resource {
+        id: "grok-host-mix".to_string(),
+        label: "This host (Build mix)".to_string(),
+        kind_hint: KindHint::Consumption,
+        facets: Facets {
+            consumed: Some(Measure::new(totals.sessions as f64, "sessions")),
+            expires_unused: Some(false),
+            ..Default::default()
+        },
+        vendor_status: Some(status),
         vendor_representative: false,
     })
 }
@@ -419,7 +460,7 @@ fn prepaid_balance(config: &serde_json::Value, totals: &Totals) -> Option<Resour
 /// After 2026-09-01 this account reported `used: 0` with `monthlyLimit` equal
 /// to prepaid remaining, so callers must not treat that as 0% utilization
 /// unless the credits-format payload is absent entirely.
-fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resource> {
+fn monthly_resource(billing: &serde_json::Value) -> Option<Resource> {
     let c = billing.get("config")?;
     if is_credits_shape(c) {
         return None;
@@ -453,7 +494,6 @@ fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resour
                 (Some(s), Some(e)) => Some(e - s),
                 _ => None,
             },
-            work_units: week.work_units(),
             expires_unused: None,
             ..Default::default()
         },
@@ -462,40 +502,7 @@ fn monthly_resource(billing: &serde_json::Value, week: &Totals) -> Option<Resour
     })
 }
 
-fn consumption_only_week(totals: &Totals) -> Resource {
-    Resource {
-        id: "grok-build-week".to_string(),
-        label: "Grok Build (ISO week)".to_string(),
-        kind_hint: KindHint::Consumption,
-        facets: Facets {
-            consumed: Some(Measure::new(
-                totals.ticks as f64 / TICKS_PER_CREDIT,
-                "credits",
-            )),
-            work_units: totals.work_units(),
-            ..Default::default()
-        },
-        vendor_status: None,
-        vendor_representative: false,
-    }
-}
-
 fn account_label(config: &serde_json::Value) -> Option<String> {
-    if let Some(products) = config.get("productUsage").and_then(|v| v.as_array()) {
-        if let Some(name) = products
-            .iter()
-            .find(|p| {
-                p.get("product")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|n| n.eq_ignore_ascii_case("GrokBuild"))
-            })
-            .or_else(|| products.first())
-            .and_then(|p| p.get("product"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(kebab_product(name));
-        }
-    }
     if config
         .get("isUnifiedBillingUser")
         .and_then(|v| v.as_bool())
@@ -503,7 +510,7 @@ fn account_label(config: &serde_json::Value) -> Option<String> {
     {
         return Some("unified".to_string());
     }
-    None
+    Some("xai".to_string())
 }
 
 enum BillingFetch {
@@ -579,15 +586,6 @@ fn probe() -> Observation {
         return fail(FailureKind::Unknown, "HOME is not set");
     };
     let root = PathBuf::from(&home).join(".grok/sessions");
-    if !root.exists() {
-        return fail(
-            FailureKind::Unknown,
-            format!(
-                "{} does not exist; Grok Build is not installed here",
-                root.display()
-            ),
-        );
-    }
 
     let now = chrono::Utc::now();
     let billing_note;
@@ -609,7 +607,7 @@ fn probe() -> Observation {
             BillingFetch::Quota => {
                 return fail(
                     FailureKind::QuotaDenied,
-                    "402 Payment Required — Grok Build usage balance exhausted",
+                    "402 Payment Required — Grok usage balance exhausted",
                 )
             }
             BillingFetch::Unavailable(note) => {
@@ -633,25 +631,39 @@ fn probe() -> Observation {
 
     let config = billing.as_ref().and_then(|b| b.get("config"));
     let (since_unix, window_kind) = window_start(config, now);
-    let t = scan(&root, since_unix);
+    let t = if root.exists() {
+        scan(&root, since_unix)
+    } else {
+        Totals::default()
+    };
 
     let mut resources = vec![];
     if let Some(b) = billing.as_ref() {
         if let Some(c) = b.get("config") {
-            if let Some(r) = grok_build_week(c, &t) {
+            if let Some(r) = shared_week(c) {
                 resources.push(r);
             }
-            if let Some(r) = prepaid_balance(c, &t) {
+            resources.extend(product_shares(c));
+            if let Some(r) = prepaid_wallet(c) {
                 resources.push(r);
             }
         }
-        if let Some(r) = monthly_resource(b, &t) {
+        if let Some(r) = monthly_resource(b) {
             resources.push(r);
         }
     }
+    if let Some(r) = auto_topup_row(&topup_note) {
+        resources.push(r);
+    }
+    if let Some(r) = host_mix(&t) {
+        resources.push(r);
+    }
 
-    if !resources.iter().any(|r| r.id == "grok-build-week") {
-        resources.push(consumption_only_week(&t));
+    if resources.is_empty() {
+        return fail(
+            FailureKind::Unknown,
+            "no Grok account meter and no local Build sessions on this host",
+        );
     }
 
     let mut obs = Observation::ok(
@@ -661,15 +673,17 @@ fn probe() -> Observation {
         SideEffect::RequestConsuming,
         resources,
     );
-    obs.assistant = Some("grok-build".to_string());
-    obs.account = account;
+    obs.assistant = Some("grok".to_string());
+    obs.account = account.or_else(|| Some("xai".to_string()));
+    obs.scope = MeterScope::Account;
     if let Outcome::Ok { raw, .. } = &mut obs.outcome {
         *raw = Some(serde_json::json!({
             "window": window_kind,
             "window_start_unix": since_unix,
-            "note": "Grok Build remaining is /v1/billing?format=credits (the TUI /usage call). \
-                     Unformatted /v1/billing is fallback only — after 2026-09-01 it reported \
-                     used=0 with monthlyLimit equal to prepaid remaining.",
+            "note": "Account meter is /v1/billing?format=credits (the TUI /usage call): \
+                     creditUsagePercent is the shared weekly pool across Chat, Voice, Imagine \
+                     and Build on every device. Local ~/.grok/sessions is this host's Build \
+                     mix only. Unformatted /v1/billing is fallback only.",
             "turns": t.turns,
             "sessions": t.sessions,
             "model_calls": t.calls,
@@ -702,7 +716,8 @@ mod tests {
             "history":[]}})
     }
 
-    /// Verbatim from GET /v1/billing?format=credits, 2026-09-08.
+    /// Verbatim from GET /v1/billing?format=credits, 2026-09-14.
+    /// Shared week is 75%; Build is 71 points of that pool, not a Build quota.
     fn live_credits_shape() -> serde_json::Value {
         serde_json::json!({"config":{
             "currentPeriod":{
@@ -710,12 +725,17 @@ mod tests {
                 "start":"2026-09-08T06:24:29.556273+00:00",
                 "end":"2026-09-15T06:24:29.556273+00:00"
             },
-            "creditUsagePercent":16.0,
+            "creditUsagePercent":75.0,
             "onDemandCap":{"val":0},
             "onDemandUsed":{"val":0},
-            "productUsage":[{"product":"GrokBuild","usagePercent":16.0}],
+            "productUsage":[
+                {"product":"GrokBuild","usagePercent":71.0},
+                {"product":"GrokChat","usagePercent":3.0},
+                {"product":"GrokVoice","usagePercent":1.0},
+                {"product":"GrokImagine"}
+            ],
             "isUnifiedBillingUser":true,
-            "prepaidBalance":{"val":3542},
+            "prepaidBalance":{"val":8542},
             "topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
             "billingPeriodStart":"2026-09-08T06:24:29.556273+00:00",
             "billingPeriodEnd":"2026-09-15T06:24:29.556273+00:00"
@@ -764,17 +784,24 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_rule_yields_nothing() {
+    fn a_disabled_rule_is_an_off_flag_not_silence() {
         let off = serde_json::json!({"rule":{"enabled": false, "minBeforeHittingSl":{"val":5000}}});
-        assert!(parse_topup(&off).is_none());
+        let r = parse_topup(&off).expect("rule present");
+        assert!(!r.enabled);
+        let row = auto_topup_row(&off).expect("flag");
+        assert_eq!(row.vendor_status.as_deref(), Some("off"));
         assert!(parse_topup(&serde_json::json!({})).is_none());
     }
 
     #[test]
-    fn no_observations_means_no_work_estimate() {
+    fn prepaid_wallet_is_dollars_with_no_session_estimate() {
         let c = live_credits_shape();
-        let r = prepaid_balance(c.get("config").unwrap(), &Totals::default()).expect("parsed");
-        assert!(r.facets.work_units.is_empty(), "must not divide by zero");
+        let r = prepaid_wallet(c.get("config").unwrap()).expect("parsed");
+        assert!(r.facets.work_units.is_empty(), "must not invent remaining sessions");
+        assert_eq!(r.facets.remaining.as_ref().unwrap().unit, "USD");
+        assert!((r.facets.remaining.as_ref().unwrap().value - 85.42).abs() < 1e-9);
+        assert_eq!(r.label, "Extra Usage Credits");
+        assert_eq!(r.facets.expires_unused, Some(false));
     }
 
     #[test]
@@ -790,39 +817,86 @@ mod tests {
     }
 
     #[test]
-    fn credits_payload_yields_weekly_utilization() {
+    fn credits_payload_yields_the_shared_week_not_build_alone() {
         let c = live_credits_shape();
-        let r = grok_build_week(c.get("config").unwrap(), &Totals::default()).expect("parsed");
+        let r = shared_week(c.get("config").unwrap()).expect("parsed");
         let u = r.facets.utilization.expect("utilization");
         assert!(
-            (u - 0.16).abs() < 1e-9,
-            "got {u} — 16.0 is percent, not a fraction"
+            (u - 0.75).abs() < 1e-9,
+            "got {u} — shared week is 75, not Build's 71"
         );
-        assert_eq!(r.id, "grok-build-week");
-        assert_eq!(r.label, "Grok Build (7 days)");
+        assert_eq!(r.id, "grok-week");
+        assert_eq!(r.label, "Grok (shared weekly)");
         assert_eq!(r.kind_hint, KindHint::ResetWindow);
         assert!(r.vendor_representative);
+        assert!(r.facets.work_units.is_empty());
         assert_eq!(r.facets.expires_unused, Some(true));
-        // Fractional-second RFC3339 from the vendor must survive.
         assert_eq!(r.facets.resets_at, Some(1_789_453_469));
         assert_eq!(r.facets.window_secs, Some(7 * 86_400));
     }
 
     #[test]
+    fn product_shares_are_breakdown_not_quotas() {
+        let c = live_credits_shape();
+        let shares = product_shares(c.get("config").unwrap());
+        assert_eq!(shares.len(), 4);
+        assert_eq!(shares[0].id, "grok-share-grok-build");
+        assert_eq!(shares[0].label, "Build · week share");
+        assert_eq!(
+            shares[0].vendor_status.as_deref(),
+            Some("71% of this week's shared pool")
+        );
+        assert_eq!(shares[0].facets.utilization, None);
+        assert_eq!(shares[0].kind_hint, KindHint::Opaque);
+        assert_eq!(shares[1].label, "Chat · week share");
+        assert_eq!(shares[2].label, "Voice · week share");
+        assert_eq!(
+            shares[3].vendor_status.as_deref(),
+            Some("in this week's shared pool (no percent reported)")
+        );
+        let a = assess(&shares[0], &Policy::default(), 1_000_000, 0);
+        assert_ne!(a.scarcity, AxisState::Approaching);
+        assert_ne!(a.perishability, AxisState::Opportunity);
+    }
+
+    #[test]
+    fn auto_topup_flag_names_the_dollar_blocks() {
+        let row = auto_topup_row(&live_rule()).expect("flag");
+        assert_eq!(row.id, "grok-auto-topup");
+        assert_eq!(
+            row.vendor_status.as_deref(),
+            Some("on · $50 blocks · $100/month cap")
+        );
+    }
+
+    #[test]
+    fn host_mix_is_a_sample_not_remaining_capacity() {
+        let mut t = Totals::default();
+        t.sessions = 15;
+        t.input = 1_152_502;
+        t.output = 145_791;
+        let r = host_mix(&t).expect("mix");
+        assert_eq!(r.id, "grok-host-mix");
+        assert!(r.facets.work_units.is_empty());
+        let status = r.vendor_status.expect("status");
+        assert!(status.contains("15 sessions"), "{status}");
+        assert!(status.contains("this host"), "{status}");
+        assert!(status.contains("not remaining capacity"), "{status}");
+        assert!(host_mix(&Totals::default()).is_none());
+    }
+
+    #[test]
     fn credits_payload_does_not_paint_prepaid_as_zero_percent() {
         let c = live_credits_shape();
-        let r = prepaid_balance(c.get("config").unwrap(), &Totals::default()).expect("parsed");
+        let r = prepaid_wallet(c.get("config").unwrap()).expect("parsed");
         assert_eq!(r.facets.utilization, None, "remaining is not a 0% cap");
-        assert_eq!(r.facets.remaining.as_ref().unwrap().value, 3542.0);
-        assert_eq!(r.facets.remaining.as_ref().unwrap().unit, "credits");
         assert_eq!(r.facets.limit, None);
-        assert_eq!(r.label, "Credits left");
         assert!(!r.vendor_representative);
     }
 
     #[test]
     fn credits_shape_is_not_parsed_as_the_legacy_monthly_row() {
-        assert!(monthly_resource(&live_credits_shape(), &Totals::default()).is_none());
+        assert!(monthly_resource(&live_credits_shape()).is_none());
     }
 
     #[test]
@@ -839,20 +913,20 @@ mod tests {
     #[test]
     fn weekly_pool_is_assessable_and_perishable() {
         let c = live_credits_shape();
-        let r = grok_build_week(c.get("config").unwrap(), &Totals::default()).expect("parsed");
+        let r = shared_week(c.get("config").unwrap()).expect("parsed");
         let now = r.facets.resets_at.unwrap() - 6 * 86_400;
         let a = assess(&r, &Policy::default(), now, 0);
-        assert_eq!(a.scarcity, AxisState::Healthy);
+        assert_eq!(a.scarcity, AxisState::Approaching, "75% is the approaching line");
         assert_eq!(a.perishability, AxisState::Healthy);
         assert_ne!(a.scarcity, AxisState::NotAssessable);
     }
 
     #[test]
-    fn account_label_from_grok_build_product() {
+    fn account_label_is_the_unified_account_not_build() {
         let c = live_credits_shape();
         assert_eq!(
             account_label(c.get("config").unwrap()).as_deref(),
-            Some("grok-build")
+            Some("unified")
         );
     }
 
@@ -873,7 +947,7 @@ mod tests {
 
     #[test]
     fn monthly_allowance_yields_real_remaining() {
-        let r = monthly_resource(&live_monthly_shape(), &Totals::default()).expect("parsed");
+        let r = monthly_resource(&live_monthly_shape()).expect("parsed");
         let u = r.facets.utilization.expect("utilization");
         assert!((u - 11558.0 / 15500.0).abs() < 1e-9, "got {u}");
         assert_eq!(
@@ -887,7 +961,7 @@ mod tests {
 
     #[test]
     fn the_monthly_allowance_never_invites_spending() {
-        let r = monthly_resource(&live_monthly_shape(), &Totals::default()).expect("parsed");
+        let r = monthly_resource(&live_monthly_shape()).expect("parsed");
         assert_eq!(r.facets.expires_unused, None);
 
         let two_days_before = r.facets.resets_at.unwrap() - 2 * 86_400;
@@ -899,8 +973,8 @@ mod tests {
     #[test]
     fn a_billing_payload_without_a_limit_is_not_invented() {
         let bad = serde_json::json!({"config":{"used":{"val":10}}});
-        assert!(monthly_resource(&bad, &Totals::default()).is_none());
-        assert!(monthly_resource(&serde_json::json!({}), &Totals::default()).is_none());
+        assert!(monthly_resource(&bad).is_none());
+        assert!(monthly_resource(&serde_json::json!({})).is_none());
     }
 
     #[test]

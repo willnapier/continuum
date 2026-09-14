@@ -7,7 +7,7 @@
 //! the account — otherwise a permissive five-hour claim could mask a threatened
 //! weekly one.
 
-use crate::envelope::{FailureKind, KindHint, Outcome, StoredObservation};
+use crate::envelope::{FailureKind, KindHint, MeterScope, Outcome, StoredObservation};
 use crate::policy::{assess_with_history, Baselines, AxisState, Policy};
 
 pub fn axis_cell(state: AxisState) -> String {
@@ -62,7 +62,24 @@ fn reset_cell(kind: KindHint, seconds: Option<i64>) -> String {
 /// figure the user never pays and implies a spend that is not happening; that
 /// is worse than showing the raw vendor unit, because a currency symbol is
 /// believed.
+fn currency_sym(unit: &str) -> Option<&'static str> {
+    match unit {
+        "USD" => Some("$"),
+        "GBP" => Some("£"),
+        "EUR" => Some("€"),
+        _ => None,
+    }
+}
+
 fn human_gloss(r: &crate::envelope::Resource) -> Option<String> {
+    // Remaining money is remaining money. Do not divide a wallet by one
+    // host's session size and call that capacity.
+    if let Some(rem) = &r.facets.remaining {
+        if let Some(sym) = currency_sym(&rem.unit) {
+            return Some(format!("{sym}{:.2} in wallet", rem.value));
+        }
+    }
+
     // Work first: it is the question a prepaid allowance actually answers.
     let parts: Vec<String> = r
         .facets
@@ -184,12 +201,16 @@ pub fn status(
     for row in rows {
         let obs = &row.observation;
         let age = now_unix - row.ingested_at_unix;
+        let where_from = match obs.scope {
+            MeterScope::Account => format!("account · probed from {}", row.machine_id),
+            MeterScope::Machine => row.machine_id.clone(),
+        };
         out.push_str(&format!(
             "\n{} ({})  {}  [{}]\n",
             obs.probe.name,
             obs.provider,
             obs.account.as_deref().unwrap_or("-"),
-            row.machine_id
+            where_from
         ));
 
         match &obs.outcome {
@@ -346,7 +367,7 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{Facets, KindHint, Monetary, Observation, Resource, SideEffect};
+    use crate::envelope::{Facets, KindHint, MeterScope, Monetary, Observation, Resource, SideEffect};
 
     fn stored(obs: Observation, age: i64, now: i64) -> StoredObservation {
         StoredObservation {
@@ -392,6 +413,47 @@ mod tests {
         assert!(g.starts_with("≈ 9 more sessions"), "got {g}");
         assert!(!g.contains('$'), "a flat-rate allowance must not be priced: {g}");
         assert!(g.contains("from 16 sessions"), "sample size must be visible: {g}");
+    }
+
+    #[test]
+    fn remaining_currency_is_a_wallet_not_remaining_sessions() {
+        let mut r = res(
+            "grok-monthly-credits",
+            KindHint::Consumption,
+            Facets {
+                remaining: Some(crate::envelope::Measure::new(85.42, "USD")),
+                work_units: vec![crate::envelope::WorkUnit {
+                    label: "session".into(),
+                    cost: 4.56,
+                    observed: 15,
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(human_gloss(&r).as_deref(), Some("$85.42 in wallet"));
+        r.facets.work_units.clear();
+        assert_eq!(human_gloss(&r).as_deref(), Some("$85.42 in wallet"));
+    }
+
+    #[test]
+    fn account_scope_does_not_label_the_reading_as_the_host() {
+        let mut obs = Observation::ok(
+            "grok",
+            "0.1.0",
+            "xai",
+            SideEffect::RequestConsuming,
+            vec![res("grok-week", KindHint::ResetWindow, Facets::default())],
+        );
+        obs.account = Some("unified".into());
+        obs.scope = MeterScope::Account;
+        let s = status(
+            &[stored(obs, 10, NOW)],
+            &Baselines::new(),
+            &Policy::default(),
+            NOW,
+        );
+        assert!(s.contains("[account · probed from desk]"), "{s}");
+        assert!(!s.contains("[desk]\n"), "{s}");
     }
 
     #[test]

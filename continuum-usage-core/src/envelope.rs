@@ -48,6 +48,23 @@ impl SideEffect {
     }
 }
 
+/// Where the vendor meters the reading.
+///
+/// Default `Machine` keeps old rows and host-local probes unchanged. `Account`
+/// means the numbers are the subscription (every laptop, the phone, the web
+/// app) and the host that ran the probe is only where the HTTP call happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeterScope {
+    #[default]
+    Machine,
+    Account,
+}
+
+fn meter_scope_is_machine(scope: &MeterScope) -> bool {
+    matches!(scope, MeterScope::Machine)
+}
+
 /// Why a probe produced no reading.
 ///
 /// A bare exit code cannot distinguish these, and the difference matters: on
@@ -307,6 +324,10 @@ pub struct Observation {
     /// Stable pseudonym for the account. Never a secret, never an email.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// Account-scoped meters (a shared weekly pool, a prepaid wallet) must not
+    /// be labelled as the host that happened to probe them.
+    #[serde(default, skip_serializing_if = "meter_scope_is_machine")]
+    pub scope: MeterScope,
     /// The probe's clock. **Advisory** — clocks skew across machines, so
     /// ordering uses the core-stamped sequence instead.
     pub observed_at: String,
@@ -331,6 +352,7 @@ impl Observation {
             provider: provider.to_string(),
             assistant: None,
             account: None,
+            scope: MeterScope::Machine,
             observed_at: now_rfc3339(),
             outcome: Outcome::Ok {
                 side_effect,
@@ -367,6 +389,7 @@ impl Observation {
             provider: provider.to_string(),
             assistant: None,
             account: None,
+            scope: MeterScope::Machine,
             observed_at: now_rfc3339(),
             outcome: Outcome::Failure {
                 kind,
