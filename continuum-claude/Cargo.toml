@@ -20,3 +20,4 @@ tokio.workspace = true
 atty = "0.2"
 exec = "0.3"
 which = "6.0"
+regex.workspace = true
