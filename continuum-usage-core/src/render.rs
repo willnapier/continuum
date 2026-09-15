@@ -457,6 +457,39 @@ mod tests {
     }
 
     #[test]
+    fn claude_codex_and_dpa_key_are_account_meters_not_host_readings() {
+        // Same labels the three probes emit. Their numbers come from vendor
+        // account APIs (Max unified headers, Codex account/rateLimits/read, DPA
+        // org rate-limit headers), so the host is only where the call ran.
+        let probes = [
+            ("claude", "anthropic", "max"),
+            ("codex", "openai", "plus"),
+            ("anthropic-api", "anthropic-api", "dpa"),
+        ];
+        let rows: Vec<StoredObservation> = probes
+            .iter()
+            .map(|(probe, provider, account)| {
+                let mut obs = Observation::ok(
+                    probe,
+                    "0.1.0",
+                    provider,
+                    SideEffect::RequestConsuming,
+                    vec![res("window", KindHint::ResetWindow, Facets::default())],
+                );
+                obs.account = Some((*account).into());
+                obs.scope = MeterScope::Account;
+                stored(obs, 10, NOW)
+            })
+            .collect();
+        let s = status(&rows, &Baselines::new(), &Policy::default(), NOW);
+        for (probe, provider, account) in probes {
+            let header = format!("{probe} ({provider})  {account}  [account · probed from desk]");
+            assert!(s.contains(&header), "missing {header:?} in:\n{s}");
+        }
+        assert!(!s.contains("[desk]\n"), "a bare host label survived:\n{s}");
+    }
+
+    #[test]
     fn real_money_is_still_shown_where_money_actually_moves() {
         // A metered key: billed per token, so pounds are the honest unit.
         let r = res(

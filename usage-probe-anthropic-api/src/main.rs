@@ -26,7 +26,7 @@
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Observation, ObservationCost, Outcome,
+    Facets, FailureKind, KindHint, Measure, MeterScope, Observation, ObservationCost, Outcome,
     Resource, SideEffect,
 };
 
@@ -308,6 +308,9 @@ fn probe() -> Observation {
     // Labels from the config (never the key and never an org id).
     obs.assistant = Some(src.assistant.clone());
     obs.account = Some(src.account.clone());
+    // Rate-limit buckets are per organisation key, shared by every caller that
+    // holds it; the probing host only made the request.
+    obs.scope = MeterScope::Account;
     if let Outcome::Ok { cost, raw, .. } = &mut obs.outcome {
         *cost = Some(ObservationCost {
             requests: Some(1),

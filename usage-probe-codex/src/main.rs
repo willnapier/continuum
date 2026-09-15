@@ -21,7 +21,8 @@ use color_eyre::{
     Result,
 };
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Measure, Monetary, Observation, Outcome, Resource, SideEffect,
+    Facets, FailureKind, KindHint, Measure, MeterScope, Monetary, Observation, Outcome, Resource,
+    SideEffect,
 };
 use serde_json::{json, Value};
 
@@ -220,6 +221,9 @@ fn probe() -> Observation {
         resources,
     );
     obs.assistant = Some("codex".to_string());
+    // account/rateLimits/read is the plan's 5-hour and weekly windows across every
+    // host that signs in with this account; the probing host is not the meter.
+    obs.scope = MeterScope::Account;
     obs.account = raw
         .get("planType")
         .and_then(Value::as_str)

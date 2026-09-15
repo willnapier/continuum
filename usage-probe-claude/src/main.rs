@@ -15,8 +15,8 @@
 use std::process::ExitCode;
 
 use continuum_usage_core::envelope::{
-    Facets, FailureKind, KindHint, Monetary, Observation, ObservationCost, Outcome, Resource,
-    SideEffect,
+    Facets, FailureKind, KindHint, MeterScope, Monetary, Observation, ObservationCost, Outcome,
+    Resource, SideEffect,
 };
 
 const PROBE: &str = "claude";
@@ -446,6 +446,9 @@ fn probe() -> Observation {
     );
     obs.assistant = Some("claude-code".to_string());
     obs.account = creds.subscription;
+    // Max plan windows belong to the subscription, not to whichever host sent
+    // the one-token request; the host is only where the HTTP call ran.
+    obs.scope = MeterScope::Account;
     if let Outcome::Ok { cost, raw, .. } = &mut obs.outcome {
         *cost = Some(ObservationCost {
             requests: Some(1),
