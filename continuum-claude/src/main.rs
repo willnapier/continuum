@@ -1,7 +1,10 @@
 // Continuum-Claude: Transparent wrapper for Claude Code CLI
 // Logs all conversations to plain-text JSONL files while maintaining normal UX
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use color_eyre::{eyre::Context, Result};
 use continuum_core::{PlainTextWriter, NoiseFilter};
 use serde::{Deserialize, Serialize};
@@ -345,71 +348,89 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
-    // Get the most recently modified session file BEFORE running claude
-    let projects_dir = std::path::PathBuf::from(&home).join(".claude/projects");
-
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
     let before_session = find_latest_session_file(&projects_dir);
+    let before_paths = existing_session_jsonl(&projects_dir);
+    let resume_id = resume_session_id_from_args(args);
+    let is_continue = args.iter().any(|a| a == "--continue" || a == "-c");
 
-    // Spawn claude as a child process (not exec) so we can capture the session after
-    let status = Command::new(&real_claude)
+    // Spawn claude as a child process (not exec) so we can capture the session after.
+    // Identify *this* child's session while it runs (open jsonl / --resume id).
+    // Do not use "newest jsonl after exit": two Claudes dying together used to
+    // make every wrapper auto-log the same file (identical DayPage twins).
+    let mut child = Command::new(&real_claude)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn claude process")?
-        .wait()
-        .await?;
+        .context("Failed to spawn claude process")?;
 
-    // After claude exits, find the session that was just modified
-    let after_session = find_latest_session_file(&projects_dir);
-
-    if skip_saving {
-        // Ephemeral mode: delete the session from Claude's storage too
-        if let Some(session_path) = after_session {
-            if before_session.as_ref() != Some(&session_path) {
-                if let Err(e) = std::fs::remove_file(&session_path) {
-                    eprintln!("⚠ Warning: Failed to delete session file: {}", e);
-                } else {
-                    eprintln!("✗ Session deleted (ephemeral mode)");
-                }
-            }
-        }
-    } else {
-        // Normal mode: import to continuum logs
-        if let Some(ref session_path) = after_session {
-            if before_session.as_ref() != Some(session_path) {
-                if clinical_marker_exists(&home, session_path) {
-                    // Defence-in-depth for the clinical→Continuum boundary
-                    // (design-forum, 2026-07-22). This wrapper imports the
-                    // latest-modified session across all projects — which, if a
-                    // `cc-clinical` PHI session is being written concurrently in
-                    // another terminal, could be that clinical transcript.
-                    // `cc-clinical` registers a 0600 marker before launch, so a
-                    // present marker is the precise, sufficient signal to refuse;
-                    // Continuum must stay PHI-free. We also skip the farewell
-                    // pass so no clinical content is read. (A missing registry /
-                    // marker means no protection was requested for this session,
-                    // so ordinary non-clinical capture proceeds unchanged.)
-                    eprintln!(
-                        "⏭ Skipping protected cc-clinical session — not imported to continuum"
-                    );
-                } else {
-                    eprintln!("\n📝 Importing session to continuum logs...");
-                    match import_session_to_continuum(session_path) {
-                        Ok(_) => {
-                            // Silently saved - no prompt needed
-                        }
-                        Err(e) => {
-                            eprintln!("⚠ Warning: Failed to import session: {}", e);
+    let child_pid = child.id();
+    let watched = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch_handle = {
+        let watched = watched.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(pid) = child_pid {
+                    if let Some(path) = session_jsonl_for_pid_tree(pid) {
+                        if let Ok(mut slot) = watched.lock() {
+                            *slot = Some(path);
                         }
                     }
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        })
+    };
 
-                    // Post-session farewell check: if user said goodbye but
-                    // daypage-append wasn't called, compensate automatically
-                    check_farewell_and_log(session_path);
+    let status = child.wait().await?;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watch_handle.join();
+    let watched_path = watched.lock().ok().and_then(|guard| guard.clone());
+
+    let after_session = resolve_wrapped_session(
+        watched_path,
+        resume_id.as_deref(),
+        is_continue,
+        &projects_dir,
+        &before_paths,
+        before_session.as_ref(),
+    );
+
+    if skip_saving {
+        // Ephemeral mode: delete the session this wrapper actually ran
+        if let Some(session_path) = after_session {
+            if let Err(e) = std::fs::remove_file(&session_path) {
+                eprintln!("⚠ Warning: Failed to delete session file: {}", e);
+            } else {
+                eprintln!("✗ Session deleted (ephemeral mode)");
+            }
+        }
+    } else if let Some(ref session_path) = after_session {
+        if clinical_marker_exists(&home, session_path) {
+            // Defence-in-depth for the clinical→Continuum boundary
+            // (design-forum, 2026-07-22). cc-clinical registers a 0600
+            // marker before launch; a present marker is sufficient to refuse.
+            // Continuum must stay PHI-free. Skip farewell so no clinical
+            // content is read.
+            eprintln!(
+                "⏭ Skipping protected cc-clinical session — not imported to continuum"
+            );
+        } else {
+            eprintln!("\n📝 Importing session to continuum logs...");
+            match import_session_to_continuum(session_path) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("⚠ Warning: Failed to import session: {}", e);
                 }
             }
+
+            // Post-session farewell check: if the model never called
+            // daypage-append, compensate automatically — once per session id.
+            check_farewell_and_log(session_path);
         }
     }
 
@@ -431,6 +452,193 @@ fn clinical_marker_exists(home: &str, session_path: &std::path::Path) -> bool {
             .is_file(),
         None => false,
     }
+}
+
+fn resume_session_id_from_args(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--resume" || arg == "-r" {
+            return args.get(i + 1).cloned().filter(|value| !value.starts_with('-'));
+        }
+        if let Some(rest) = arg.strip_prefix("--resume=") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn session_id_is_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn is_session_jsonl_name(path: &Path) -> bool {
+    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        return false;
+    }
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    !name.starts_with("agent-")
+}
+
+fn looks_like_claude_session_jsonl(path: &Path) -> bool {
+    if !is_session_jsonl_name(path) {
+        return false;
+    }
+    let mut saw_claude = false;
+    let mut saw_projects = false;
+    for component in path.components() {
+        if component.as_os_str() == ".claude" {
+            saw_claude = true;
+        }
+        if component.as_os_str() == "projects" {
+            saw_projects = true;
+        }
+    }
+    saw_claude && saw_projects
+}
+
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut pids = vec![root];
+    let mut i = 0;
+    while i < pids.len() {
+        if let Ok(output) = std::process::Command::new("pgrep")
+            .args(["-P", &pids[i].to_string()])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    pids
+}
+
+fn session_jsonl_for_pid_tree(root: u32) -> Option<PathBuf> {
+    let pids = descendant_pids(root);
+    if pids.is_empty() {
+        return None;
+    }
+    let pid_arg = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new("lsof")
+        .args(["-Fn", "-p", &pid_arg])
+        .output()
+        .ok()?;
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(raw) = line.strip_prefix('n') else {
+            continue;
+        };
+        let path = PathBuf::from(raw);
+        if looks_like_claude_session_jsonl(&path) {
+            found.push(path);
+        }
+    }
+    found.into_iter().next()
+}
+
+fn existing_session_jsonl(projects_dir: &Path) -> HashSet<PathBuf> {
+    session_jsonl_files(projects_dir).into_iter().collect()
+}
+
+fn session_jsonl_files(projects_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if !projects_dir.exists() {
+        return files;
+    }
+    let Ok(projects) = std::fs::read_dir(projects_dir) else {
+        return files;
+    };
+    for project in projects.flatten() {
+        let project_dir = project.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&project_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_session_jsonl_name(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn find_session_file(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if !session_id_is_safe(session_id) {
+        return None;
+    }
+    let filename = format!("{session_id}.jsonl");
+    session_jsonl_files(projects_dir)
+        .into_iter()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(filename.as_str()))
+}
+
+fn resolve_wrapped_session(
+    watched: Option<PathBuf>,
+    resume_id: Option<&str>,
+    is_continue: bool,
+    projects_dir: &Path,
+    before_paths: &HashSet<PathBuf>,
+    before_latest: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = watched {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Some(id) = resume_id {
+        if let Some(path) = find_session_file(projects_dir, id) {
+            return Some(path);
+        }
+    }
+    let new_files: Vec<PathBuf> = existing_session_jsonl(projects_dir)
+        .into_iter()
+        .filter(|path| !before_paths.contains(path))
+        .collect();
+    if new_files.len() == 1 {
+        return Some(new_files.into_iter().next().unwrap());
+    }
+    if is_continue {
+        return before_latest.cloned();
+    }
+    None
+}
+
+fn autolog_marker_path(marker_dir: &Path, session_id: &str) -> PathBuf {
+    marker_dir.join(session_id)
+}
+
+/// Exclusive create: first wrapper to claim a session id wins the DayPage auto-log.
+fn try_claim_autolog(marker_dir: &Path, session_id: &str) -> bool {
+    if !session_id_is_safe(session_id) {
+        return false;
+    }
+    if std::fs::create_dir_all(marker_dir).is_err() {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(autolog_marker_path(marker_dir, session_id))
+        .is_ok()
 }
 
 fn find_latest_session_file(projects_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -796,6 +1004,20 @@ fn check_farewell_and_log(session_path: &std::path::Path) {
         return;
     }
 
+    let session_id = session_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let marker_dir = Path::new(&home).join(".local/share/continuum/daypage-autologged");
+    if !try_claim_autolog(&marker_dir, session_id) {
+        eprintln!(
+            "⏭ Auto-log already claimed for session {} — skipping duplicate DayPage entry",
+            session_id
+        );
+        return;
+    }
+
     let entry = format!(
         "{}:: {}x {}min - [auto-logged by continuum: session ended without daypage-append]",
         tag, assistant_count, duration_min
@@ -813,9 +1035,11 @@ fn check_farewell_and_log(session_path: &std::path::Path) {
         }
         Ok(_) => {
             eprintln!("⚠ daypage-append exited with error");
+            let _ = std::fs::remove_file(autolog_marker_path(&marker_dir, session_id));
         }
         Err(e) => {
             eprintln!("⚠ Failed to run daypage-append: {}", e);
+            let _ = std::fs::remove_file(autolog_marker_path(&marker_dir, session_id));
         }
     }
 }
@@ -879,8 +1103,12 @@ enum Content {
 
 #[cfg(test)]
 mod tests {
-    use super::clinical_marker_exists;
-    use std::path::Path;
+    use super::{
+        clinical_marker_exists, resolve_wrapped_session, resume_session_id_from_args,
+        session_id_is_safe, try_claim_autolog,
+    };
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn marked_session_is_protected_unmarked_imports() {
@@ -918,6 +1146,114 @@ mod tests {
             home,
             Path::new("/x/99999999-0000-0000-0000-000000000000.jsonl")
         ));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resume_flag_parses_space_and_equals_forms() {
+        let space = vec!["--resume".into(), "abc-123".into()];
+        assert_eq!(resume_session_id_from_args(&space).as_deref(), Some("abc-123"));
+        let short = vec!["-r".into(), "abc-123".into()];
+        assert_eq!(resume_session_id_from_args(&short).as_deref(), Some("abc-123"));
+        let equals = vec!["--resume=abc-123".into()];
+        assert_eq!(resume_session_id_from_args(&equals).as_deref(), Some("abc-123"));
+        let missing = vec!["--resume".into()];
+        assert_eq!(resume_session_id_from_args(&missing), None);
+        let none = vec!["--print".into()];
+        assert_eq!(resume_session_id_from_args(&none), None);
+    }
+
+    #[test]
+    fn session_id_rejects_path_traversal() {
+        assert!(session_id_is_safe("500e6041-190d-4760-a497-86d3d3f56641"));
+        assert!(!session_id_is_safe("../etc/passwd"));
+        assert!(!session_id_is_safe("a/b"));
+        assert!(!session_id_is_safe(""));
+    }
+
+    #[test]
+    fn autolog_claim_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-autolog-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "500e6041-190d-4760-a497-86d3d3f56641";
+        assert!(try_claim_autolog(&dir, id), "first claim must succeed");
+        assert!(
+            !try_claim_autolog(&dir, id),
+            "second claim for the same session must fail"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_prefers_watched_then_resume_then_unique_new_file() {
+        let base = std::env::temp_dir().join(format!(
+            "cc-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = base.join("projects");
+        let proj = projects.join("p1");
+        std::fs::create_dir_all(&proj).unwrap();
+        let watched = proj.join("watched.jsonl");
+        let resumed = proj.join("resumed.jsonl");
+        let newborn = proj.join("newborn.jsonl");
+        std::fs::write(&watched, b"").unwrap();
+        std::fs::write(&resumed, b"").unwrap();
+        std::fs::write(&newborn, b"").unwrap();
+
+        let before: HashSet<PathBuf> = HashSet::new();
+        let got = resolve_wrapped_session(
+            Some(watched.clone()),
+            Some("resumed"),
+            false,
+            &projects,
+            &before,
+            None,
+        );
+        assert_eq!(got.as_ref(), Some(&watched));
+
+        let got = resolve_wrapped_session(
+            None,
+            Some("resumed"),
+            false,
+            &projects,
+            &before,
+            None,
+        );
+        assert_eq!(got.as_ref(), Some(&resumed));
+
+        let mut before = HashSet::new();
+        before.insert(watched.clone());
+        before.insert(resumed.clone());
+        let got = resolve_wrapped_session(None, None, false, &projects, &before, None);
+        assert_eq!(got.as_ref(), Some(&newborn));
+
+        // Two new files: do not guess.
+        std::fs::write(proj.join("other.jsonl"), b"").unwrap();
+        let got = resolve_wrapped_session(None, None, false, &projects, &before, None);
+        assert_eq!(got, None);
+
+        let latest = watched.clone();
+        let got = resolve_wrapped_session(
+            None,
+            None,
+            true,
+            &projects,
+            &before,
+            Some(&latest),
+        );
+        assert_eq!(got.as_ref(), Some(&latest));
+
         std::fs::remove_dir_all(&base).ok();
     }
 }
