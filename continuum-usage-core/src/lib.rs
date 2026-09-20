@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod notify;
 pub mod policy;
 pub mod render;
+pub mod smoke;
 pub mod store;
 
 pub use envelope::{

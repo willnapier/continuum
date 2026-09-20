@@ -16,25 +16,28 @@
 //! `QuotaConsuming`, so the cadence gate holds it to once an hour on a timer;
 //! an explicit `usagewatch refresh` always runs it. About 10k tokens per run,
 //! nearly all cached prompt.
+//!
+//! The deadline, the words-to-kind table and the envelope shape are shared
+//! with the other smoke probes in `continuum_usage_core::smoke`; what is here
+//! is only what is Codex's own.
 
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::time::Instant;
 
-use continuum_usage_core::envelope::{
-    FailureKind, KindHint, Observation, Outcome, Resource, SideEffect,
+use continuum_usage_core::envelope::{FailureKind, Observation, Outcome};
+use continuum_usage_core::smoke::{
+    self, kind_for, tail, Run, SmokeProbe, Verdict, PROMPT, REQUEST_TIMEOUT,
 };
 use serde_json::{json, Value};
 
-const PROBE: &str = "codex-smoke";
-const PROVIDER: &str = "openai";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROMPT: &str = "Reply with exactly the word OK and nothing else.";
-/// Inside core's 45s `RUN_TIMEOUT`, with room to report the overrun as a
-/// reading rather than be killed silently.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+const SMOKE: SmokeProbe = SmokeProbe {
+    probe: "codex-smoke",
+    version: env!("CARGO_PKG_VERSION"),
+    provider: "openai",
+    assistant: "codex",
+    resource_id: "codex-request-path",
+};
 
 fn main() -> ExitCode {
     let obs = probe();
@@ -45,160 +48,56 @@ fn main() -> ExitCode {
     }
 }
 
-fn fail(kind: FailureKind, msg: impl Into<String>) -> Observation {
-    let mut obs = Observation::failure(PROBE, VERSION, PROVIDER, kind, msg);
-    obs.assistant = Some("codex".to_string());
-    obs
-}
-
 fn probe() -> Observation {
     let codex = match continuum_core::codex_cli::resolve_codex(None) {
         Ok(r) => r.path,
-        Err(e) => return fail(FailureKind::NetworkFailure, format!("no codex binary: {e}")),
+        Err(e) => return SMOKE.fail(FailureKind::NetworkFailure, format!("no codex binary: {e}")),
     };
     let model = configured_model();
     let started = Instant::now();
     let run = match run_codex(&codex) {
         Ok(run) => run,
-        Err(e) => return fail(FailureKind::NetworkFailure, e),
+        Err(e) => return SMOKE.fail(FailureKind::NetworkFailure, e),
     };
     let elapsed = started.elapsed();
     let verdict = classify(&run.stdout, &run.stderr, run.exit_code);
-    // Short enough for the 22-column status cell with a model name inside.
-    let label = match &model {
-        Some(m) => format!("Smoke ({m})"),
-        None => "Smoke (default model)".to_string(),
+    let raw = match &verdict {
+        Verdict::Ok { tokens } => json!({
+            "model": model,
+            "codex": codex.display().to_string(),
+            "elapsed_secs": elapsed.as_secs_f64(),
+            "tokens_used": tokens,
+        }),
+        Verdict::Refused { .. } => json!({
+            "model": model,
+            "codex": codex.display().to_string(),
+            "exit_code": run.exit_code,
+            "stderr_tail": tail(&run.stderr, 600),
+            "stdout_tail": tail(&run.stdout, 600),
+        }),
     };
-
-    match verdict {
-        Verdict::Ok { tokens } => {
-            let mut obs = Observation::ok(
-                PROBE,
-                VERSION,
-                PROVIDER,
-                SideEffect::QuotaConsuming,
-                vec![Resource {
-                    id: "codex-request-path".into(),
-                    label,
-                    kind_hint: KindHint::Opaque,
-                    facets: Default::default(),
-                    vendor_status: Some(format!(
-                        "OK in {:.1}s{}",
-                        elapsed.as_secs_f64(),
-                        tokens.map(|t| format!(", {t} tokens")).unwrap_or_default()
-                    )),
-                    vendor_representative: false,
-                }],
-            );
-            obs.assistant = Some("codex".to_string());
-            if let Outcome::Ok { raw, .. } = &mut obs.outcome {
-                *raw = Some(json!({
-                    "model": model,
-                    "codex": codex.display().to_string(),
-                    "elapsed_secs": elapsed.as_secs_f64(),
-                    "tokens_used": tokens,
-                }));
-            }
-            obs
-        }
-        Verdict::Refused { kind, message } => {
-            let mut obs = fail(
-                kind,
-                match &model {
-                    Some(m) => format!("{m}: {message}"),
-                    None => message,
-                },
-            );
-            if let Outcome::Failure { raw, .. } = &mut obs.outcome {
-                *raw = Some(json!({
-                    "model": model,
-                    "codex": codex.display().to_string(),
-                    "exit_code": run.exit_code,
-                    "stderr_tail": tail(&run.stderr, 600),
-                    "stdout_tail": tail(&run.stdout, 600),
-                }));
-            }
-            obs
-        }
-    }
+    SMOKE.observe(verdict, model.as_deref(), elapsed, raw)
 }
 
-struct Run {
-    stdout: String,
-    stderr: String,
-    exit_code: Option<i32>,
-}
-
-/// One request, with a hard deadline. `Command::output()` blocks until EOF
-/// and has no timeout; a hung child would wedge the whole refresh.
-fn run_codex(codex: &PathBuf) -> Result<Run, String> {
+/// `--ephemeral` so no session file is written; read-only sandbox; a scratch
+/// directory; whatever `model` the config selects.
+fn run_codex(codex: &Path) -> Result<Run, String> {
     let workdir = std::env::temp_dir().join("usage-probe-codex-smoke");
     std::fs::create_dir_all(&workdir).map_err(|e| format!("scratch dir: {e}"))?;
-
-    let mut child = Command::new(codex)
-        .args([
-            "exec",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--color",
-            "never",
-            "-s",
-            "read-only",
-            "-C",
-        ])
-        .arg(&workdir)
-        .arg(PROMPT)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", codex.display()))?;
-
-    let (out_tx, out_rx) = mpsc::channel();
-    let (err_tx, err_rx) = mpsc::channel();
-    if let Some(mut so) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = so.read_to_string(&mut s);
-            let _ = out_tx.send(s);
-        });
-    }
-    if let Some(mut se) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = se.read_to_string(&mut s);
-            let _ = err_tx.send(s);
-        });
-    }
-
-    let deadline = Instant::now() + REQUEST_TIMEOUT;
-    let exit_code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "no reply within {}s — request path hung",
-                    REQUEST_TIMEOUT.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("wait: {e}")),
-        }
-    };
-    let grace = Duration::from_secs(2);
-    Ok(Run {
-        stdout: out_rx.recv_timeout(grace).unwrap_or_default(),
-        stderr: err_rx.recv_timeout(grace).unwrap_or_default(),
-        exit_code,
-    })
-}
-
-#[derive(Debug, PartialEq)]
-enum Verdict {
-    Ok { tokens: Option<u64> },
-    Refused { kind: FailureKind, message: String },
+    let mut cmd = Command::new(codex);
+    cmd.args([
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--color",
+        "never",
+        "-s",
+        "read-only",
+        "-C",
+    ])
+    .arg(&workdir)
+    .arg(PROMPT);
+    smoke::run_with_deadline(cmd, REQUEST_TIMEOUT)
 }
 
 /// Read the transcript `codex exec` prints and decide whether a reply came
@@ -221,11 +120,7 @@ fn classify(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Verdict {
             message,
         };
     }
-    let replied = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .any(|l| l.eq_ignore_ascii_case("ok") || l.eq_ignore_ascii_case("ok."));
+    let replied = stdout.lines().any(smoke::is_ok_reply);
     if replied && exit_code == Some(0) {
         // The reply lands on stdout; the transcript, token count included,
         // goes to stderr.
@@ -233,19 +128,11 @@ fn classify(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Verdict {
             tokens: tokens_used(&combined),
         };
     }
-    let message = if stderr.trim().is_empty() {
-        format!(
-            "no reply (exit {:?}): {}",
-            exit_code,
-            tail(stdout, 240).trim()
-        )
-    } else {
-        format!("no reply (exit {:?}): {}", exit_code, tail(stderr, 240).trim())
-    };
-    Verdict::Refused {
-        kind: FailureKind::MalformedResponse,
-        message,
-    }
+    smoke::no_reply(&Run {
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
+        exit_code,
+    })
 }
 
 /// `{"type":"error","status":400,"error":{"message":"..."}}` → (status, message).
@@ -263,23 +150,6 @@ fn parse_error(text: &str) -> (Option<u64>, String) {
             (status, message)
         }
         Err(_) => (None, text.to_string()),
-    }
-}
-
-/// Classify as far as the words allow — no further.
-fn kind_for(status: Option<u64>, message: &str) -> FailureKind {
-    let m = message.to_ascii_lowercase();
-    match status {
-        Some(401) | Some(403) => FailureKind::InvalidCredentials,
-        Some(429) => FailureKind::QuotaDenied,
-        Some(s) if s >= 500 => FailureKind::ProviderOutage,
-        _ if m.contains("usage limit") || m.contains("rate limit") || m.contains("quota") => {
-            FailureKind::QuotaDenied
-        }
-        _ if m.contains("unauthori") || m.contains("log in") || m.contains("login") => {
-            FailureKind::InvalidCredentials
-        }
-        _ => FailureKind::RequestRefused,
     }
 }
 
@@ -307,15 +177,6 @@ fn configured_model() -> Option<String> {
 fn model_from_config(text: &str) -> Option<String> {
     let table: toml::Table = text.parse().ok()?;
     table.get("model")?.as_str().map(str::to_string)
-}
-
-fn tail(s: &str, n: usize) -> String {
-    let count = s.chars().count();
-    if count <= n {
-        s.to_string()
-    } else {
-        s.chars().skip(count - n).collect()
-    }
 }
 
 #[cfg(test)]
@@ -364,16 +225,6 @@ mod tests {
         // a line of its own.
         let no_reply = "user\nReply with exactly the word OK and nothing else.\n";
         assert!(matches!(classify(no_reply, "", Some(0)), Verdict::Refused { .. }));
-    }
-
-    #[test]
-    fn statuses_and_words_classify_only_as_far_as_they_go() {
-        assert_eq!(kind_for(Some(429), "slow down"), FailureKind::QuotaDenied);
-        assert_eq!(kind_for(Some(401), "nope"), FailureKind::InvalidCredentials);
-        assert_eq!(kind_for(Some(503), "nope"), FailureKind::ProviderOutage);
-        assert_eq!(kind_for(None, "You've hit your usage limit"), FailureKind::QuotaDenied);
-        assert_eq!(kind_for(Some(400), "requires a newer version"), FailureKind::RequestRefused);
-        assert_eq!(kind_for(None, "something else entirely"), FailureKind::RequestRefused);
     }
 
     #[test]
