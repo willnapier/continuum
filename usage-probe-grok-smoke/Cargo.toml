@@ -1,0 +1,14 @@
+[package]
+name = "usage-probe-grok-smoke"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "usage-probe-grok-smoke"
+path = "src/main.rs"
+
+[dependencies]
+continuum-usage-core = { path = "../continuum-usage-core" }
+serde_json = { workspace = true }
+continuum-core = { path = "../continuum-core" }

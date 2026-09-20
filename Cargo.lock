@@ -1388,6 +1388,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "usage-probe-claude-smoke"
+version = "0.1.0"
+dependencies = [
+ "continuum-usage-core",
+ "serde_json",
+]
+
+[[package]]
 name = "usage-probe-codex"
 version = "0.1.0"
 dependencies = [
@@ -1415,6 +1423,15 @@ dependencies = [
  "continuum-usage-core",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "usage-probe-grok-smoke"
+version = "0.1.0"
+dependencies = [
+ "continuum-core",
+ "continuum-usage-core",
+ "serde_json",
 ]
 
 [[package]]

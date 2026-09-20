@@ -24,6 +24,7 @@ use color_eyre::{eyre::Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use continuum_core::adapters::grok_cli::is_smoke_cwd;
 use continuum_core::{MessageCompressor, PlainTextWriter};
 
 const SOURCE: &str = "grok-cli";
@@ -112,7 +113,9 @@ fn find_session_by_id(root: &Path, id: &str) -> Option<PathBuf> {
     let cwds = std::fs::read_dir(root).ok()?;
     for cwd in cwds.flatten() {
         let cwd = cwd.path();
-        if !cwd.is_dir() {
+        // The Stop/SessionEnd hook fires for `usage-probe-grok-smoke` too; an
+        // hourly "OK" is not a conversation.
+        if !cwd.is_dir() || is_smoke_cwd(&cwd) {
             continue;
         }
         let chat = cwd.join(id).join("chat_history.jsonl");
@@ -128,8 +131,8 @@ fn all_chat_histories(root: &Path) -> Vec<PathBuf> {
     let Ok(cwds) = std::fs::read_dir(root) else { return out };
     for cwd in cwds.flatten() {
         let cwd = cwd.path();
-        if !cwd.is_dir() {
-            continue; // skip session_search.sqlite / prompt_history.jsonl
+        if !cwd.is_dir() || is_smoke_cwd(&cwd) {
+            continue; // skip session_search.sqlite / prompt_history.jsonl / smoke pings
         }
         let Ok(sessions) = std::fs::read_dir(&cwd) else { continue };
         for sess in sessions.flatten() {

@@ -10,11 +10,27 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::{eyre::Context, Result};
 
 use super::LogAdapter;
+
+/// Directory name `usage-probe-grok-smoke` runs in. Grok has no ephemeral
+/// mode, so every hourly ping leaves a session on disk; they are keyed by
+/// this cwd so that everything reading `~/.grok/sessions` can tell a liveness
+/// ping from a conversation. The probe deletes them; importers skip them.
+pub const SMOKE_CWD_NAME: &str = "usage-probe-grok-smoke";
+
+/// Is this `~/.grok/sessions/<url-encoded-cwd>` directory the smoke probe's?
+/// Matches on the encoded final path component, so the temp root it sits
+/// under (`/private/var/folders/…` on macOS, `/tmp` on Linux) does not matter.
+pub fn is_smoke_cwd(encoded_cwd_dir: &Path) -> bool {
+    encoded_cwd_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(&format!("%2F{SMOKE_CWD_NAME}")))
+}
 
 pub struct GrokCliAdapter;
 
@@ -55,8 +71,8 @@ impl LogAdapter for GrokCliAdapter {
 
         for cwd_entry in std::fs::read_dir(&root)? {
             let cwd_dir = cwd_entry?.path();
-            if !cwd_dir.is_dir() {
-                continue; // skips session_search.sqlite, prompt_history.jsonl
+            if !cwd_dir.is_dir() || is_smoke_cwd(&cwd_dir) {
+                continue; // skips session_search.sqlite, prompt_history.jsonl, smoke pings
             }
             for sess_entry in std::fs::read_dir(&cwd_dir)? {
                 let sess_dir = sess_entry?.path();
@@ -86,5 +102,22 @@ impl LogAdapter for GrokCliAdapter {
         Ok(Box::new(reader.lines().map(|line| {
             line.map_err(|e| color_eyre::eyre::eyre!("Failed to read line: {}", e))
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_smoke_probes_own_scratch_dir_is_a_smoke_cwd() {
+        let root = Path::new("/home/u/.grok/sessions");
+        assert!(is_smoke_cwd(&root.join("%2Ftmp%2Fusage-probe-grok-smoke")));
+        assert!(is_smoke_cwd(
+            &root.join("%2Fprivate%2Fvar%2Ffolders%2Fab%2FT%2Fusage-probe-grok-smoke")
+        ));
+        assert!(!is_smoke_cwd(&root.join("%2FUsers%2Fu")));
+        assert!(!is_smoke_cwd(&root.join("%2FUsers%2Fu%2Fusage-probe-grok-smoke-notes")));
+        assert!(!is_smoke_cwd(&root.join("%2FUsers%2Fu%2Fmy-usage-probe-grok-smoke")));
     }
 }
