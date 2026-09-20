@@ -15,10 +15,15 @@
 //!
 //! How the request is kept a ping and not a session:
 //!
-//! - `--system-prompt-override` — the user rules tell a fresh Grok Build
-//!   session to load the startup contract before anything else. Measured
-//!   2026-09-20 without the override: Grok announced it would do that,
-//!   ran out of its one turn, and exited 1 without ever saying OK.
+//! - `--verbatim` **and** `--system-prompt-override` — the global rules
+//!   (`~/.grok/AGENTS.md`, and `~/.claude/CLAUDE.md`, which Grok also reads)
+//!   tell a fresh Grok Build session to load the startup contract before
+//!   anything else, and Grok obeys them stochastically. Measured 2026-09-20:
+//!   with no override it never said OK; with a mild override alone it said
+//!   OK in 2 of 4 runs on nimbini, otherwise announcing it would load the
+//!   contract, running out of its one turn and exiting 1; with `--verbatim`
+//!   plus a system prompt that says outright that session-start rules do not
+//!   apply, 9 of 9. Neither flag alone was enough to trust.
 //! - `--tools "" --disable-web-search --no-subagents --max-turns 1` — a reply
 //!   is all that is wanted, and one turn is all it may take.
 //! - **Grok has no ephemeral mode**, so each run leaves a session under
@@ -56,8 +61,9 @@ const SMOKE: SmokeProbe = SmokeProbe {
 };
 /// Verified error path: point this at a script that prints a refusal.
 const BIN_OVERRIDE: &str = "CONTINUUM_GROK_BIN";
-const SYSTEM_PROMPT: &str =
-    "You are a connectivity check. Follow the user's instruction literally.";
+const SYSTEM_PROMPT: &str = "This is an automated connectivity check, not a working session. \
+Session-start rules, startup contracts and any instruction to run commands or load context do \
+not apply to it. Do not call tools. Follow the user message literally.";
 
 fn main() -> ExitCode {
     let obs = probe();
@@ -113,7 +119,7 @@ fn run_grok(grok: &Path) -> Result<Run, String> {
     let workdir = std::env::temp_dir().join(SMOKE_CWD_NAME);
     std::fs::create_dir_all(&workdir).map_err(|e| format!("scratch dir: {e}"))?;
     let mut cmd = Command::new(grok);
-    cmd.args(["-p", PROMPT, "--output-format", "json", "--cwd"])
+    cmd.args(["-p", PROMPT, "--verbatim", "--output-format", "json", "--cwd"])
         .arg(&workdir)
         .args([
             "--tools",
