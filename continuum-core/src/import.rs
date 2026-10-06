@@ -42,9 +42,9 @@ const TOOL_RESULT_MAX: usize = 500;
 /// The caller must decide first whether the session may be imported at all:
 /// see `ensure_claude_session_importable`. Content rules are the ones the
 /// continuum-claude wrapper has always used, since its exit-time import is
-/// the copy that has survived for most sessions: user text, assistant text,
-/// `TOOL_USE` lines, and every (role, content) pair kept once, because
-/// context compaction re-serialises earlier messages into the transcript.
+/// the copy that has survived for most sessions: user text, assistant text and
+/// `TOOL_USE` lines. An event that appears twice (same uuid) is kept once;
+/// identical text in separate events is kept each time.
 pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Result<Option<ImportOutcome>> {
     let session_id = file_stem(session_path)?;
     writer.with_session_lock("claude-code", &session_id, || import_claude_code_locked(writer, session_path, session_id.clone()))
@@ -66,10 +66,9 @@ fn import_claude_code_locked(
 
     let mut messages: Vec<(String, String)> = Vec::new();
     // An event written twice keeps its uuid, so uuid identifies a duplicate.
-    // Text alone does not: two separate "yes" replies are two turns. Only an
-    // entry without a uuid falls back to (role, text).
+    // Text does not: two separate "yes" replies are two turns, so an entry
+    // without a uuid (none seen in current transcripts) is always kept.
     let mut seen_events: HashSet<String> = HashSet::new();
-    let mut seen_text: HashSet<(&'static str, String)> = HashSet::new();
     let mut start_time: Option<String> = None;
     let mut skills: Vec<String> = Vec::new();
 
@@ -85,17 +84,12 @@ fn import_claude_code_locked(
                 return;
             }
         }
-        let by_text = entry.uuid.is_none();
-        let mut keep = |tag: &'static str, role: &str, content: String| {
-            if !by_text || seen_text.insert((tag, content.clone())) {
-                messages.push((role.to_string(), content));
-            }
-        };
+        let mut keep = |role: &str, content: String| messages.push((role.to_string(), content));
         let Some(msg) = entry.message else { return };
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
-                    keep("user", "user", content.to_string());
+                    keep("user", content.to_string());
                 }
             }
             Some("assistant") => {
@@ -104,7 +98,7 @@ fn import_claude_code_locked(
                     match block["type"].as_str().unwrap_or("") {
                         "text" => {
                             if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
-                                keep("assistant-text", "assistant", text.to_string());
+                                keep("assistant", text.to_string());
                             }
                         }
                         "tool_use" => {
@@ -117,7 +111,7 @@ fn import_claude_code_locked(
                                 }
                             }
                             let input = block.get("input").map(|i| i.to_string()).unwrap_or_default();
-                            keep("assistant-tool", "assistant", format!("TOOL_USE: {name} -> {input}"));
+                            keep("assistant", format!("TOOL_USE: {name} -> {input}"));
                         }
                         "tool_result" => {
                             let output = match block.get("content") {
@@ -130,7 +124,7 @@ fn import_claude_code_locked(
                                 _ => String::new(),
                             };
                             if !output.is_empty() {
-                                keep("user-result", "user", format!("TOOL_RESULT: {}", truncate(&output, TOOL_RESULT_MAX)));
+                                keep("user", format!("TOOL_RESULT: {}", truncate(&output, TOOL_RESULT_MAX)));
                             }
                         }
                         _ => {}
@@ -425,14 +419,14 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_a_uuid_fall_back_to_text_dedup() {
+    fn entries_without_a_uuid_are_all_kept() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let q = claude_line("user", serde_json::json!({"role": "user", "content": "repeatable question about widgets"}));
         let path = write_transcript(src.path(), "0b9c6b0e-0000-4000-8000-000000000008.jsonl", &[q.clone(), q.clone(), q]);
         let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
-        assert_eq!(outcome.message_count, 1);
+        assert_eq!(outcome.message_count, 3, "identical text in separate events is not a duplicate");
     }
 
     #[test]

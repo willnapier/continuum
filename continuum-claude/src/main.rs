@@ -421,15 +421,13 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
             }
         }
     } else if let Some(ref session_path) = after_session {
-        if clinical_marker_exists(&home, session_path) {
+        if let Some(reason) = clinical_refusal(&home, session_path) {
             // Defence-in-depth for the clinical→Continuum boundary
             // (design-forum, 2026-07-22). cc-clinical registers a 0600
             // marker before launch; a present marker is sufficient to refuse.
             // Continuum must stay PHI-free. Skip farewell so no clinical
             // content is read.
-            eprintln!(
-                "⏭ Skipping protected cc-clinical session — not imported to continuum"
-            );
+            eprintln!("⏭ Not imported to continuum: {reason}");
         } else {
             eprintln!("\n📝 Importing session to continuum logs...");
             match import_session_to_continuum(session_path) {
@@ -448,20 +446,21 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1))
 }
 
-/// True if this Claude session carries a clinical-session marker and must NOT be
-/// imported into Continuum (a PHI-free store). Mirrors continuum-cli's
-/// `ensure_claude_session_importable` refusal. A missing registry/marker means no
-/// protection was requested for this session, so ordinary capture proceeds — the
-/// concurrency case this defends (a concurrent `cc-clinical` session being the
-/// latest-modified file) always has its marker present, since `cc-clinical`
-/// registers it before launch.
-fn clinical_marker_exists(home: &str, session_path: &std::path::Path) -> bool {
-    match session_path.file_stem().and_then(|value| value.to_str()) {
-        Some(session_id) => std::path::Path::new(home)
-            .join(".local/share/continuum/claude-clinical-sessions")
-            .join(session_id)
-            .is_file(),
-        None => false,
+/// Why this Claude session must NOT be imported into Continuum (a PHI-free
+/// store), or `None` if it may be. Once the cc-clinical registry exists, this
+/// is the shared fail-closed check: any marker, of any type, refuses, and so
+/// does any error checking for one. Only a registry directory that is
+/// confirmed absent means no protection was ever requested on this machine,
+/// so ordinary capture proceeds — the case this defends (a concurrent
+/// `cc-clinical` session) always has its marker, which `cc-clinical`
+/// registers before launch.
+fn clinical_refusal(home: &str, session_path: &std::path::Path) -> Option<String> {
+    let registry = std::path::Path::new(home).join(".local/share/continuum/claude-clinical-sessions");
+    match std::fs::symlink_metadata(&registry) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        _ => continuum_core::import::ensure_claude_session_importable(session_path, &registry)
+            .err()
+            .map(|e| e.to_string()),
     }
 }
 
@@ -937,7 +936,7 @@ enum Content {
 #[cfg(test)]
 mod tests {
     use super::{
-        clinical_marker_exists, resolve_wrapped_session, resume_session_id_from_args,
+        clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
         session_id_is_safe, try_claim_autolog,
     };
     use std::collections::HashSet;
@@ -957,11 +956,11 @@ mod tests {
         let marked_path = format!("/x/{marked}.jsonl");
         let unmarked_path = format!("/x/{unmarked}.jsonl");
         assert!(
-            clinical_marker_exists(home, Path::new(&marked_path)),
+            clinical_refusal(home, Path::new(&marked_path)).is_some(),
             "a registered clinical session must be protected (skipped, not imported)"
         );
         assert!(
-            !clinical_marker_exists(home, Path::new(&unmarked_path)),
+            clinical_refusal(home, Path::new(&unmarked_path)).is_none(),
             "an unmarked session must import normally"
         );
         std::fs::remove_dir_all(&base).ok();
@@ -975,11 +974,35 @@ mod tests {
             std::env::temp_dir().join(format!("cc-continuum-claude-noreg-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let home = base.to_str().unwrap();
-        assert!(!clinical_marker_exists(
-            home,
-            Path::new("/x/99999999-0000-0000-0000-000000000000.jsonl")
-        ));
+        assert!(clinical_refusal(home, Path::new("/x/99999999-0000-0000-0000-000000000000.jsonl")).is_none());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn once_the_registry_exists_any_marker_or_error_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile_dir("cc-continuum-claude-strict");
+        let reg = base.join(".local/share/continuum/claude-clinical-sessions");
+        std::fs::create_dir_all(&reg).unwrap();
+        let home = base.to_str().unwrap();
+        let id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        std::fs::create_dir(reg.join(id)).unwrap();
+        let path = format!("/x/{id}.jsonl");
+        assert!(clinical_refusal(home, Path::new(&path)).is_some(), "a directory marker refuses");
+
+        std::fs::set_permissions(&reg, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let other = "/x/cccccccc-dddd-eeee-ffff-000000000000.jsonl";
+        let refused = clinical_refusal(home, Path::new(other)).is_some();
+        std::fs::set_permissions(&reg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused, "an unreadable registry refuses rather than assuming no marker");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
     }
 
     #[test]

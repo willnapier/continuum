@@ -34,8 +34,12 @@ impl PlainTextWriter {
     /// (`$CONTINUUM_HOME/continuum-logs`, i.e. `~/Assistants/continuum-logs`)
     pub fn new() -> Result<Self> {
         let base_dir = continuum_home()?.join("continuum-logs");
-        let home = std::env::var("HOME").context("HOME not set")?;
-        let lock_dir = PathBuf::from(home).join(".local/state/continuum/import-locks");
+        // Outside the synced tree when HOME is known; a CONTINUUM_HOME-only
+        // service falls back to a lock directory inside the log tree.
+        let lock_dir = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            Some(home) => PathBuf::from(home).join(".local/state/continuum/import-locks"),
+            None => base_dir.join(".import-locks"),
+        };
         Ok(PlainTextWriter { base_dir, lock_dir })
     }
 
