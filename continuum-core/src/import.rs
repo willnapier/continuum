@@ -1,0 +1,432 @@
+// Whole-session importers shared by every capture path: the exit-time
+// wrappers (continuum-claude, continuum-codex), `continuum import` (the
+// 5-minute sync and timer jobs) and the per-turn Stop hooks.
+//
+// Until 2026-10-06 each path had its own importer and they disagreed. The
+// sync's Claude Code importer appended the whole session on every run, so an
+// active session was stored several times over until the wrapper rewrote it
+// at exit, and continuum-codex filed every session under the day it exited.
+// One importer per assistant, written by `PlainTextWriter::replace_session`,
+// makes any number of re-imports harmless.
+
+use color_eyre::{eyre::Context, eyre::eyre, Result};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use crate::{CodexLogEntry, LoopDetection, LoopDetector, MessageCompressor, PlainTextWriter};
+
+/// What one import did.
+#[derive(Debug)]
+pub struct ImportOutcome {
+    pub session_id: String,
+    pub dir: PathBuf,
+    pub message_count: usize,
+    /// False when the stored copy already matched and nothing was written.
+    pub written: bool,
+    /// Lines that were not valid JSON, normally one still being written.
+    pub skipped_lines: usize,
+}
+
+/// Set to `1` by the continuum-claude / continuum-codex wrappers on the agent
+/// process when `~/.continuum-nosave` was present at launch. The agent's
+/// Stop hooks inherit it, so `continuum import --hook` skips that session.
+pub const NOSAVE_ENV: &str = "CONTINUUM_NOSAVE";
+
+/// Longest tool result kept, in bytes (cut back to a character boundary).
+const TOOL_RESULT_MAX: usize = 500;
+
+/// Import one Claude Code transcript (`~/.claude/projects/<dir>/<uuid>.jsonl`).
+/// `Ok(None)` when it holds no messages yet.
+///
+/// The caller must decide first whether the session may be imported at all:
+/// see `ensure_claude_session_importable`. Content rules are the ones the
+/// continuum-claude wrapper has always used, since its exit-time import is
+/// the copy that has survived for most sessions: user text, assistant text,
+/// `TOOL_USE` lines, and every (role, content) pair kept once, because
+/// context compaction re-serialises earlier messages into the transcript.
+pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Result<Option<ImportOutcome>> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(rename = "type")]
+        entry_type: String,
+        message: Option<serde_json::Value>,
+        timestamp: Option<String>,
+    }
+
+    let session_id = file_stem(session_path)?;
+    let mut messages: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+    let mut keep = |tag: &'static str, role: &str, content: String, messages: &mut Vec<(String, String)>| {
+        if seen.insert((tag, content.clone())) {
+            messages.push((role.to_string(), content));
+        }
+    };
+    let mut start_time: Option<String> = None;
+    let mut skills: Vec<String> = Vec::new();
+    let mut skipped_lines = 0;
+
+    for line in read_lines(session_path)? {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
+            skipped_lines += 1;
+            continue;
+        };
+        if start_time.is_none() {
+            start_time = entry.timestamp.clone();
+        }
+        if entry.entry_type != "user" && entry.entry_type != "assistant" {
+            continue;
+        }
+        let Some(msg) = entry.message else { continue };
+        match msg["role"].as_str() {
+            Some("user") => {
+                if let Some(content) = msg["content"].as_str() {
+                    keep("user", "user", content.to_string(), &mut messages);
+                }
+            }
+            Some("assistant") => {
+                let Some(blocks) = msg["content"].as_array() else { continue };
+                for block in blocks {
+                    match block["type"].as_str().unwrap_or("") {
+                        "text" => {
+                            if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
+                                keep("assistant-text", "assistant", text.to_string(), &mut messages);
+                            }
+                        }
+                        "tool_use" => {
+                            let name = block["name"].as_str().unwrap_or("unknown");
+                            if name == "Skill" {
+                                if let Some(skill) = block.pointer("/input/skill").and_then(|v| v.as_str()) {
+                                    if !skills.iter().any(|s| s == skill) {
+                                        skills.push(skill.to_string());
+                                    }
+                                }
+                            }
+                            let input = block.get("input").map(|i| i.to_string()).unwrap_or_default();
+                            keep("assistant-tool", "assistant", format!("TOOL_USE: {name} -> {input}"), &mut messages);
+                        }
+                        "tool_result" => {
+                            let output = match block.get("content") {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(serde_json::Value::Array(parts)) => parts
+                                    .iter()
+                                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => String::new(),
+                            };
+                            if !output.is_empty() {
+                                let entry = format!("TOOL_RESULT: {}", truncate(&output, TOOL_RESULT_MAX));
+                                keep("user-result", "user", entry, &mut messages);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let compressed = MessageCompressor::new().compress_batch(&messages);
+    if compressed.is_empty() {
+        return Ok(None);
+    }
+    let start_time = start_time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let (dir, written) = writer.replace_session(&session_id, "claude-code", Some(&start_time), &skills, &compressed)?;
+    Ok(Some(ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines }))
+}
+
+/// Import one Codex rollout (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`),
+/// filed under the session's own start date. Also returns the loop
+/// detections, for a caller that wants to show them.
+pub fn import_codex(
+    writer: &PlainTextWriter,
+    session_path: &Path,
+) -> Result<Option<(ImportOutcome, Vec<LoopDetection>)>> {
+    let session_id = file_stem(session_path)?;
+    let mut messages: Vec<(String, String)> = Vec::new();
+    let mut start_time: Option<String> = None;
+    let mut skipped_lines = 0;
+
+    for line in read_lines(session_path)? {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<CodexLogEntry>(&line) else {
+            skipped_lines += 1;
+            continue;
+        };
+        if start_time.is_none() {
+            start_time = entry.timestamp.clone();
+        }
+        if entry.entry_type != "response_item" {
+            continue;
+        }
+        if let Some(payload) = entry.payload {
+            if let (Some(role), Some(content)) = (payload.role, payload.content) {
+                let text = content.iter().filter_map(|c| c.text.as_deref()).collect::<String>();
+                messages.push((role, text));
+            }
+        }
+    }
+
+    let compressed = MessageCompressor::new().compress_batch(&messages);
+    if compressed.is_empty() {
+        return Ok(None);
+    }
+    // The session's own start, never the import time: stamping with `now`
+    // filed one session under a new date on every re-import (2026-09-02).
+    let start_time = start_time
+        .or_else(|| {
+            std::fs::metadata(session_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+        })
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let detections = LoopDetector::new().analyze(&messages);
+    let (dir, written) = writer.replace_session(&session_id, "codex", Some(&start_time), &[], &compressed)?;
+    let outcome = ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines };
+    Ok(Some((outcome, detections)))
+}
+
+/// The cc-clinical session registry: one marker file per clinical session id.
+pub fn claude_clinical_registry() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        eyre!("Refusing Claude Code import: HOME is unavailable, so the clinical-session registry cannot be checked")
+    })?;
+    Ok(PathBuf::from(home).join(".local/share/continuum/claude-clinical-sessions"))
+}
+
+/// Continuum must stay PHI-free, so a session registered by cc-clinical is
+/// never imported. Fails closed: with no registry to consult, refuse.
+pub fn ensure_claude_session_importable(session_path: &Path, registry: &Path) -> Result<()> {
+    if !registry.is_dir() {
+        return Err(eyre!(
+            "Refusing Claude Code import: clinical-session registry is unavailable at {}",
+            registry.display()
+        ));
+    }
+    let session_id = session_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre!("Refusing Claude Code import: invalid session path"))?;
+    if registry.join(session_id).is_file() {
+        return Err(eyre!("Refusing to import protected cc-clinical session {session_id}"));
+    }
+    Ok(())
+}
+
+/// A session id that is safe to use as one path component.
+pub fn session_id_is_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The rollout file for a Codex session id under `sessions_dir`
+/// (`YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`), newest first.
+pub fn find_codex_rollout(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if !session_id_is_safe(session_id) {
+        return None;
+    }
+    let suffix = format!("-{session_id}.jsonl");
+    let mut dirs = vec![sessions_dir.to_path_buf()];
+    let mut found: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rollout-") && n.ends_with(&suffix)) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found.pop()
+}
+
+fn file_stem(path: &Path) -> Result<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| eyre!("Not a session file: {}", path.display()))
+}
+
+fn read_lines(path: &Path) -> Result<std::io::Lines<BufReader<std::fs::File>>> {
+    let file = std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    Ok(BufReader::new(file).lines())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [truncated]", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn claude_line(kind: &str, message: serde_json::Value) -> String {
+        serde_json::json!({"type": kind, "message": message, "timestamp": "2026-10-06T21:00:00.000Z"}).to_string()
+    }
+
+    fn write_transcript(dir: &Path, name: &str, lines: &[String]) -> PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        path
+    }
+
+    fn transcript(dir: &Path) -> PathBuf {
+        write_transcript(
+            dir,
+            "0b9c6b0e-0000-4000-8000-000000000001.jsonl",
+            &[
+                claude_line("user", serde_json::json!({"role": "user", "content": "first question about widgets"})),
+                claude_line(
+                    "assistant",
+                    serde_json::json!({"role": "assistant", "content": [
+                        {"type": "text", "text": "widgets answer"},
+                        {"type": "tool_use", "name": "Skill", "input": {"skill": "senior-dev"}}
+                    ]}),
+                ),
+            ],
+        )
+    }
+
+    fn stored(outcome: &ImportOutcome) -> Vec<String> {
+        std::fs::read_to_string(outcome.dir.join("messages.jsonl")).unwrap().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn reimport_of_an_unchanged_claude_session_writes_nothing_and_never_duplicates() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let path = transcript(src.path());
+
+        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+        assert!(first.written);
+        let lines = stored(&first);
+        for _ in 0..3 {
+            let again = import_claude_code(&writer, &path).unwrap().unwrap();
+            assert!(!again.written, "unchanged session must not be rewritten");
+            assert_eq!(stored(&again), lines, "re-import must leave exactly one copy");
+        }
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(first.dir.join("session.json")).unwrap()).unwrap();
+        assert_eq!(meta["skills"], serde_json::json!(["senior-dev"]));
+        assert_eq!(meta["message_count"], serde_json::json!(lines.len()));
+    }
+
+    #[test]
+    fn a_grown_claude_session_is_replaced_not_appended() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let path = transcript(src.path());
+        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{}", claude_line("user", serde_json::json!({"role": "user", "content": "second question about gears"}))).unwrap();
+        // A half-written final line is skipped, not fatal.
+        write!(f, "{{\"type\":\"assistant\",\"mess").unwrap();
+        drop(f);
+
+        let second = import_claude_code(&writer, &path).unwrap().unwrap();
+        assert!(second.written);
+        assert_eq!(second.skipped_lines, 1);
+        assert_eq!(second.message_count, first.message_count + 1);
+        let lines = stored(&second);
+        assert_eq!(lines.len(), second.message_count, "one line per message, no duplicates");
+        assert!(lines.last().unwrap().contains("second question about gears"));
+        let leftovers: Vec<_> = std::fs::read_dir(&second.dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left behind");
+    }
+
+    #[test]
+    fn compaction_reserialised_messages_are_kept_once() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let q = claude_line("user", serde_json::json!({"role": "user", "content": "repeatable question about widgets"}));
+        let path = write_transcript(src.path(), "0b9c6b0e-0000-4000-8000-000000000002.jsonl", &[q.clone(), q.clone(), q]);
+        let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
+        assert_eq!(outcome.message_count, 1);
+    }
+
+    #[test]
+    fn long_multibyte_tool_results_truncate_on_a_character_boundary() {
+        let s = "é".repeat(400); // 800 bytes; byte 500 falls mid-character
+        let t = truncate(&s, 501);
+        assert!(t.ends_with("... [truncated]"));
+    }
+
+    #[test]
+    fn clinical_registry_refuses_marked_sessions_and_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = home.path().join("registry");
+        let session = home.path().join("0b9c6b0e-0000-4000-8000-000000000003.jsonl");
+
+        assert!(
+            ensure_claude_session_importable(&session, &registry).is_err(),
+            "missing registry must refuse (fail closed)"
+        );
+        std::fs::create_dir_all(&registry).unwrap();
+        assert!(ensure_claude_session_importable(&session, &registry).is_ok(), "unmarked session imports");
+        std::fs::write(registry.join("0b9c6b0e-0000-4000-8000-000000000003"), "").unwrap();
+        assert!(ensure_claude_session_importable(&session, &registry).is_err(), "marked session is refused");
+    }
+
+    #[test]
+    fn codex_import_is_idempotent_and_dated_by_the_session_start() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let line = |role: &str, text: &str| {
+            serde_json::json!({"type": "response_item", "timestamp": "2026-09-29T08:00:00.000Z",
+                "payload": {"role": role, "content": [{"type": "input_text", "text": text}]}})
+            .to_string()
+        };
+        let path = write_transcript(
+            src.path(),
+            "rollout-2026-09-29T08-00-00-019a0000-0000-7000-8000-000000000004.jsonl",
+            &[line("user", "plan the journey to the coast"), line("assistant", "here is a plan for the coast")],
+        );
+        let (first, _) = import_codex(&writer, &path).unwrap().unwrap();
+        assert!(first.written);
+        assert!(first.dir.to_string_lossy().contains("/codex/2026-09-29/"), "filed under its own start date");
+        let (again, _) = import_codex(&writer, &path).unwrap().unwrap();
+        assert!(!again.written);
+        assert_eq!(stored(&again).len(), first.message_count);
+    }
+
+    #[test]
+    fn codex_rollouts_are_found_by_session_id_only() {
+        let root = tempfile::tempdir().unwrap();
+        let day = root.path().join("2026/10/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "019a0000-0000-7000-8000-000000000005";
+        let want = day.join(format!("rollout-2026-10-06T23-00-00-{id}.jsonl"));
+        std::fs::write(&want, "").unwrap();
+        std::fs::write(day.join("rollout-2026-10-06T23-00-00-019a0000-0000-7000-8000-000000000006.jsonl"), "").unwrap();
+        assert_eq!(find_codex_rollout(root.path(), id), Some(want));
+        assert_eq!(find_codex_rollout(root.path(), "../etc"), None);
+    }
+}

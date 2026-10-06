@@ -4,6 +4,7 @@
 pub mod adapters;
 pub mod codex_cli;
 pub mod compression;
+pub mod import;
 pub mod loop_detection;
 pub mod plaintext;
 pub mod types;

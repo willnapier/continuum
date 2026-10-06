@@ -70,8 +70,14 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
         None
     };
 
-    // Spawn claude process
-    let mut child = Command::new("claude")
+    // Spawn claude process. CONTINUUM_NOSAVE reaches the per-turn Stop hook
+    // (`continuum import --hook`) through claude's environment, so a nosave
+    // session is not imported turn by turn either.
+    let mut command = Command::new("claude");
+    if skip_saving {
+        command.env(continuum_core::import::NOSAVE_ENV, "1");
+    }
+    let mut child = command
         .args(&args)
         .stdin(if user_prompt.is_some() {
             Stdio::piped()
@@ -358,7 +364,12 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     // Identify *this* child's session while it runs (open jsonl / --resume id).
     // Do not use "newest jsonl after exit": two Claudes dying together used to
     // make every wrapper auto-log the same file (identical DayPage twins).
-    let mut child = Command::new(&real_claude)
+    let mut command = Command::new(&real_claude);
+    if skip_saving {
+        // Seen by the per-turn Stop hook through claude's environment.
+        command.env(continuum_core::import::NOSAVE_ENV, "1");
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -688,196 +699,18 @@ fn find_latest_session_file(projects_dir: &std::path::Path) -> Option<std::path:
     latest.map(|(path, _)| path)
 }
 
-fn hash_content(role: &str, content: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    role.hash(&mut hasher);
-    content.hash(&mut hasher);
-    hasher.finish()
-}
-
+/// Import the wrapped session into Continuum: the same importer as the
+/// 5-minute sync and the per-turn Stop hook (`continuum_core::import`), so
+/// whichever runs last leaves the same single copy.
 fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
-    use continuum_core::{MessageCompressor, PlainTextWriter};
-    use std::io::{BufRead, BufReader};
-
     let writer = PlainTextWriter::new()?;
-
-    let session_id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    let compressor = MessageCompressor::new();
-    let mut messages: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut start_time: Option<String> = None;
-    let mut skills: Vec<String> = Vec::new();
-
-    // Read all messages from the session file, deduplicating content.
-    // CC sessions with context compression re-serialize earlier messages,
-    // causing massive duplication in long sessions without this check.
-    let file = std::fs::File::open(session_path)
-        .with_context(|| format!("Failed to open {}", session_path.display()))?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-
-        #[derive(serde::Deserialize)]
-        struct ClaudeCodeEntry {
-            #[serde(rename = "type")]
-            entry_type: String,
-            message: Option<serde_json::Value>,
-            timestamp: Option<String>,
+    match continuum_core::import::import_claude_code(&writer, session_path)? {
+        Some(outcome) => {
+            eprintln!("✓ Saved {} messages to continuum logs", outcome.message_count);
+            Ok(())
         }
-
-        let entry: ClaudeCodeEntry = serde_json::from_str(&line)?;
-
-        // Capture first timestamp
-        if start_time.is_none() {
-            if let Some(ref ts) = entry.timestamp {
-                start_time = Some(ts.clone());
-            }
-        }
-
-        // Process user and assistant messages
-        if entry.entry_type == "user" || entry.entry_type == "assistant" {
-            if let Some(msg) = entry.message {
-                let role = msg["role"].as_str().unwrap_or("");
-
-                if role == "user" {
-                    if let Some(content) = msg["content"].as_str() {
-                        let hash = hash_content("user", content);
-                        if seen.insert(hash) {
-                            messages.push(("user".to_string(), content.to_string()));
-                        }
-                    }
-                } else if role == "assistant" {
-                    if let Some(content_array) = msg["content"].as_array() {
-                        // Extract skills from Skill tool_use blocks
-                        for block in content_array {
-                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
-                                && block.get("name").and_then(|v| v.as_str()) == Some("Skill")
-                            {
-                                if let Some(skill) =
-                                    block.pointer("/input/skill").and_then(|v| v.as_str())
-                                {
-                                    if !skills.contains(&skill.to_string()) {
-                                        skills.push(skill.to_string());
-                                    }
-                                }
-                            }
-                        }
-
-                        // Process all content blocks: text and tool_use
-                        for block in content_array {
-                            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                            match block_type {
-                                "text" => {
-                                    if let Some(text) = block["text"].as_str() {
-                                        if !text.is_empty() {
-                                            let hash = hash_content("assistant-text", text);
-                                            if seen.insert(hash) {
-                                                messages.push(("assistant".to_string(), text.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                                "tool_use" => {
-                                    let tool_name = block["name"].as_str().unwrap_or("unknown");
-                                    let input = block.get("input")
-                                        .map(|i| serde_json::to_string(i).unwrap_or_default())
-                                        .unwrap_or_default();
-                                    let tool_entry = format!(
-                                        "TOOL_USE: {} -> {}",
-                                        tool_name, input
-                                    );
-                                    let hash = hash_content("assistant-tool", &tool_entry);
-                                    if seen.insert(hash) {
-                                        messages.push(("assistant".to_string(), tool_entry));
-                                    }
-                                }
-                                "tool_result" => {
-                                    // Extract tool result content
-                                    let output = match block.get("content") {
-                                        Some(serde_json::Value::String(s)) => s.clone(),
-                                        Some(serde_json::Value::Array(blocks)) => blocks
-                                            .iter()
-                                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                                            .collect::<Vec<_>>()
-                                            .join("\n"),
-                                        _ => String::new(),
-                                    };
-                                    if !output.is_empty() {
-                                        // Truncate large outputs to keep logs manageable
-                                        let truncated = if output.len() > 500 {
-                                            format!("{}... [truncated]", &output[..500])
-                                        } else {
-                                            output
-                                        };
-                                        let result_entry = format!("TOOL_RESULT: {}", truncated);
-                                        let hash = hash_content("user-result", &result_entry);
-                                        if seen.insert(hash) {
-                                            messages.push(("user".to_string(), result_entry));
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        None => Err(color_eyre::eyre::eyre!("No messages to import")),
     }
-
-    // Compress messages (noise filter removes pleasantries/boilerplate)
-    let compressed = compressor.compress_batch(&messages);
-    let message_count = compressed.len();
-
-    if message_count == 0 {
-        return Err(color_eyre::eyre::eyre!("No messages to import"));
-    }
-
-    let timestamp = start_time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let date = PlainTextWriter::extract_date(Some(&timestamp));
-
-    // Write session (overwrites session.json)
-    let session_dir = writer.write_session(
-        session_id,
-        "claude-code",
-        Some(&timestamp),
-        None,
-        "closed",
-        message_count,
-        &skills,
-    )?;
-
-    // Delete existing messages.jsonl before writing to prevent duplication
-    // on session re-import (CC sessions can be resumed, triggering re-import).
-    let messages_path = session_dir.join("messages.jsonl");
-    if messages_path.exists() {
-        std::fs::remove_file(&messages_path)
-            .with_context(|| format!("Failed to remove old messages.jsonl: {}", messages_path.display()))?;
-    }
-
-    // Write messages
-    for (idx, (role, content)) in compressed.iter().enumerate() {
-        writer.append_message(
-            session_id,
-            "claude-code",
-            &date,
-            idx + 1,
-            role,
-            content,
-            Some(&timestamp),
-        )?;
-    }
-
-    eprintln!("✓ Saved {} messages to continuum logs", message_count);
-
-    Ok(())
 }
 
 /// Post-session check: was this a substantive session without daypage-append?

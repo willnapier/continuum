@@ -49,7 +49,12 @@ fn main() -> Result<()> {
     let before_session = find_latest_session_file(&sessions_dir);
 
     // Spawn codex as a child process
-    let mut child = Command::new(&real_codex)
+    let mut command = Command::new(&real_codex);
+    if skip_saving {
+        // Seen by the per-turn Stop hook through codex's environment.
+        command.env(continuum_core::import::NOSAVE_ENV, "1");
+    }
+    let mut child = command
         .args(&args)
         .env(continuum_core::codex_cli::CODEX_DEPTH_ENV, "1")
         .stdin(Stdio::inherit())
@@ -154,62 +159,17 @@ fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path:
     latest.map(|(path, _)| path)
 }
 
+/// Import the wrapped session into Continuum with the shared importer
+/// (`continuum_core::import`), which files it under the session's own start
+/// date and replaces rather than appends, like the timer and the Stop hook.
 fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::path::PathBuf> {
-    use continuum_core::{
-        CodexLogEntry, LoopDetector, LoopSeverity, MessageCompressor, PlainTextWriter,
-    };
-    use std::io::{BufRead, BufReader};
+    use continuum_core::{LoopSeverity, PlainTextWriter};
 
     let writer = PlainTextWriter::new()?;
-
-    let session_id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    let compressor = MessageCompressor::new();
-    let mut messages: Vec<(String, String)> = Vec::new();
-    let start_time = chrono::Utc::now().to_rfc3339();
-
-    // Read all messages from the session file
-    let file = std::fs::File::open(session_path)
-        .with_context(|| format!("Failed to open {}", session_path.display()))?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = line?;
-        let entry: CodexLogEntry = serde_json::from_str(&line)?;
-
-        if entry.entry_type == "response_item" {
-            if let Some(ref payload) = entry.payload {
-                if let Some(ref role) = payload.role {
-                    if let Some(ref content_array) = payload.content {
-                        let text = content_array
-                            .iter()
-                            .filter_map(|c| c.text.as_deref())
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        messages.push((role.clone(), text));
-                    }
-                }
-            }
-        }
-    }
-
-    // Compress messages
-    let compressed = compressor.compress_batch(&messages);
-    let message_count = compressed.len();
-
-    if message_count == 0 {
+    let Some((outcome, detections)) = continuum_core::import::import_codex(&writer, session_path)? else {
         return Err(color_eyre::eyre::eyre!("No messages to import"));
-    }
+    };
 
-    // Loop detection - analyze messages before writing
-    let detector = LoopDetector::new();
-    let detections = detector.analyze(&messages);
-
-    // Report any detected loops
     if !detections.is_empty() {
         eprintln!("\n⚠️  LOOP DETECTION WARNINGS ⚠️");
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -224,35 +184,8 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
         eprintln!("This may indicate an automation failure or runaway process.\n");
     }
 
-    let date = PlainTextWriter::extract_date(Some(&start_time));
-
-    // Write session
-    let session_dir = writer.write_session(
-        session_id,
-        "codex",
-        Some(&start_time),
-        None,
-        "closed",
-        message_count,
-        &[],
-    )?;
-
-    // Write messages
-    for (idx, (role, content)) in compressed.iter().enumerate() {
-        writer.append_message(
-            session_id,
-            "codex",
-            &date,
-            idx + 1,
-            role,
-            content,
-            Some(&start_time),
-        )?;
-    }
-
-    eprintln!("✓ Saved {} messages to continuum logs", message_count);
-
-    Ok(session_dir)
+    eprintln!("✓ Saved {} messages to continuum logs", outcome.message_count);
+    Ok(outcome.dir)
 }
 
 /// Prompt user whether to save the conversation

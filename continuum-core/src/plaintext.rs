@@ -185,10 +185,96 @@ impl PlainTextWriter {
         Ok(())
     }
 
+    /// Write a whole session at once, replacing whatever is stored for it.
+    ///
+    /// Unlike `write_session` + `append_message`, any number of re-imports
+    /// of a session that is still growing (the 5-minute sync, a per-turn
+    /// hook, a wrapper at exit) leave exactly one copy. If `messages.jsonl`
+    /// already holds these messages byte for byte, nothing is written and
+    /// the second value is `false`. Both files are written to a `*.tmp`
+    /// sibling (Syncthing-ignored) and renamed into place, so a reader or a
+    /// concurrent importer never sees half a file.
+    pub fn replace_session(
+        &self,
+        session_id: &str,
+        assistant: &str,
+        start_time: Option<&str>,
+        skills: &[String],
+        messages: &[(String, String)],
+    ) -> Result<(PathBuf, bool)> {
+        let date = Self::extract_date(start_time);
+        let session_dir = self.session_dir(assistant, &date, session_id);
+        fs::create_dir_all(&session_dir)
+            .with_context(|| format!("Failed to create directory: {}", session_dir.display()))?;
+
+        // Same line format as `append_message`.
+        let mut body = Vec::new();
+        for (idx, (role, content)) in messages.iter().enumerate() {
+            let message = json!({
+                "id": idx + 1,
+                "role": role,
+                "content": content,
+                "timestamp": start_time,
+            });
+            serde_json::to_writer(&mut body, &message)?;
+            body.push(b'\n');
+        }
+
+        let messages_path = session_dir.join("messages.jsonl");
+        let session_json_path = session_dir.join("session.json");
+        if session_json_path.exists() && fs::read(&messages_path).ok().as_deref() == Some(&body[..]) {
+            return Ok((session_dir, false));
+        }
+
+        let mut metadata = json!({
+            "id": session_id,
+            "assistant": assistant,
+            "start_time": start_time,
+            "end_time": null,
+            "status": "closed",
+            "message_count": messages.len(),
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if !skills.is_empty() {
+            metadata["skills"] = json!(skills);
+        }
+
+        write_atomically(&messages_path, &body)?;
+        write_atomically(&session_json_path, &serde_json::to_vec_pretty(&metadata)?)?;
+        Ok((session_dir, true))
+    }
+
     /// Get the base directory
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
+}
+
+/// Write `bytes` to `path` by way of a uniquely named `*.tmp` sibling and a
+/// rename, which is atomic on the same filesystem.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("Failed to rename {} into place", tmp.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]

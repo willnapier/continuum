@@ -9,9 +9,8 @@ use color_eyre::{eyre::Context, Result};
 use continuum_core::adapters::claude_code::ClaudeCodeAdapter;
 use continuum_core::adapters::codex::CodexAdapter;
 use continuum_core::adapters::goose::{parse_goose_content, GooseAdapter};
-use continuum_core::{
-    CodexLogEntry, LogAdapter, LoopDetector, LoopSeverity, MessageCompressor, PlainTextWriter,
-};
+use continuum_core::import;
+use continuum_core::{LogAdapter, LoopSeverity, MessageCompressor, PlainTextWriter};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -151,15 +150,20 @@ impl Drop for UpdateLock {
 
 #[derive(Args, Debug)]
 struct ImportArgs {
-    /// Assistant to import from (codex, goose)
+    /// Assistant to import from (claude-code, codex, goose)
     #[arg(short, long)]
     assistant: String,
-    /// Session ID to import (uses adapter's latest if not specified)
+    /// Session file to import (uses adapter's latest if not specified)
     #[arg(short, long)]
     session: Option<String>,
     /// Output directory (default: $CONTINUUM_HOME/continuum-logs, i.e. ~/Assistants/continuum-logs)
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Run as the agent's per-turn Stop hook (claude-code, codex): read the
+    /// hook's JSON from stdin and import that one session. Prints nothing on
+    /// stdout; exits 0 or 1, never 2.
+    #[arg(long, conflicts_with = "session")]
+    hook: bool,
 }
 
 fn handle_import(args: &ImportArgs) -> Result<()> {
@@ -170,6 +174,28 @@ fn handle_import(args: &ImportArgs) -> Result<()> {
     };
 
     let adapter_name = args.assistant.to_lowercase();
+
+    if args.hook {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let stdin = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+        let clinical_launch = std::env::var_os("CC_CLINICAL_PID").is_some_and(|v| !v.is_empty());
+        if std::env::var_os(import::NOSAVE_ENV).is_some_and(|v| v == "1") {
+            eprintln!("continuum hook: nosave session, not imported");
+            std::process::exit(0);
+        }
+        let codex_home = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+        let code = match run_hook(&adapter_name, &stdin, home.as_deref(), clinical_launch, codex_home.as_deref(), &writer) {
+            Ok(HookResult::Imported(note)) | Ok(HookResult::Skipped(note)) => {
+                eprintln!("continuum hook: {note}");
+                0
+            }
+            Err(e) => {
+                eprintln!("continuum hook: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
 
     match adapter_name.as_str() {
         "codex" => {
@@ -194,29 +220,6 @@ fn handle_import(args: &ImportArgs) -> Result<()> {
     }
 }
 
-/// Number of messages already stored for a session, or `None` if it has
-/// never been imported.
-fn existing_message_count(session_dir: &std::path::Path) -> Option<usize> {
-    let text = std::fs::read_to_string(session_dir.join("messages.jsonl")).ok()?;
-    Some(text.lines().filter(|l| !l.trim().is_empty()).count())
-}
-
-#[cfg(test)]
-mod codex_import_tests {
-    use super::existing_message_count;
-
-    #[test]
-    fn message_count_is_none_before_import_and_counts_lines_after() {
-        let dir = std::env::temp_dir().join(format!("continuum-codex-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(existing_message_count(&dir), None);
-        std::fs::write(dir.join("messages.jsonl"), "{\"a\":1}\n{\"b\":2}\n\n").unwrap();
-        assert_eq!(existing_message_count(&dir), Some(2));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 fn import_codex_session(
     writer: &PlainTextWriter,
     adapter: &CodexAdapter,
@@ -230,87 +233,11 @@ fn import_codex_session(
 
     eprintln!("Importing Codex session: {}", session_path.display());
 
-    let session_id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let Some((outcome, detections)) = import::import_codex(writer, &session_path)? else {
+        eprintln!("⚠ No messages found in Codex session: {}", session_path.display());
+        return Ok(());
+    };
 
-    let compressor = MessageCompressor::new();
-    let mut messages: Vec<(String, String)> = Vec::new();
-    // The session's own start time, not the import time (2026-09-02):
-    // stamping with `now` filed the same session under a new date on
-    // every 5-minute re-import, so it surfaced as "new" for weeks.
-    let mut start_time: Option<String> = None;
-
-    // Read all messages
-    for line_result in adapter.stream_session(&session_path)? {
-        let line = line_result?;
-        let entry: CodexLogEntry = serde_json::from_str(&line)?;
-        if start_time.is_none() {
-            start_time = entry.timestamp.clone();
-        }
-
-        if entry.entry_type == "response_item" {
-            if let Some(ref payload) = entry.payload {
-                if let Some(ref role) = payload.role {
-                    if let Some(ref content_array) = payload.content {
-                        let text = content_array
-                            .iter()
-                            .filter_map(|c| c.text.as_deref())
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        messages.push((role.clone(), text));
-                    }
-                }
-            }
-        }
-    }
-
-    let start_time = start_time
-        .or_else(|| {
-            std::fs::metadata(&session_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
-        })
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-    // Compress messages to remove noise
-    let compressed = compressor.compress_batch(&messages);
-    let message_count = compressed.len();
-
-    // Idempotence (2026-09-02): `append_message` appends, so re-importing
-    // an unchanged session used to duplicate every message. If the
-    // session is already on disk with the same message count, do nothing;
-    // if it has grown, rewrite it rather than append to it.
-    let date = PlainTextWriter::extract_date(Some(&start_time));
-    let session_dir = writer.base_dir().join("codex").join(&date).join(session_id);
-    match existing_message_count(&session_dir) {
-        Some(n) if n == message_count => {
-            println!(
-                "= Codex session {} already imported ({} messages, {}); nothing to do",
-                session_id,
-                n,
-                session_dir.display()
-            );
-            return Ok(());
-        }
-        Some(n) => {
-            eprintln!(
-                "Codex session {} grew {} → {} messages; rewriting",
-                session_id, n, message_count
-            );
-            std::fs::remove_file(session_dir.join("messages.jsonl"))?;
-        }
-        None => {}
-    }
-
-    // Loop detection - analyze messages before writing
-    let detector = LoopDetector::new();
-    let detections = detector.analyze(&messages);
-
-    // Report any detected loops
     if !detections.is_empty() {
         eprintln!("\n⚠️  LOOP DETECTION WARNINGS ⚠️");
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -324,44 +251,7 @@ fn import_codex_session(
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     }
 
-    // Write session
-    writer.write_session(
-        session_id,
-        "codex",
-        Some(&start_time),
-        None,
-        "closed",
-        message_count,
-        &[],
-    )?;
-
-    // Write messages
-    for (idx, (role, content)) in compressed.iter().enumerate() {
-        writer.append_message(
-            session_id,
-            "codex",
-            &date,
-            idx + 1,
-            role,
-            content,
-            Some(&start_time),
-        )?;
-    }
-
-    println!(
-        "✓ Imported {} messages from Codex session: {}",
-        message_count, session_id
-    );
-    println!(
-        "  Location: {}",
-        writer
-            .base_dir()
-            .join("codex")
-            .join(&date)
-            .join(session_id)
-            .display()
-    );
-
+    report("Codex", &outcome);
     Ok(())
 }
 
@@ -476,176 +366,130 @@ fn import_claude_code_session(
         adapter.find_latest_session()?
     };
 
-    ensure_claude_session_importable(&session_path, &clinical_session_marker_dir()?)?;
+    import::ensure_claude_session_importable(&session_path, &import::claude_clinical_registry()?)?;
 
     eprintln!("Importing Claude Code session: {}", session_path.display());
 
-    let session_id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    let compressor = MessageCompressor::new();
-    let mut messages: Vec<(String, String)> = Vec::new();
-    let mut start_time: Option<String> = None;
-    let mut skills: Vec<String> = Vec::new();
-
-    // Read all messages
-    for line_result in adapter.stream_session(&session_path)? {
-        let line = line_result?;
-
-        #[derive(serde::Deserialize)]
-        struct ClaudeCodeEntry {
-            #[serde(rename = "type")]
-            entry_type: String,
-            message: Option<serde_json::Value>,
-            timestamp: Option<String>,
-        }
-
-        let entry: ClaudeCodeEntry = serde_json::from_str(&line)?;
-
-        // Capture first timestamp as session start time
-        if start_time.is_none() {
-            if let Some(ref ts) = entry.timestamp {
-                start_time = Some(ts.clone());
-            }
-        }
-
-        // Process user and assistant messages
-        if entry.entry_type == "user" || entry.entry_type == "assistant" {
-            if let Some(msg) = entry.message {
-                let role = msg["role"].as_str().unwrap_or("");
-
-                if role == "user" {
-                    // User messages have content as a string
-                    if let Some(content) = msg["content"].as_str() {
-                        messages.push(("user".to_string(), content.to_string()));
-                    }
-                } else if role == "assistant" {
-                    // Assistant messages have content as an array
-                    if let Some(content_array) = msg["content"].as_array() {
-                        // Extract skills from Skill tool_use blocks
-                        for block in content_array {
-                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
-                                && block.get("name").and_then(|v| v.as_str()) == Some("Skill")
-                            {
-                                if let Some(skill) =
-                                    block.pointer("/input/skill").and_then(|v| v.as_str())
-                                {
-                                    if !skills.contains(&skill.to_string()) {
-                                        skills.push(skill.to_string());
-                                    }
-                                }
-                            }
-                        }
-
-                        let text = content_array
-                            .iter()
-                            .filter_map(|c| {
-                                // Only include "text" type, skip "thinking"
-                                if c["type"].as_str() == Some("text") {
-                                    c["text"].as_str().map(String::from)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-
-                        if !text.is_empty() {
-                            messages.push(("assistant".to_string(), text));
-                        }
-                    }
-                }
-            }
-        }
+    match import::import_claude_code(writer, &session_path)? {
+        Some(outcome) => report("Claude Code", &outcome),
+        None => eprintln!("⚠ No messages found in Claude Code session: {}", session_path.display()),
     }
-
-    // Compress messages to remove noise
-    let compressed = compressor.compress_batch(&messages);
-    let message_count = compressed.len();
-
-    if message_count == 0 {
-        eprintln!("⚠ No messages found in Claude Code session: {}", session_id);
-        return Ok(());
-    }
-
-    // Use captured timestamp or fallback to current time
-    let timestamp = start_time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let date = PlainTextWriter::extract_date(Some(&timestamp));
-
-    // Write session
-    writer.write_session(
-        session_id,
-        "claude-code",
-        Some(&timestamp),
-        None,
-        "closed",
-        message_count,
-        &skills,
-    )?;
-
-    // Write messages
-    for (idx, (role, content)) in compressed.iter().enumerate() {
-        writer.append_message(
-            session_id,
-            "claude-code",
-            &date,
-            idx + 1,
-            role,
-            content,
-            Some(&timestamp),
-        )?;
-    }
-
-    println!(
-        "✓ Imported {} messages from Claude Code session: {}",
-        message_count, session_id
-    );
-    println!(
-        "  Location: {}",
-        writer
-            .base_dir()
-            .join("claude-code")
-            .join(&date)
-            .join(session_id)
-            .display()
-    );
-
     Ok(())
 }
 
-fn clinical_session_marker_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "Refusing Claude Code import: HOME is unavailable, so the clinical-session registry cannot be checked"
-        )
-    })?;
-    Ok(PathBuf::from(home).join(".local/share/continuum/claude-clinical-sessions"))
+fn report(label: &str, outcome: &import::ImportOutcome) {
+    if outcome.written {
+        println!(
+            "✓ Imported {} messages from {} session: {}",
+            outcome.message_count, label, outcome.session_id
+        );
+    } else {
+        println!(
+            "= {} session {} already imported ({} messages); nothing to do",
+            label, outcome.session_id, outcome.message_count
+        );
+    }
+    if outcome.skipped_lines > 0 {
+        eprintln!("  ({} unreadable line(s) skipped)", outcome.skipped_lines);
+    }
+    println!("  Location: {}", outcome.dir.display());
 }
 
-fn ensure_claude_session_importable(session_path: &Path, marker_dir: &Path) -> Result<()> {
-    if !marker_dir.is_dir() {
-        return Err(color_eyre::eyre::eyre!(
-            "Refusing Claude Code import: clinical-session registry is unavailable at {}",
-            marker_dir.display()
-        ));
+/// What the Stop hook payload carries that we use (Claude Code and Codex
+/// both send these two fields; everything else is ignored).
+#[derive(serde::Deserialize)]
+struct HookInput {
+    session_id: String,
+    transcript_path: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum HookResult {
+    Imported(String),
+    Skipped(String),
+}
+
+/// The per-turn Stop hook: import the session that just finished a turn, so
+/// a crash or power cut loses at most the turn in progress.
+///
+/// `Skipped` covers sessions that must not or cannot be imported (a
+/// cc-clinical session, a transcript outside the agent's own store); `Err`
+/// is a real failure. The caller maps both to exit 0 and 1 — never 2, which
+/// Claude Code and Codex read from a Stop hook as "continue the turn".
+fn run_hook(
+    assistant: &str,
+    stdin: &str,
+    home: Option<&Path>,
+    clinical_launch: bool,
+    codex_home: Option<&Path>,
+    writer: &PlainTextWriter,
+) -> Result<HookResult> {
+    let home = home.ok_or_else(|| color_eyre::eyre::eyre!("HOME is not set"))?;
+    let input: HookInput = serde_json::from_str(stdin).context("Stop hook payload is not the expected JSON")?;
+    if !import::session_id_is_safe(&input.session_id) {
+        color_eyre::eyre::bail!("unusable session id in Stop hook payload");
     }
 
-    let session_id = session_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!("Refusing Claude Code import: invalid session path")
-        })?;
-
-    if marker_dir.join(session_id).is_file() {
-        return Err(color_eyre::eyre::eyre!(
-            "Refusing to import protected cc-clinical session {session_id}"
-        ));
+    match assistant {
+        "claude-code" => {
+            // Continuum stays PHI-free. A cc-clinical launch is refused before
+            // anything is read; the registry check below is the second guard.
+            if clinical_launch {
+                return Ok(HookResult::Skipped("cc-clinical session, not imported".into()));
+            }
+            let path = input
+                .transcript_path
+                .map(PathBuf::from)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Stop hook payload has no transcript_path"))?;
+            let projects = home.join(".claude/projects");
+            let inside = match (path.canonicalize(), projects.canonicalize()) {
+                (Ok(p), Ok(root)) => p.starts_with(root),
+                _ => false,
+            };
+            let stem_matches = path.file_stem().and_then(|s| s.to_str()) == Some(input.session_id.as_str());
+            if !inside || !stem_matches || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                return Ok(HookResult::Skipped(format!(
+                    "transcript is not this session's file under {}",
+                    projects.display()
+                )));
+            }
+            let registry = home.join(".local/share/continuum/claude-clinical-sessions");
+            if let Err(refusal) = import::ensure_claude_session_importable(&path, &registry) {
+                return Ok(HookResult::Skipped(refusal.to_string()));
+            }
+            Ok(match import::import_claude_code(writer, &path)? {
+                Some(o) => HookResult::Imported(describe(&o)),
+                None => HookResult::Skipped("no messages yet".into()),
+            })
+        }
+        "codex" => {
+            let sessions = codex_home.map(Path::to_path_buf).unwrap_or_else(|| home.join(".codex")).join("sessions");
+            let path = input
+                .transcript_path
+                .map(PathBuf::from)
+                .filter(|p| p.is_file())
+                .or_else(|| import::find_codex_rollout(&sessions, &input.session_id))
+                .ok_or_else(|| color_eyre::eyre::eyre!("no rollout file for Codex session {}", input.session_id))?;
+            let stem_ok = path.file_stem().and_then(|s| s.to_str()).is_some_and(import::session_id_is_safe);
+            if !stem_ok {
+                color_eyre::eyre::bail!("unusable rollout file name: {}", path.display());
+            }
+            Ok(match import::import_codex(writer, &path)? {
+                Some((o, _)) => HookResult::Imported(describe(&o)),
+                None => HookResult::Skipped("no messages yet".into()),
+            })
+        }
+        other => color_eyre::eyre::bail!("--hook supports claude-code and codex, not {other}"),
     }
+}
 
-    Ok(())
+fn describe(o: &import::ImportOutcome) -> String {
+    format!(
+        "{} {} ({} messages)",
+        if o.written { "saved" } else { "unchanged" },
+        o.session_id,
+        o.message_count
+    )
 }
 
 fn handle_stats() -> Result<()> {
@@ -663,8 +507,11 @@ fn handle_stats() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_claude_session_importable;
+    use super::{run_hook, HookResult};
+    use continuum_core::import::ensure_claude_session_importable;
+    use continuum_core::PlainTextWriter;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -703,5 +550,120 @@ mod tests {
             .join("22222222-2222-2222-2222-222222222222.jsonl");
 
         ensure_claude_session_importable(&session, &registry).unwrap();
+    }
+
+    const ID: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// A fake home with a Claude transcript, the clinical registry and an
+    /// output tree. Returns (home, transcript, writer).
+    fn claude_home() -> (tempfile::TempDir, PathBuf, PlainTextWriter) {
+        let home = tempdir().unwrap();
+        let project = home.path().join(".claude/projects/-home-x");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(home.path().join(".local/share/continuum/claude-clinical-sessions")).unwrap();
+        let transcript = project.join(format!("{ID}.jsonl"));
+        let line = serde_json::json!({"type": "user", "timestamp": "2026-10-06T22:00:00.000Z",
+            "message": {"role": "user", "content": "a question about gearboxes"}});
+        fs::write(&transcript, format!("{line}\n")).unwrap();
+        let writer = PlainTextWriter::with_base_dir(home.path().join("out"));
+        (home, transcript, writer)
+    }
+
+    fn payload(transcript: &Path) -> String {
+        serde_json::json!({"session_id": ID, "transcript_path": transcript, "hook_event_name": "Stop",
+            "stop_hook_active": false})
+        .to_string()
+    }
+
+    fn stored(home: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut dirs = vec![home.join("out")];
+        while let Some(d) = dirs.pop() {
+            for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    dirs.push(e.path());
+                } else if e.file_name() == "messages.jsonl" {
+                    found.push(e.path());
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn hook_imports_an_ordinary_claude_session_once() {
+        let (home, transcript, writer) = claude_home();
+        let first = run_hook("claude-code", &payload(&transcript), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(first, HookResult::Imported(ref s) if s.starts_with("saved")), "{first:?}");
+        let again = run_hook("claude-code", &payload(&transcript), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(again, HookResult::Imported(ref s) if s.starts_with("unchanged")), "{again:?}");
+        let files = stored(home.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read_to_string(&files[0]).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn hook_never_imports_a_cc_clinical_launch() {
+        let (home, transcript, writer) = claude_home();
+        let r = run_hook("claude-code", &payload(&transcript), Some(home.path()), true, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Skipped(_)));
+        assert!(stored(home.path()).is_empty(), "nothing may be written for a clinical launch");
+    }
+
+    #[test]
+    fn hook_never_imports_a_registered_clinical_session() {
+        let (home, transcript, writer) = claude_home();
+        fs::write(home.path().join(".local/share/continuum/claude-clinical-sessions").join(ID), "").unwrap();
+        let r = run_hook("claude-code", &payload(&transcript), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Skipped(ref s) if s.contains("protected cc-clinical")), "{r:?}");
+        assert!(stored(home.path()).is_empty());
+    }
+
+    #[test]
+    fn hook_fails_closed_without_the_clinical_registry() {
+        let (home, transcript, writer) = claude_home();
+        fs::remove_dir(home.path().join(".local/share/continuum/claude-clinical-sessions")).unwrap();
+        let r = run_hook("claude-code", &payload(&transcript), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Skipped(ref s) if s.contains("registry is unavailable")), "{r:?}");
+        assert!(stored(home.path()).is_empty());
+    }
+
+    #[test]
+    fn hook_refuses_a_transcript_outside_the_claude_store_or_for_another_session() {
+        let (home, transcript, writer) = claude_home();
+        let elsewhere = home.path().join(format!("{ID}.jsonl"));
+        fs::copy(&transcript, &elsewhere).unwrap();
+        let r = run_hook("claude-code", &payload(&elsewhere), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Skipped(_)), "{r:?}");
+
+        let other = transcript.with_file_name("44444444-4444-4444-8444-444444444444.jsonl");
+        fs::copy(&transcript, &other).unwrap();
+        let r = run_hook("claude-code", &payload(&other), Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Skipped(_)), "a payload naming one session must not import another: {r:?}");
+        assert!(stored(home.path()).is_empty());
+    }
+
+    #[test]
+    fn hook_rejects_malformed_payloads_as_errors() {
+        let (home, _, writer) = claude_home();
+        assert!(run_hook("claude-code", "not json", Some(home.path()), false, None, &writer).is_err());
+        let bad_id = serde_json::json!({"session_id": "../../etc", "transcript_path": null}).to_string();
+        assert!(run_hook("claude-code", &bad_id, Some(home.path()), false, None, &writer).is_err());
+    }
+
+    #[test]
+    fn codex_hook_finds_the_rollout_when_transcript_path_is_null() {
+        let home = tempdir().unwrap();
+        let day = home.path().join(".codex/sessions/2026/10/06");
+        fs::create_dir_all(&day).unwrap();
+        let sid = "019a0000-0000-7000-8000-000000000007";
+        let line = serde_json::json!({"type": "response_item", "timestamp": "2026-10-06T22:30:00.000Z",
+            "payload": {"role": "user", "content": [{"type": "input_text", "text": "list the gear ratios"}]}});
+        fs::write(day.join(format!("rollout-2026-10-06T22-30-00-{sid}.jsonl")), format!("{line}\n")).unwrap();
+        let writer = PlainTextWriter::with_base_dir(home.path().join("out"));
+        let stdin = serde_json::json!({"session_id": sid, "transcript_path": null, "turn_id": "t1"}).to_string();
+        let r = run_hook("codex", &stdin, Some(home.path()), false, None, &writer).unwrap();
+        assert!(matches!(r, HookResult::Imported(ref s) if s.starts_with("saved")), "{r:?}");
+        assert_eq!(stored(home.path()).len(), 1);
     }
 }
