@@ -46,52 +46,65 @@ const TOOL_RESULT_MAX: usize = 500;
 /// `TOOL_USE` lines, and every (role, content) pair kept once, because
 /// context compaction re-serialises earlier messages into the transcript.
 pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Result<Option<ImportOutcome>> {
+    let session_id = file_stem(session_path)?;
+    writer.with_session_lock("claude-code", &session_id, || import_claude_code_locked(writer, session_path, session_id.clone()))
+}
+
+fn import_claude_code_locked(
+    writer: &PlainTextWriter,
+    session_path: &Path,
+    session_id: String,
+) -> Result<Option<ImportOutcome>> {
     #[derive(serde::Deserialize)]
     struct Entry {
         #[serde(rename = "type")]
         entry_type: String,
+        uuid: Option<String>,
         message: Option<serde_json::Value>,
         timestamp: Option<String>,
     }
 
-    let session_id = file_stem(session_path)?;
     let mut messages: Vec<(String, String)> = Vec::new();
-    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
-    let mut keep = |tag: &'static str, role: &str, content: String, messages: &mut Vec<(String, String)>| {
-        if seen.insert((tag, content.clone())) {
-            messages.push((role.to_string(), content));
-        }
-    };
+    // An event written twice keeps its uuid, so uuid identifies a duplicate.
+    // Text alone does not: two separate "yes" replies are two turns. Only an
+    // entry without a uuid falls back to (role, text).
+    let mut seen_events: HashSet<String> = HashSet::new();
+    let mut seen_text: HashSet<(&'static str, String)> = HashSet::new();
     let mut start_time: Option<String> = None;
     let mut skills: Vec<String> = Vec::new();
-    let mut skipped_lines = 0;
 
-    for line in read_lines(session_path)? {
-        let line = line?;
-        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
-            skipped_lines += 1;
-            continue;
-        };
+    let skipped_lines = for_each_record(session_path, |entry: Entry| {
         if start_time.is_none() {
             start_time = entry.timestamp.clone();
         }
         if entry.entry_type != "user" && entry.entry_type != "assistant" {
-            continue;
+            return;
         }
-        let Some(msg) = entry.message else { continue };
+        if let Some(uuid) = &entry.uuid {
+            if !seen_events.insert(uuid.clone()) {
+                return;
+            }
+        }
+        let by_text = entry.uuid.is_none();
+        let mut keep = |tag: &'static str, role: &str, content: String| {
+            if !by_text || seen_text.insert((tag, content.clone())) {
+                messages.push((role.to_string(), content));
+            }
+        };
+        let Some(msg) = entry.message else { return };
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
-                    keep("user", "user", content.to_string(), &mut messages);
+                    keep("user", "user", content.to_string());
                 }
             }
             Some("assistant") => {
-                let Some(blocks) = msg["content"].as_array() else { continue };
+                let Some(blocks) = msg["content"].as_array() else { return };
                 for block in blocks {
                     match block["type"].as_str().unwrap_or("") {
                         "text" => {
                             if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
-                                keep("assistant-text", "assistant", text.to_string(), &mut messages);
+                                keep("assistant-text", "assistant", text.to_string());
                             }
                         }
                         "tool_use" => {
@@ -104,7 +117,7 @@ pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Resu
                                 }
                             }
                             let input = block.get("input").map(|i| i.to_string()).unwrap_or_default();
-                            keep("assistant-tool", "assistant", format!("TOOL_USE: {name} -> {input}"), &mut messages);
+                            keep("assistant-tool", "assistant", format!("TOOL_USE: {name} -> {input}"));
                         }
                         "tool_result" => {
                             let output = match block.get("content") {
@@ -117,8 +130,7 @@ pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Resu
                                 _ => String::new(),
                             };
                             if !output.is_empty() {
-                                let entry = format!("TOOL_RESULT: {}", truncate(&output, TOOL_RESULT_MAX));
-                                keep("user-result", "user", entry, &mut messages);
+                                keep("user-result", "user", format!("TOOL_RESULT: {}", truncate(&output, TOOL_RESULT_MAX)));
                             }
                         }
                         _ => {}
@@ -127,7 +139,7 @@ pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Resu
             }
             _ => {}
         }
-    }
+    })?;
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
     if compressed.is_empty() {
@@ -146,21 +158,23 @@ pub fn import_codex(
     session_path: &Path,
 ) -> Result<Option<(ImportOutcome, Vec<LoopDetection>)>> {
     let session_id = file_stem(session_path)?;
+    writer.with_session_lock("codex", &session_id, || import_codex_locked(writer, session_path, session_id.clone()))
+}
+
+fn import_codex_locked(
+    writer: &PlainTextWriter,
+    session_path: &Path,
+    session_id: String,
+) -> Result<Option<(ImportOutcome, Vec<LoopDetection>)>> {
     let mut messages: Vec<(String, String)> = Vec::new();
     let mut start_time: Option<String> = None;
-    let mut skipped_lines = 0;
 
-    for line in read_lines(session_path)? {
-        let line = line?;
-        let Ok(entry) = serde_json::from_str::<CodexLogEntry>(&line) else {
-            skipped_lines += 1;
-            continue;
-        };
+    let skipped_lines = for_each_record(session_path, |entry: CodexLogEntry| {
         if start_time.is_none() {
             start_time = entry.timestamp.clone();
         }
         if entry.entry_type != "response_item" {
-            continue;
+            return;
         }
         if let Some(payload) = entry.payload {
             if let (Some(role), Some(content)) = (payload.role, payload.content) {
@@ -168,7 +182,7 @@ pub fn import_codex(
                 messages.push((role, text));
             }
         }
-    }
+    })?;
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
     if compressed.is_empty() {
@@ -210,11 +224,17 @@ pub fn ensure_claude_session_importable(session_path: &Path, registry: &Path) ->
     let session_id = session_path
         .file_stem()
         .and_then(|value| value.to_str())
+        .filter(|id| session_id_is_safe(id))
         .ok_or_else(|| eyre!("Refusing Claude Code import: invalid session path"))?;
-    if registry.join(session_id).is_file() {
-        return Err(eyre!("Refusing to import protected cc-clinical session {session_id}"));
+    // Only a confirmed absence of the marker allows the import. Any marker,
+    // of any type, refuses it, and so does any error checking for one.
+    match std::fs::symlink_metadata(registry.join(session_id)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(eyre!("Refusing to import protected cc-clinical session {session_id}")),
+        Err(e) => Err(eyre!(
+            "Refusing Claude Code import: cannot check the clinical-session registry for {session_id}: {e}"
+        )),
     }
-    Ok(())
 }
 
 /// A session id that is safe to use as one path component.
@@ -255,9 +275,28 @@ fn file_stem(path: &Path) -> Result<String> {
         .ok_or_else(|| eyre!("Not a session file: {}", path.display()))
 }
 
-fn read_lines(path: &Path) -> Result<std::io::Lines<BufReader<std::fs::File>>> {
+/// Feed each JSONL record of `path` to `f`; returns how many lines were
+/// skipped. An unparseable line is tolerated only as the last line, where it
+/// is a record still being written. Anywhere else the import is abandoned
+/// before anything is written, so a damaged transcript can never replace a
+/// good stored copy with a shorter one.
+fn for_each_record<T: serde::de::DeserializeOwned>(path: &Path, mut f: impl FnMut(T)) -> Result<usize> {
     let file = std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    Ok(BufReader::new(file).lines())
+    let mut bad: Option<(usize, serde_json::Error)> = None;
+    for (n, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((at, e)) = bad.take() {
+            return Err(eyre!("{} line {}: {e}; not importing a damaged transcript", path.display(), at + 1));
+        }
+        match serde_json::from_str::<T>(&line) {
+            Ok(record) => f(record),
+            Err(e) => bad = Some((n, e)),
+        }
+    }
+    Ok(usize::from(bad.is_some()))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -360,15 +399,57 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp files left behind");
     }
 
+    fn with_uuid(line: &str, uuid: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        v["uuid"] = serde_json::json!(uuid);
+        v.to_string()
+    }
+
     #[test]
-    fn compaction_reserialised_messages_are_kept_once() {
+    fn duplicates_are_judged_by_event_uuid_not_by_text() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let q = claude_line("user", serde_json::json!({"role": "user", "content": "repeatable question about widgets"}));
-        let path = write_transcript(src.path(), "0b9c6b0e-0000-4000-8000-000000000002.jsonl", &[q.clone(), q.clone(), q]);
+        let path = write_transcript(
+            src.path(),
+            "0b9c6b0e-0000-4000-8000-000000000002.jsonl",
+            &[
+                with_uuid(&q, "u-1"),
+                with_uuid(&q, "u-2"), // the same words sent again: a second turn
+                with_uuid(&q, "u-1"), // the same event written twice: one turn
+            ],
+        );
+        let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
+        assert_eq!(outcome.message_count, 2);
+    }
+
+    #[test]
+    fn entries_without_a_uuid_fall_back_to_text_dedup() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let q = claude_line("user", serde_json::json!({"role": "user", "content": "repeatable question about widgets"}));
+        let path = write_transcript(src.path(), "0b9c6b0e-0000-4000-8000-000000000008.jsonl", &[q.clone(), q.clone(), q]);
         let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
         assert_eq!(outcome.message_count, 1);
+    }
+
+    #[test]
+    fn a_damaged_interior_line_aborts_and_leaves_the_stored_copy_alone() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        let path = transcript(src.path());
+        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+        let before = stored(&first);
+
+        let good = claude_line("user", serde_json::json!({"role": "user", "content": "later question about gears"}));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{{not json\n{text}{good}\n")).unwrap();
+
+        assert!(import_claude_code(&writer, &path).is_err(), "interior damage must abort the import");
+        assert_eq!(stored(&first), before, "the stored copy must be untouched");
     }
 
     #[test]
@@ -392,6 +473,23 @@ mod tests {
         assert!(ensure_claude_session_importable(&session, &registry).is_ok(), "unmarked session imports");
         std::fs::write(registry.join("0b9c6b0e-0000-4000-8000-000000000003"), "").unwrap();
         assert!(ensure_claude_session_importable(&session, &registry).is_err(), "marked session is refused");
+
+        let other = home.path().join("0b9c6b0e-0000-4000-8000-000000000009.jsonl");
+        std::fs::create_dir(registry.join("0b9c6b0e-0000-4000-8000-000000000009")).unwrap();
+        assert!(ensure_claude_session_importable(&other, &registry).is_err(), "a marker of any type refuses");
+    }
+
+    #[test]
+    fn an_unreadable_registry_refuses_rather_than_assuming_no_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let registry = home.path().join("registry");
+        std::fs::create_dir(&registry).unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let session = home.path().join("0b9c6b0e-0000-4000-8000-00000000000a.jsonl");
+        let result = ensure_claude_session_importable(&session, &registry);
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "a marker that cannot be checked must refuse the import");
     }
 
     #[test]

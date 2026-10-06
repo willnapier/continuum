@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 /// Plain-text session writer
 pub struct PlainTextWriter {
     base_dir: PathBuf,
+    /// Where per-session import locks live: outside the Syncthing-synced
+    /// tree for the default writer, inside a custom base dir otherwise.
+    lock_dir: PathBuf,
 }
 
 /// Root under which Continuum keeps its trees (`continuum-logs/`,
@@ -31,12 +34,38 @@ impl PlainTextWriter {
     /// (`$CONTINUUM_HOME/continuum-logs`, i.e. `~/Assistants/continuum-logs`)
     pub fn new() -> Result<Self> {
         let base_dir = continuum_home()?.join("continuum-logs");
-        Ok(PlainTextWriter { base_dir })
+        let home = std::env::var("HOME").context("HOME not set")?;
+        let lock_dir = PathBuf::from(home).join(".local/state/continuum/import-locks");
+        Ok(PlainTextWriter { base_dir, lock_dir })
     }
 
     /// Create a new writer with custom base directory
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
-        PlainTextWriter { base_dir }
+        let lock_dir = base_dir.join(".import-locks");
+        PlainTextWriter { base_dir, lock_dir }
+    }
+
+    /// Run `f` holding an exclusive lock for one session, so the read, parse
+    /// and write of an import never interleave with another import of the
+    /// same session on this machine (Stop hook, 5-minute sync, wrapper at
+    /// exit). Without it an import that read an older snapshot could
+    /// overwrite a newer one. A session is only imported on the machine whose
+    /// agent wrote it, so a local lock suffices; Syncthing only copies the
+    /// result. The kernel releases the lock if the process dies.
+    pub fn with_session_lock<R>(&self, assistant: &str, session_id: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        fs::create_dir_all(&self.lock_dir)
+            .with_context(|| format!("Failed to create {}", self.lock_dir.display()))?;
+        let path = self.lock_dir.join(format!("{assistant}-{session_id}.lock"));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        file.lock().with_context(|| format!("Failed to lock {}", path.display()))?;
+        let result = f();
+        let _ = file.unlock();
+        result
     }
 
     /// Get the directory path for a session

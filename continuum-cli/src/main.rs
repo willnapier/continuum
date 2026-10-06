@@ -14,7 +14,18 @@ use continuum_core::{LogAdapter, LoopSeverity, MessageCompressor, PlainTextWrite
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = Cli::parse();
+    // A Stop hook that exits 2 tells Claude Code and Codex to continue the
+    // turn, and clap exits 2 on any usage error (and prints help on stdout).
+    // In hook mode, report a parse failure on stderr and exit 1 instead.
+    let hook_mode = std::env::args().any(|a| a == "--hook");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if hook_mode => {
+            eprintln!("continuum hook: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => e.exit(),
+    };
     match &cli.command {
         Command::Import(cmd) => handle_import(cmd)?,
         Command::Stats => handle_stats()?,
