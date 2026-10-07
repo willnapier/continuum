@@ -28,16 +28,37 @@ pub struct ImportOutcome {
     pub skipped_lines: usize,
 }
 
+/// What an import stored, or why it stored nothing.
+#[derive(Debug)]
+pub enum Imported<T> {
+    Stored(T),
+    /// The transcript holds no messages yet.
+    Empty,
+    /// The session is in the no-save registry.
+    NoSave,
+}
+
+impl<T> Imported<T> {
+    pub fn stored(self) -> Option<T> {
+        match self {
+            Imported::Stored(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 /// Set to `1` by the continuum-claude / continuum-codex wrappers on the agent
 /// process when `~/.continuum-nosave` was present at launch. The agent's
-/// Stop hooks inherit it, so `continuum import --hook` skips that session.
+/// SessionStart and Stop hooks inherit it and put the session in the no-save
+/// registry (`register_nosave`), which every importer consults. The env alone
+/// is not enough: the 5-minute Claude sync and the Codex timer never see it.
 pub const NOSAVE_ENV: &str = "CONTINUUM_NOSAVE";
 
 /// Longest tool result kept, in bytes (cut back to a character boundary).
 const TOOL_RESULT_MAX: usize = 500;
 
 /// Import one Claude Code transcript (`~/.claude/projects/<dir>/<uuid>.jsonl`).
-/// `Ok(None)` when it holds no messages yet.
+/// A session in the no-save registry is never read.
 ///
 /// The caller must decide first whether the session may be imported at all:
 /// see `ensure_claude_session_importable`. Content rules are the ones the
@@ -45,8 +66,11 @@ const TOOL_RESULT_MAX: usize = 500;
 /// the copy that has survived for most sessions: user text, assistant text and
 /// `TOOL_USE` lines. An event that appears twice (same uuid) is kept once;
 /// identical text in separate events is kept each time.
-pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Result<Option<ImportOutcome>> {
+pub fn import_claude_code(writer: &PlainTextWriter, session_path: &Path) -> Result<Imported<ImportOutcome>> {
     let session_id = file_stem(session_path)?;
+    if nosave_marked(writer, &[&session_id])? {
+        return Ok(Imported::NoSave);
+    }
     writer.with_session_lock("claude-code", &session_id, || import_claude_code_locked(writer, session_path, session_id.clone()))
 }
 
@@ -54,7 +78,7 @@ fn import_claude_code_locked(
     writer: &PlainTextWriter,
     session_path: &Path,
     session_id: String,
-) -> Result<Option<ImportOutcome>> {
+) -> Result<Imported<ImportOutcome>> {
     #[derive(serde::Deserialize)]
     struct Entry {
         #[serde(rename = "type")]
@@ -137,21 +161,29 @@ fn import_claude_code_locked(
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
     if compressed.is_empty() {
-        return Ok(None);
+        return Ok(Imported::Empty);
     }
     let start_time = start_time.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    // Again under the lock: the session may have been registered while it was read.
+    if nosave_marked(writer, &[&session_id])? {
+        return Ok(Imported::NoSave);
+    }
     let (dir, written) = writer.replace_session(&session_id, "claude-code", Some(&start_time), &skills, &compressed)?;
-    Ok(Some(ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines }))
+    Ok(Imported::Stored(ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines }))
 }
 
 /// Import one Codex rollout (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`),
 /// filed under the session's own start date. Also returns the loop
-/// detections, for a caller that wants to show them.
+/// detections, for a caller that wants to show them. A session in the
+/// no-save registry, under its thread id, is never read.
 pub fn import_codex(
     writer: &PlainTextWriter,
     session_path: &Path,
-) -> Result<Option<(ImportOutcome, Vec<LoopDetection>)>> {
+) -> Result<Imported<(ImportOutcome, Vec<LoopDetection>)>> {
     let session_id = file_stem(session_path)?;
+    if nosave_marked(writer, &codex_ids(&session_id))? {
+        return Ok(Imported::NoSave);
+    }
     writer.with_session_lock("codex", &session_id, || import_codex_locked(writer, session_path, session_id.clone()))
 }
 
@@ -159,7 +191,7 @@ fn import_codex_locked(
     writer: &PlainTextWriter,
     session_path: &Path,
     session_id: String,
-) -> Result<Option<(ImportOutcome, Vec<LoopDetection>)>> {
+) -> Result<Imported<(ImportOutcome, Vec<LoopDetection>)>> {
     let mut messages: Vec<(String, String)> = Vec::new();
     let mut start_time: Option<String> = None;
 
@@ -180,7 +212,7 @@ fn import_codex_locked(
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
     if compressed.is_empty() {
-        return Ok(None);
+        return Ok(Imported::Empty);
     }
     // The session's own start, never the import time: stamping with `now`
     // filed one session under a new date on every re-import (2026-09-02).
@@ -193,9 +225,96 @@ fn import_codex_locked(
         })
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     let detections = LoopDetector::new().analyze(&messages);
+    // Again under the lock: the session may have been registered while it was read.
+    if nosave_marked(writer, &codex_ids(&session_id))? {
+        return Ok(Imported::NoSave);
+    }
     let (dir, written) = writer.replace_session(&session_id, "codex", Some(&start_time), &[], &compressed)?;
     let outcome = ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines };
-    Ok(Some((outcome, detections)))
+    Ok(Imported::Stored((outcome, detections)))
+}
+
+/// Put `session_id` in the no-save registry: one empty marker file per
+/// session that no importer may store. The wrappers can't know the id of the
+/// session they launch, so the agent's SessionStart and Stop hooks call this
+/// (through `continuum import --hook`) when they carry `NOSAVE_ENV`.
+/// Registering an id twice is harmless.
+pub fn register_nosave(writer: &PlainTextWriter, session_id: &str) -> Result<PathBuf> {
+    if !session_id_is_safe(session_id) {
+        return Err(eyre!("not registering an unusable session id as no-save"));
+    }
+    let dir = writer
+        .nosave_dir()
+        .ok_or_else(|| eyre!("HOME is unavailable, so the no-save registry cannot be found"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let marker = dir.join(session_id);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        options.mode(0o600);
+    }
+    options.open(&marker).with_context(|| format!("Failed to register no-save session at {}", marker.display()))?;
+    Ok(marker)
+}
+
+/// Make a session no-save after the fact: register it, then delete every
+/// stored copy (`<base>/<assistant>/<date>/<id>/`) under its import lock, so
+/// an import already running sees the marker instead of writing. The
+/// wrappers call this when a no-save launch exits (a copy may have been
+/// stored before a hook registered it, if the hook failed or Codex had not
+/// trusted it yet) and when the user discards a conversation. Returns how
+/// many copies were removed.
+pub fn discard_session(writer: &PlainTextWriter, assistant: &str, session_id: &str) -> Result<usize> {
+    register_nosave(writer, session_id)?;
+    writer.with_session_lock(assistant, session_id, || {
+        let Ok(days) = std::fs::read_dir(writer.base_dir().join(assistant)) else { return Ok(0) };
+        let mut removed = 0;
+        for day in days.flatten() {
+            let copy = day.path().join(session_id);
+            if copy.is_dir() {
+                std::fs::remove_dir_all(&copy).with_context(|| format!("Failed to remove {}", copy.display()))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    })
+}
+
+/// Whether any of `ids` is in the no-save registry. Only a confirmed absence
+/// counts as "not marked": an error checking for a marker is an error, so a
+/// scheduled import fails visibly rather than storing the session, and so is
+/// having no registry to consult (HOME unknown).
+fn nosave_marked(writer: &PlainTextWriter, ids: &[&str]) -> Result<bool> {
+    let dir = writer
+        .nosave_dir()
+        .ok_or_else(|| eyre!("Refusing import: HOME is unavailable, so the no-save registry cannot be checked"))?;
+    for id in ids.iter().filter(|id| session_id_is_safe(id)) {
+        match std::fs::symlink_metadata(dir.join(id)) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(eyre!("cannot check the no-save registry for {id}: {e}")),
+        }
+    }
+    Ok(false)
+}
+
+/// The ids a Codex session may be registered under: its rollout stem (the
+/// wrappers) and its thread id (the hooks).
+fn codex_ids(stem: &str) -> Vec<&str> {
+    std::iter::once(stem).chain(codex_thread_id(stem)).collect()
+}
+
+/// The thread id that ends a Codex rollout's file stem
+/// (`rollout-<timestamp>-<uuid>`): the id Codex hooks report.
+fn codex_thread_id(stem: &str) -> Option<&str> {
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    let shaped = id
+        .char_indices()
+        .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
+    shaped.then_some(id)
 }
 
 /// The cc-clinical session registry: one marker file per clinical session id.
@@ -350,11 +469,11 @@ mod tests {
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let path = transcript(src.path());
 
-        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+        let first = import_claude_code(&writer, &path).unwrap().stored().unwrap();
         assert!(first.written);
         let lines = stored(&first);
         for _ in 0..3 {
-            let again = import_claude_code(&writer, &path).unwrap().unwrap();
+            let again = import_claude_code(&writer, &path).unwrap().stored().unwrap();
             assert!(!again.written, "unchanged session must not be rewritten");
             assert_eq!(stored(&again), lines, "re-import must leave exactly one copy");
         }
@@ -370,7 +489,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let path = transcript(src.path());
-        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+        let first = import_claude_code(&writer, &path).unwrap().stored().unwrap();
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "{}", claude_line("user", serde_json::json!({"role": "user", "content": "second question about gears"}))).unwrap();
@@ -378,7 +497,7 @@ mod tests {
         write!(f, "{{\"type\":\"assistant\",\"mess").unwrap();
         drop(f);
 
-        let second = import_claude_code(&writer, &path).unwrap().unwrap();
+        let second = import_claude_code(&writer, &path).unwrap().stored().unwrap();
         assert!(second.written);
         assert_eq!(second.skipped_lines, 1);
         assert_eq!(second.message_count, first.message_count + 1);
@@ -414,7 +533,7 @@ mod tests {
                 with_uuid(&q, "u-1"), // the same event written twice: one turn
             ],
         );
-        let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
+        let outcome = import_claude_code(&writer, &path).unwrap().stored().unwrap();
         assert_eq!(outcome.message_count, 2);
     }
 
@@ -425,7 +544,7 @@ mod tests {
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let q = claude_line("user", serde_json::json!({"role": "user", "content": "repeatable question about widgets"}));
         let path = write_transcript(src.path(), "0b9c6b0e-0000-4000-8000-000000000008.jsonl", &[q.clone(), q.clone(), q]);
-        let outcome = import_claude_code(&writer, &path).unwrap().unwrap();
+        let outcome = import_claude_code(&writer, &path).unwrap().stored().unwrap();
         assert_eq!(outcome.message_count, 3, "identical text in separate events is not a duplicate");
     }
 
@@ -435,7 +554,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
         let path = transcript(src.path());
-        let first = import_claude_code(&writer, &path).unwrap().unwrap();
+        let first = import_claude_code(&writer, &path).unwrap().stored().unwrap();
         let before = stored(&first);
 
         let good = claude_line("user", serde_json::json!({"role": "user", "content": "later question about gears"}));
@@ -501,12 +620,104 @@ mod tests {
             "rollout-2026-09-29T08-00-00-019a0000-0000-7000-8000-000000000004.jsonl",
             &[line("user", "plan the journey to the coast"), line("assistant", "here is a plan for the coast")],
         );
-        let (first, _) = import_codex(&writer, &path).unwrap().unwrap();
+        let (first, _) = import_codex(&writer, &path).unwrap().stored().unwrap();
         assert!(first.written);
         assert!(first.dir.to_string_lossy().contains("/codex/2026-09-29/"), "filed under its own start date");
-        let (again, _) = import_codex(&writer, &path).unwrap().unwrap();
+        let (again, _) = import_codex(&writer, &path).unwrap().stored().unwrap();
         assert!(!again.written);
         assert_eq!(stored(&again).len(), first.message_count);
+    }
+
+    #[test]
+    fn a_registered_nosave_claude_session_is_never_stored() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().join("logs")).with_nosave_dir(out.path().join("nosave"));
+        let path = transcript(src.path());
+        let marker = register_nosave(&writer, "0b9c6b0e-0000-4000-8000-000000000001").unwrap();
+        register_nosave(&writer, "0b9c6b0e-0000-4000-8000-000000000001").unwrap(); // twice is fine
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(out.path().join("nosave")).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert!(matches!(import_claude_code(&writer, &path).unwrap(), Imported::NoSave));
+        assert!(!out.path().join("logs").exists(), "nothing written for a no-save session");
+
+        std::fs::remove_file(&marker).unwrap();
+        assert!(matches!(import_claude_code(&writer, &path).unwrap(), Imported::Stored(_)), "known green: unmarked imports");
+    }
+
+    #[test]
+    fn a_nosave_codex_session_is_found_by_its_thread_id() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().join("logs")).with_nosave_dir(out.path().join("nosave"));
+        let thread = "019a0000-0000-7000-8000-00000000000b";
+        let line = serde_json::json!({"type": "response_item", "timestamp": "2026-10-07T08:00:00.000Z",
+            "payload": {"role": "user", "content": [{"type": "input_text", "text": "a private question"}]}});
+        let path = write_transcript(src.path(), &format!("rollout-2026-10-07T08-00-00-{thread}.jsonl"), &[line.to_string()]);
+        register_nosave(&writer, thread).unwrap();
+        assert!(matches!(import_codex(&writer, &path).unwrap(), Imported::NoSave));
+        assert!(!out.path().join("logs").exists());
+    }
+
+    #[test]
+    fn an_unreadable_nosave_registry_is_an_error_not_a_silent_import() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let registry = out.path().join("nosave");
+        std::fs::create_dir(&registry).unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().join("logs")).with_nosave_dir(registry.clone());
+        let path = transcript(src.path());
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = import_claude_code(&writer, &path);
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert!(!out.path().join("logs").exists());
+    }
+
+    #[test]
+    fn discard_registers_and_removes_every_stored_copy() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let writer = PlainTextWriter::with_base_dir(out.path().join("logs")).with_nosave_dir(out.path().join("nosave"));
+        let path = transcript(src.path());
+        let id = "0b9c6b0e-0000-4000-8000-000000000001";
+        let stored_copy = import_claude_code(&writer, &path).unwrap().stored().unwrap().dir;
+        let stray = out.path().join("logs/claude-code/2026-01-01").join(id);
+        std::fs::create_dir_all(&stray).unwrap();
+        let unrelated = out.path().join("logs/claude-code/2026-01-01/0b9c6b0e-0000-4000-8000-0000000000ff");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        assert_eq!(discard_session(&writer, "claude-code", id).unwrap(), 2);
+        assert!(!stored_copy.exists() && !stray.exists());
+        assert!(unrelated.exists(), "other sessions are untouched");
+        assert!(matches!(import_claude_code(&writer, &path).unwrap(), Imported::NoSave), "and it stays out");
+    }
+
+    #[test]
+    fn with_no_registry_to_consult_the_import_refuses() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut writer = PlainTextWriter::with_base_dir(out.path().join("logs"));
+        writer.clear_nosave_dir_for_test();
+        assert!(import_claude_code(&writer, &transcript(src.path())).is_err());
+        assert!(!out.path().join("logs").exists());
+    }
+
+    #[test]
+    fn codex_thread_ids_come_from_the_end_of_the_rollout_stem() {
+        assert_eq!(
+            codex_thread_id("rollout-2026-10-07T08-00-00-019a0000-0000-7000-8000-00000000000b"),
+            Some("019a0000-0000-7000-8000-00000000000b")
+        );
+        assert_eq!(codex_thread_id("rollout-2026-10-07T08-00-00"), None);
+        assert_eq!(codex_thread_id("short"), None);
+        assert_eq!(codex_thread_id("é".repeat(20).as_str()), None);
+        assert!(register_nosave(&PlainTextWriter::with_base_dir("/nonexistent".into()), "../etc").is_err());
     }
 
     #[test]

@@ -412,8 +412,20 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     );
 
     if skip_saving {
-        // Ephemeral mode: delete the session this wrapper actually ran
+        // Ephemeral mode: delete the session this wrapper actually ran.
+        // First register it as no-save and remove any copy the 5-minute sync
+        // stored before the SessionStart hook registered it (a backstop for
+        // a hook that failed); the hook normally makes this a no-op.
         if let Some(session_path) = after_session {
+            if let Some(id) = session_path.file_stem().and_then(|s| s.to_str()) {
+                let discarded = PlainTextWriter::new()
+                    .and_then(|w| continuum_core::import::discard_session(&w, "claude-code", id));
+                match discarded {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("✗ Removed {n} stored copy(ies) of this no-save session"),
+                    Err(e) => eprintln!("⚠ Warning: could not mark the session no-save: {e}"),
+                }
+            }
             if let Err(e) = std::fs::remove_file(&session_path) {
                 eprintln!("⚠ Warning: Failed to delete session file: {}", e);
             } else {
@@ -704,11 +716,15 @@ fn find_latest_session_file(projects_dir: &std::path::Path) -> Option<std::path:
 fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
     let writer = PlainTextWriter::new()?;
     match continuum_core::import::import_claude_code(&writer, session_path)? {
-        Some(outcome) => {
+        continuum_core::import::Imported::Stored(outcome) => {
             eprintln!("✓ Saved {} messages to continuum logs", outcome.message_count);
             Ok(())
         }
-        None => Err(color_eyre::eyre::eyre!("No messages to import")),
+        continuum_core::import::Imported::Empty => Err(color_eyre::eyre::eyre!("No messages to import")),
+        continuum_core::import::Imported::NoSave => {
+            eprintln!("This session is marked no-save; not saved to continuum logs");
+            Ok(())
+        }
     }
 }
 

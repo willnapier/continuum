@@ -13,6 +13,17 @@ pub struct PlainTextWriter {
     /// Where per-session import locks live: outside the Syncthing-synced
     /// tree for the default writer, inside a custom base dir otherwise.
     lock_dir: PathBuf,
+    /// The machine's no-save registry (`import::register_nosave`), whatever
+    /// the base dir; None when HOME is unknown.
+    nosave_dir: Option<PathBuf>,
+}
+
+/// `$HOME/.local/share/continuum/nosave-sessions`, beside the cc-clinical
+/// registry.
+fn default_nosave_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/share/continuum/nosave-sessions"))
 }
 
 /// Root under which Continuum keeps its trees (`continuum-logs/`,
@@ -40,13 +51,29 @@ impl PlainTextWriter {
             Some(home) => PathBuf::from(home).join(".local/state/continuum/import-locks"),
             None => base_dir.join(".import-locks"),
         };
-        Ok(PlainTextWriter { base_dir, lock_dir })
+        Ok(PlainTextWriter { base_dir, lock_dir, nosave_dir: default_nosave_dir() })
     }
 
     /// Create a new writer with custom base directory
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         let lock_dir = base_dir.join(".import-locks");
-        PlainTextWriter { base_dir, lock_dir }
+        PlainTextWriter { base_dir, lock_dir, nosave_dir: default_nosave_dir() }
+    }
+
+    /// Use `dir` as the no-save registry instead of the one under HOME.
+    pub fn with_nosave_dir(mut self, dir: PathBuf) -> Self {
+        self.nosave_dir = Some(dir);
+        self
+    }
+
+    pub fn nosave_dir(&self) -> Option<&Path> {
+        self.nosave_dir.as_deref()
+    }
+
+    /// As if HOME were unknown.
+    #[cfg(test)]
+    pub(crate) fn clear_nosave_dir_for_test(&mut self) {
+        self.nosave_dir = None;
     }
 
     /// Run `f` holding an exclusive lock for one session, so the read, parse

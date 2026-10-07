@@ -69,13 +69,25 @@ fn main() -> Result<()> {
 
     // Import the session if it's different from before (and we're not skipping)
     let mut session_dir: Option<std::path::PathBuf> = None;
-    if !skip_saving {
+    if skip_saving {
+        // The hooks register a no-save session as it runs. This backstop
+        // covers a hook that failed or is not trusted yet: it registers the
+        // session, so the Codex timer never stores it later, and deletes any
+        // copy stored before then.
+        if let Some(session_path) = after_session.filter(|p| before_session.as_ref() != Some(p)) {
+            match discard(&session_path) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("✗ Removed {n} stored copy(ies) of this no-save session"),
+                Err(e) => eprintln!("⚠ Warning: could not mark the session no-save: {e}"),
+            }
+        }
+    } else {
         if let Some(session_path) = after_session {
             if before_session.as_ref() != Some(&session_path) {
                 eprintln!("\n📝 Importing session to continuum logs...");
                 match import_session_to_continuum(&session_path) {
                     Ok(dir) => {
-                        session_dir = Some(dir);
+                        session_dir = dir;
                     }
                     Err(e) => {
                         eprintln!("⚠ Warning: Failed to import session: {}", e);
@@ -88,8 +100,12 @@ fn main() -> Result<()> {
     // Post-conversation review prompt (if session was saved)
     if let Some(ref dir) = session_dir {
         if !prompt_save_conversation()? {
-            // User chose to discard - delete the session directory
-            let _ = std::fs::remove_dir_all(dir);
+            // User chose to discard. Register it as no-save too, so neither
+            // the timer nor a Stop hook stores it again.
+            if let Err(e) = discard(dir) {
+                eprintln!("⚠ Warning: could not mark the session no-save: {e}");
+                let _ = std::fs::remove_dir_all(dir);
+            }
             eprintln!("✗ Conversation discarded");
         } else {
             eprintln!("✓ Conversation saved");
@@ -162,12 +178,19 @@ fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path:
 /// Import the wrapped session into Continuum with the shared importer
 /// (`continuum_core::import`), which files it under the session's own start
 /// date and replaces rather than appends, like the timer and the Stop hook.
-fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::path::PathBuf> {
+/// `Ok(None)` for a session in the no-save registry.
+fn import_session_to_continuum(session_path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    use continuum_core::import::Imported;
     use continuum_core::{LoopSeverity, PlainTextWriter};
 
     let writer = PlainTextWriter::new()?;
-    let Some((outcome, detections)) = continuum_core::import::import_codex(&writer, session_path)? else {
-        return Err(color_eyre::eyre::eyre!("No messages to import"));
+    let (outcome, detections) = match continuum_core::import::import_codex(&writer, session_path)? {
+        Imported::Stored(found) => found,
+        Imported::Empty => return Err(color_eyre::eyre::eyre!("No messages to import")),
+        Imported::NoSave => {
+            eprintln!("This session is marked no-save; not saved to continuum logs");
+            return Ok(None);
+        }
     };
 
     if !detections.is_empty() {
@@ -185,7 +208,18 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<std::pa
     }
 
     eprintln!("✓ Saved {} messages to continuum logs", outcome.message_count);
-    Ok(outcome.dir)
+    Ok(Some(outcome.dir))
+}
+
+/// `continuum_core::import::discard_session` for a Codex session. `path` is
+/// its rollout file or its Continuum record directory; both are named by the
+/// rollout stem, which the importer checks alongside the thread id.
+fn discard(path: &std::path::Path) -> Result<usize> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("no session id in {}", path.display()))?;
+    continuum_core::import::discard_session(&continuum_core::PlainTextWriter::new()?, "codex", stem)
 }
 
 /// Prompt user whether to save the conversation
