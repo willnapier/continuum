@@ -413,13 +413,20 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
 
     if skip_saving {
         // Ephemeral mode: delete the session this wrapper actually ran.
-        // First register it as no-save and remove any copy the 5-minute sync
-        // stored before the SessionStart hook registered it (a backstop for
-        // a hook that failed); the hook normally makes this a no-op.
+        // First register it as no-save. For a session started here, also
+        // remove any copy the 5-minute sync stored before the SessionStart
+        // hook registered it (a backstop for a hook that failed). A resumed
+        // session's earlier record was saved deliberately, so it stays.
         if let Some(session_path) = after_session {
             if let Some(id) = session_path.file_stem().and_then(|s| s.to_str()) {
-                let discarded = PlainTextWriter::new()
-                    .and_then(|w| continuum_core::import::discard_session(&w, "claude-code", id));
+                let resumed = resume_id.is_some() || is_continue;
+                let discarded = PlainTextWriter::new().and_then(|w| {
+                    if resumed {
+                        continuum_core::import::register_nosave(&w, id).map(|_| 0)
+                    } else {
+                        continuum_core::import::discard_session(&w, "claude-code", id)
+                    }
+                });
                 match discarded {
                     Ok(0) => {}
                     Ok(n) => eprintln!("✗ Removed {n} stored copy(ies) of this no-save session"),

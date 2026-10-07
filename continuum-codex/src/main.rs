@@ -72,10 +72,13 @@ fn main() -> Result<()> {
     if skip_saving {
         // The hooks register a no-save session as it runs. This backstop
         // covers a hook that failed or is not trusted yet: it registers the
-        // session, so the Codex timer never stores it later, and deletes any
-        // copy stored before then.
+        // session, so the Codex timer never stores it later, and for a
+        // session started here deletes any copy stored before then. A resumed
+        // or forked session's earlier record was saved deliberately.
+        let resumed = args.iter().any(|a| a == "resume" || a == "fork");
         if let Some(session_path) = after_session.filter(|p| before_session.as_ref() != Some(p)) {
-            match discard(&session_path) {
+            let result = if resumed { register_only(&session_path) } else { discard(&session_path) };
+            match result {
                 Ok(0) => {}
                 Ok(n) => eprintln!("✗ Removed {n} stored copy(ies) of this no-save session"),
                 Err(e) => eprintln!("⚠ Warning: could not mark the session no-save: {e}"),
@@ -215,11 +218,19 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<Option<
 /// its rollout file or its Continuum record directory; both are named by the
 /// rollout stem, which the importer checks alongside the thread id.
 fn discard(path: &std::path::Path) -> Result<usize> {
-    let stem = path
-        .file_stem()
+    continuum_core::import::discard_session(&continuum_core::PlainTextWriter::new()?, "codex", rollout_stem(path)?)
+}
+
+/// Register a Codex session as no-save without touching stored copies.
+fn register_only(path: &std::path::Path) -> Result<usize> {
+    continuum_core::import::register_nosave(&continuum_core::PlainTextWriter::new()?, rollout_stem(path)?)?;
+    Ok(0)
+}
+
+fn rollout_stem(path: &std::path::Path) -> Result<&str> {
+    path.file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| color_eyre::eyre::eyre!("no session id in {}", path.display()))?;
-    continuum_core::import::discard_session(&continuum_core::PlainTextWriter::new()?, "codex", stem)
+        .ok_or_else(|| color_eyre::eyre::eyre!("no session id in {}", path.display()))
 }
 
 /// Prompt user whether to save the conversation
