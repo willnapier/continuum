@@ -287,7 +287,7 @@ pub fn discard_session(writer: &PlainTextWriter, assistant: &str, session_id: &s
 /// counts as "not marked": an error checking for a marker is an error, so a
 /// scheduled import fails visibly rather than storing the session, and so is
 /// having no registry to consult (HOME unknown).
-fn nosave_marked(writer: &PlainTextWriter, ids: &[&str]) -> Result<bool> {
+pub fn nosave_marked(writer: &PlainTextWriter, ids: &[&str]) -> Result<bool> {
     let dir = writer
         .nosave_dir()
         .ok_or_else(|| eyre!("Refusing import: HOME is unavailable, so the no-save registry cannot be checked"))?;

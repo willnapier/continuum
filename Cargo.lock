@@ -343,6 +343,7 @@ dependencies = [
  "continuum-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,7 +25,11 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use continuum_core::adapters::grok_cli::is_smoke_cwd;
+use continuum_core::import::{self, Imported};
 use continuum_core::{MessageCompressor, PlainTextWriter};
+
+#[cfg(test)]
+mod tests;
 
 const SOURCE: &str = "grok-cli";
 const TOOL_RESULT_TRUNCATE: usize = 500;
@@ -40,18 +44,17 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let target = if args.iter().any(|a| a == "--all") {
-        Target::All
-    } else if let Some(id) = args.iter().find(|a| !a.starts_with("--")) {
-        Target::Id(id.clone())
-    } else if args.iter().any(|a| a == "--latest") {
-        Target::Latest
-    } else if let Ok(id) = std::env::var("GROK_SESSION_ID") {
-        if id.is_empty() { Target::Latest } else { Target::Id(id) }
-    } else {
-        Target::Latest
-    };
-
+    let hook_id = std::env::var("GROK_SESSION_ID").ok();
+    let nosave = std::env::var_os(import::NOSAVE_ENV).is_some_and(|v| v == "1");
+    let target = select_target(&args, hook_id.as_deref(), nosave)?;
+    let writer = PlainTextWriter::new()?;
+    // Register before locating/reading the native transcript: a late-created
+    // transcript must still be excluded by a later scheduled import.
+    if let Target::Id(id) = &target {
+        if nosave {
+            import::register_nosave(&writer, id)?;
+        }
+    }
     let root = grok_sessions_root()?;
     let targets: Vec<PathBuf> = match target {
         Target::All => all_chat_histories(&root),
@@ -60,21 +63,81 @@ fn main() -> Result<()> {
     };
 
     if targets.is_empty() {
-        eprintln!("continuum-grok: no matching Grok session under {}", root.display());
+        eprintln!(
+            "continuum-grok: no matching Grok session under {}",
+            root.display()
+        );
         return Ok(());
     }
+    import_targets(&writer, &targets)
+}
 
+fn select_target(args: &[String], hook_id: Option<&str>, nosave: bool) -> Result<Target> {
+    let target = if args.iter().any(|a| a == "--all") {
+        Target::All
+    } else if let Some(id) = args.iter().find(|a| !a.starts_with("--")) {
+        Target::Id(id.clone())
+    } else if args.iter().any(|a| a == "--latest") {
+        Target::Latest
+    } else if let Some(id) = hook_id {
+        if id.is_empty() {
+            Target::Latest
+        } else {
+            Target::Id(id.to_owned())
+        }
+    } else {
+        Target::Latest
+    };
+
+    validate_target(&target, nosave)?;
+    if nosave {
+        if let (Target::Id(id), Some(hook)) = (&target, hook_id.filter(|id| !id.is_empty())) {
+            if id != hook {
+                return Err(color_eyre::eyre::eyre!("explicit session id disagrees with GROK_SESSION_ID; refusing no-save registration"));
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn import_targets(writer: &PlainTextWriter, targets: &[PathBuf]) -> Result<()> {
     let mut imported = 0usize;
-    for chat in &targets {
-        match import_grok_session(chat) {
-            Ok(n) => {
+    let mut failed = 0usize;
+    for chat in targets {
+        match import_grok_session(writer, chat) {
+            Ok(Imported::Stored(n)) => {
                 imported += 1;
                 eprintln!("✓ {} ({} messages)", session_id_of(chat), n);
             }
-            Err(e) => eprintln!("⚠ skipped {}: {}", chat.display(), e),
+            Ok(Imported::NoSave) => {
+                eprintln!("= {} marked no-save; not imported", session_id_of(chat))
+            }
+            Ok(Imported::Empty) => eprintln!("= {} has no messages", session_id_of(chat)),
+            Err(e) => {
+                failed += 1;
+                eprintln!("⚠ skipped {}: {}", chat.display(), e);
+            }
         }
     }
-    eprintln!("continuum-grok: imported {}/{} session(s)", imported, targets.len());
+    eprintln!(
+        "continuum-grok: imported {}/{} session(s)",
+        imported,
+        targets.len()
+    );
+    if failed > 0 {
+        return Err(color_eyre::eyre::eyre!("{failed} Grok import(s) failed"));
+    }
+    Ok(())
+}
+
+fn validate_target(target: &Target, nosave: bool) -> Result<()> {
+    if let Target::Id(id) = target {
+        if !import::session_id_is_safe(id) {
+            return Err(color_eyre::eyre::eyre!("invalid Grok session id"));
+        }
+    } else if nosave {
+        return Err(color_eyre::eyre::eyre!("no-save capture requires an explicit session id or GROK_SESSION_ID; refusing latest/all discovery"));
+    }
     Ok(())
 }
 
@@ -128,13 +191,17 @@ fn find_session_by_id(root: &Path, id: &str) -> Option<PathBuf> {
 
 fn all_chat_histories(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(cwds) = std::fs::read_dir(root) else { return out };
+    let Ok(cwds) = std::fs::read_dir(root) else {
+        return out;
+    };
     for cwd in cwds.flatten() {
         let cwd = cwd.path();
         if !cwd.is_dir() || is_smoke_cwd(&cwd) {
             continue; // skip session_search.sqlite / prompt_history.jsonl / smoke pings
         }
-        let Ok(sessions) = std::fs::read_dir(&cwd) else { continue };
+        let Ok(sessions) = std::fs::read_dir(&cwd) else {
+            continue;
+        };
         for sess in sessions.flatten() {
             let chat = sess.path().join("chat_history.jsonl");
             if chat.is_file() {
@@ -184,7 +251,24 @@ fn push_msg(
     }
 }
 
-fn import_grok_session(chat_history: &Path) -> Result<usize> {
+fn import_grok_session(writer: &PlainTextWriter, chat_history: &Path) -> Result<Imported<usize>> {
+    let session_id = session_id_of(chat_history);
+    validate_target(&Target::Id(session_id.clone()), false)?;
+    if import::nosave_marked(writer, &[&session_id])? {
+        return Ok(Imported::NoSave);
+    }
+    writer.with_session_lock(SOURCE, &session_id, || {
+        if import::nosave_marked(writer, &[&session_id])? {
+            return Ok(Imported::NoSave);
+        }
+        import_grok_session_locked(writer, chat_history)
+    })
+}
+
+fn import_grok_session_locked(
+    writer: &PlainTextWriter,
+    chat_history: &Path,
+) -> Result<Imported<usize>> {
     let session_dir = chat_history
         .parent()
         .ok_or_else(|| color_eyre::eyre::eyre!("no parent dir"))?;
@@ -207,7 +291,9 @@ fn import_grok_session(chat_history: &Path) -> Result<usize> {
         .with_context(|| format!("open {}", chat_history.display()))?;
     for line in BufReader::new(file).lines() {
         let line = line?;
-        let Ok(entry) = serde_json::from_str::<GrokLine>(&line) else { continue };
+        let Ok(entry) = serde_json::from_str::<GrokLine>(&line) else {
+            continue;
+        };
 
         match entry.kind.as_str() {
             "user" => {
@@ -222,7 +308,13 @@ fn import_grok_session(chat_history: &Path) -> Result<usize> {
             }
             "assistant" => {
                 if let Some(serde_json::Value::String(s)) = &entry.content {
-                    push_msg(&mut messages, &mut seen, "assistant", "assistant-text", s.clone());
+                    push_msg(
+                        &mut messages,
+                        &mut seen,
+                        "assistant",
+                        "assistant-text",
+                        s.clone(),
+                    );
                 }
                 for tc in entry.tool_calls.iter().flatten() {
                     let text = format!(
@@ -230,7 +322,13 @@ fn import_grok_session(chat_history: &Path) -> Result<usize> {
                         tc.name.as_deref().unwrap_or("unknown"),
                         tc.arguments.as_deref().unwrap_or("")
                     );
-                    push_msg(&mut messages, &mut seen, "assistant", "assistant-tool", text);
+                    push_msg(
+                        &mut messages,
+                        &mut seen,
+                        "assistant",
+                        "assistant-tool",
+                        text,
+                    );
                 }
             }
             "tool_result" => {
@@ -245,33 +343,14 @@ fn import_grok_session(chat_history: &Path) -> Result<usize> {
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
     if compressed.is_empty() {
-        return Err(color_eyre::eyre::eyre!("no messages to import"));
+        return Ok(Imported::Empty);
     }
 
-    let writer = PlainTextWriter::new()?;
-    let date = PlainTextWriter::extract_date(Some(&start_time));
-
-    // Creates continuum-logs/grok-cli/<date>/<uuid>/ and returns that dir.
-    let out_session_dir = writer.write_session(
-        &session_id,
-        SOURCE,
-        Some(&start_time),
-        None,
-        "closed",
-        compressed.len(),
-        &[],
-    )?;
-
-    // Idempotent re-import: drop the old messages.jsonl before rewriting.
-    let messages_path = out_session_dir.join("messages.jsonl");
-    if messages_path.exists() {
-        std::fs::remove_file(&messages_path).ok();
+    if import::nosave_marked(writer, &[&session_id])? {
+        return Ok(Imported::NoSave);
     }
-
-    for (idx, (role, content)) in compressed.iter().enumerate() {
-        writer.append_message(&session_id, SOURCE, &date, idx + 1, role, content, Some(&start_time))?;
-    }
-    Ok(compressed.len())
+    writer.replace_session(&session_id, SOURCE, Some(&start_time), &[], &compressed)?;
+    Ok(Imported::Stored(compressed.len()))
 }
 
 fn hash_content(tag: &str, content: &str) -> u64 {
