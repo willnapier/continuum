@@ -113,3 +113,38 @@ fn no_save_never_marks_an_inferred_latest_or_all_sessions() {
     assert!(validate_target(&Target::Id(ID.into()), true).is_ok());
     assert!(validate_target(&Target::All, false).is_ok());
 }
+
+#[test]
+fn conflicting_explicit_and_inherited_ids_cannot_register_the_wrong_session() {
+    assert!(select_target(&[ID.into()], Some("parent-session"), true).is_err());
+    assert!(select_target(&[ID.into()], Some(ID), true).is_ok());
+    assert!(select_target(&[], Some(ID), true).is_ok());
+    assert!(select_target(&[], None, true).is_err());
+    assert!(select_target(&["--all".into()], Some(ID), true).is_err());
+    assert!(select_target(&["--latest".into()], Some(ID), true).is_err());
+    // Explicit manual imports in an ordinary Grok session remain possible.
+    assert!(select_target(&[ID.into()], Some("parent-session"), false).is_ok());
+}
+
+#[test]
+fn mixed_batch_commits_allowed_records_but_reports_genuine_errors() {
+    let (temp, writer, allowed) = fixture();
+    let protected = temp.path().join("native/protected/chat_history.jsonl");
+    let broken = temp.path().join("native/broken/chat_history.jsonl");
+    import::register_nosave(&writer, "protected").unwrap();
+    // A protected missing file is never read; an ordinary missing file errors.
+    let error = import_targets(&writer, &[broken, protected, allowed]).unwrap_err();
+    assert!(error.to_string().contains("1 Grok import(s) failed"));
+    assert!(writer
+        .base_dir()
+        .join(SOURCE)
+        .join("2026-10-18")
+        .join(ID)
+        .join("messages.jsonl")
+        .is_file());
+    assert!(!writer
+        .base_dir()
+        .join(SOURCE)
+        .join("2026-10-18/protected")
+        .exists());
+}

@@ -44,24 +44,9 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let target = if args.iter().any(|a| a == "--all") {
-        Target::All
-    } else if let Some(id) = args.iter().find(|a| !a.starts_with("--")) {
-        Target::Id(id.clone())
-    } else if args.iter().any(|a| a == "--latest") {
-        Target::Latest
-    } else if let Ok(id) = std::env::var("GROK_SESSION_ID") {
-        if id.is_empty() {
-            Target::Latest
-        } else {
-            Target::Id(id)
-        }
-    } else {
-        Target::Latest
-    };
-
+    let hook_id = std::env::var("GROK_SESSION_ID").ok();
     let nosave = std::env::var_os(import::NOSAVE_ENV).is_some_and(|v| v == "1");
-    validate_target(&target, nosave)?;
+    let target = select_target(&args, hook_id.as_deref(), nosave)?;
     let writer = PlainTextWriter::new()?;
     // Register before locating/reading the native transcript: a late-created
     // transcript must still be excluded by a later scheduled import.
@@ -84,11 +69,42 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    import_targets(&writer, &targets)
+}
 
+fn select_target(args: &[String], hook_id: Option<&str>, nosave: bool) -> Result<Target> {
+    let target = if args.iter().any(|a| a == "--all") {
+        Target::All
+    } else if let Some(id) = args.iter().find(|a| !a.starts_with("--")) {
+        Target::Id(id.clone())
+    } else if args.iter().any(|a| a == "--latest") {
+        Target::Latest
+    } else if let Some(id) = hook_id {
+        if id.is_empty() {
+            Target::Latest
+        } else {
+            Target::Id(id.to_owned())
+        }
+    } else {
+        Target::Latest
+    };
+
+    validate_target(&target, nosave)?;
+    if nosave {
+        if let (Target::Id(id), Some(hook)) = (&target, hook_id.filter(|id| !id.is_empty())) {
+            if id != hook {
+                return Err(color_eyre::eyre::eyre!("explicit session id disagrees with GROK_SESSION_ID; refusing no-save registration"));
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn import_targets(writer: &PlainTextWriter, targets: &[PathBuf]) -> Result<()> {
     let mut imported = 0usize;
     let mut failed = 0usize;
-    for chat in &targets {
-        match import_grok_session(&writer, chat) {
+    for chat in targets {
+        match import_grok_session(writer, chat) {
             Ok(Imported::Stored(n)) => {
                 imported += 1;
                 eprintln!("✓ {} ({} messages)", session_id_of(chat), n);
