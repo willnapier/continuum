@@ -148,3 +148,45 @@ fn mixed_batch_commits_allowed_records_but_reports_genuine_errors() {
         .join("2026-10-18/protected")
         .exists());
 }
+
+#[test]
+fn malformed_transcripts_preserve_existing_capture() {
+    for damage in ["interior", "trailing"] {
+        let (_temp, writer, path) = fixture();
+        import_grok_session(&writer, &path).unwrap();
+        let captured = writer.base_dir().join(SOURCE).join("2026-10-18").join(ID);
+        let before_messages = fs::read(captured.join("messages.jsonl")).unwrap();
+        let before_metadata = fs::read(captured.join("session.json")).unwrap();
+        let good = fs::read_to_string(&path).unwrap();
+        let bad = if damage == "interior" {
+            format!("{good}malformed\n{good}")
+        } else {
+            format!("{good}{{truncated")
+        };
+        fs::write(&path, bad).unwrap();
+        assert!(import_grok_session(&writer, &path).is_err());
+        assert_eq!(
+            fs::read(captured.join("messages.jsonl")).unwrap(),
+            before_messages
+        );
+        assert_eq!(
+            fs::read(captured.join("session.json")).unwrap(),
+            before_metadata
+        );
+    }
+}
+
+#[test]
+fn fresh_corruption_creates_no_capture_and_blank_lines_are_allowed() {
+    let (_temp, writer, path) = fixture();
+    let good = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{good}{{truncated")).unwrap();
+    assert!(import_grok_session(&writer, &path).is_err());
+    // Taking the import lock may create the root, but no session is published.
+    assert!(!writer.base_dir().join(SOURCE).exists());
+    fs::write(&path, format!("\n \t\n{good}\n")).unwrap();
+    assert!(matches!(
+        import_grok_session(&writer, &path).unwrap(),
+        Imported::Stored(2)
+    ));
+}

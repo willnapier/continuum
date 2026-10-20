@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "continuum-core",
+    "continuum-mcp",
+    "semantic-query",
     "continuum-usage-core",
     "continuum-usage",
     "usage-probe-anthropic-api",
