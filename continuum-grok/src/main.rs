@@ -289,11 +289,11 @@ fn import_grok_session_locked(
 
     let file = std::fs::File::open(chat_history)
         .with_context(|| format!("open {}", chat_history.display()))?;
-    for line in BufReader::new(file).lines() {
+    for (index, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
-        let Ok(entry) = serde_json::from_str::<GrokLine>(&line) else {
-            continue;
-        };
+        if line.trim().is_empty() { continue; }
+        let entry: GrokLine = serde_json::from_str(&line)
+            .map_err(|_| color_eyre::eyre::eyre!("malformed Grok transcript at line {}; capture unchanged", index + 1))?;
 
         match entry.kind.as_str() {
             "user" => {
