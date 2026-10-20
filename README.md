@@ -50,7 +50,9 @@ and their JSON contract, using a separately installed host-local FAISS runtime.
 Grok imports refuse malformed nonblank transcript records before replacing an
 existing session. A syntactically unfinished, unterminated final JSON record is
 ignored so a complete prefix can be captured, matching the other native importers.
-Newline-terminated damage and invalid JSON syntax still refuse capture.
+Recovery also requires every previously captured turn to remain an unchanged prefix;
+a shorter or changed prefix is refused. Newline-terminated damage and invalid JSON
+syntax still refuse capture.
 Retrieval boundary checks do not erase previously captured data.
 
 ## Architecture Overview

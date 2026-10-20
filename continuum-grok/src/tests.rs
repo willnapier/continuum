@@ -222,3 +222,21 @@ fn interrupted_json_tail_recovers_complete_prefix_but_terminated_damage_refuses(
     assert!(import_grok_session(&writer, &path).is_err());
     assert_eq!(fs::read(captured.join("messages.jsonl")).unwrap(), before);
 }
+
+#[test]
+fn recovered_tail_cannot_shrink_or_change_existing_capture() {
+    let (_temp, writer, path) = fixture();
+    let good = fs::read_to_string(&path).unwrap();
+    import_grok_session(&writer, &path).unwrap();
+    let captured = writer.base_dir().join(SOURCE).join("2026-10-18").join(ID);
+    let before = ["messages.jsonl", "session.json"].map(|name| fs::read(captured.join(name)).unwrap());
+    let partial = "{\"type\":\"assistant\",\"content\":\"unfinished";
+    for prefix in [format!("{}\n", good.lines().next().unwrap()), good.replace("synthetic reply", "changed reply")] {
+        fs::write(&path, format!("{prefix}{partial}")).unwrap();
+        assert!(import_grok_session(&writer, &path).is_err());
+        assert_eq!(fs::read(captured.join("messages.jsonl")).unwrap(), before[0]);
+        assert_eq!(fs::read(captured.join("session.json")).unwrap(), before[1]);
+    }
+    fs::write(&path, format!("{good}{{\"type\":\"assistant\",\"content\":\"another complete turn\"}}\n{partial}")).unwrap();
+    assert!(matches!(import_grok_session(&writer, &path).unwrap(), Imported::Stored(3)));
+}
