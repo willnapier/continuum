@@ -48,7 +48,10 @@ Versioned MCP source now lives in [`continuum-mcp`](continuum-mcp/README.md).
 The [`semantic-query`](semantic-query/README.md) crate provides both query CLIs
 and their JSON contract, using a separately installed host-local FAISS runtime.
 Grok imports refuse malformed nonblank transcript records before replacing an
-existing session. Retrieval boundary checks do not erase previously captured data.
+existing session. A syntactically unfinished, unterminated final JSON record is
+ignored so a complete prefix can be captured, matching the other native importers.
+Newline-terminated damage and invalid JSON syntax still refuse capture.
+Retrieval boundary checks do not erase previously captured data.
 
 ## Architecture Overview
 

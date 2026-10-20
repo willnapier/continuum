@@ -155,7 +155,18 @@ pub fn run(continuum: bool) -> Result<()> {
     } else {
         ".local/share/semantic-search/config.yaml"
     }));
-    let config: Config = serde_yaml::from_str(&bounded_text(&expand(&config_path)?, 1_000_000)?)
+    let config_path = expand(&config_path)?
+        .canonicalize()
+        .context("semantic config unavailable")?;
+    let configured_path = |p: &Path| -> Result<PathBuf> {
+        let p = expand(p)?;
+        Ok(if p.is_absolute() {
+            p
+        } else {
+            config_path.parent().unwrap().join(p)
+        })
+    };
+    let config: Config = serde_yaml::from_str(&bounded_text(&config_path, 1_000_000)?)
         .context("invalid semantic config")?;
     let max = args.limit.unwrap_or(config.query.max_results);
     ensure!((1..=1000).contains(&max), "limit must be 1..1000");
@@ -163,7 +174,7 @@ pub fn run(continuum: bool) -> Result<()> {
         config.query.similarity_threshold.is_finite(),
         "invalid threshold"
     );
-    let index = expand(&config.database.index_path)?;
+    let index = configured_path(&config.database.index_path)?;
     ensure!(
         fs::metadata(&index)
             .context("semantic index unavailable; no automatic rebuild")?
@@ -171,7 +182,7 @@ pub fn run(continuum: bool) -> Result<()> {
         "index must be a file"
     );
     let metadata: Metadata = serde_json::from_str(&bounded_text(
-        &expand(&config.database.metadata_path)?,
+        &configured_path(&config.database.metadata_path)?,
         32 * 1024 * 1024,
     )?)
     .context("invalid semantic metadata")?;

@@ -205,3 +205,20 @@ fn unknown_event_kinds_do_not_block_ordinary_capture() {
         Imported::Stored(2)
     ));
 }
+
+#[test]
+fn interrupted_json_tail_recovers_complete_prefix_but_terminated_damage_refuses() {
+    let (_temp, writer, path) = fixture();
+    let good = fs::read_to_string(&path).unwrap();
+    let partial = "{\"type\":\"assistant\",\"content\":\"unfinished";
+    fs::write(&path, format!("{good}{partial}")).unwrap();
+    assert!(matches!(
+        import_grok_session(&writer, &path).unwrap(),
+        Imported::Stored(2)
+    ));
+    let captured = writer.base_dir().join(SOURCE).join("2026-10-18").join(ID);
+    let before = fs::read(captured.join("messages.jsonl")).unwrap();
+    fs::write(&path, format!("{good}{partial}\n")).unwrap();
+    assert!(import_grok_session(&writer, &path).is_err());
+    assert_eq!(fs::read(captured.join("messages.jsonl")).unwrap(), before);
+}
