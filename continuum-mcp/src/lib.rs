@@ -215,7 +215,8 @@ impl Archive {
         id: &str,
     ) -> Result<(Vec<Message>, Option<Session>)> {
         let dir = self.session(a, d, id)?;
-        let messages = Self::messages(&dir)?;
+        let messages = Self::messages(&dir)
+            .map_err(|e| anyhow::anyhow!("{a}/{d}/{id}/messages.jsonl: {e}"))?;
         let metadata = Self::read(&dir, "session.json", true)?
             .map(|s| serde_json::from_str(&s).context("malformed archive session metadata"))
             .transpose()?;
@@ -241,7 +242,9 @@ impl Archive {
                 let dd = Self::directory(&ad, &d)?;
                 for id in Self::directories(&dd)? {
                     let sd = Self::directory(&dd, &id)?;
-                    for message in Self::messages(&sd)? {
+                    for message in Self::messages(&sd)
+                        .map_err(|e| anyhow::anyhow!("{a}/{d}/{id}/messages.jsonl: {e}"))?
+                    {
                         rows.push(ConversationResult {
                             assistant: a.clone(),
                             date: d.clone(),
@@ -288,6 +291,10 @@ impl Archive {
     }
     pub fn source_text(&self, path: &Path) -> Result<String> {
         let parts = self.source_parts(path)?;
+        self.source_text_parts(&parts)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", parts.join("/")))
+    }
+    fn source_text_parts(&self, parts: &[String]) -> Result<String> {
         let dir = self.session(&parts[0], &parts[1], &parts[2])?;
         if parts[3] == "session.json" {
             let text = Self::read(&dir, "session.json", false)?.unwrap();
@@ -398,6 +405,9 @@ pub fn semantic_search_conversations(query: &str, max: usize) -> Result<Vec<Sema
         output.status.success(),
         "semantic helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(2000)
+            .collect::<String>()
     );
     archive.parse_semantic(std::str::from_utf8(&output.stdout)?)
 }

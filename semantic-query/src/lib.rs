@@ -187,7 +187,8 @@ pub fn run(continuum: bool) -> Result<()> {
     // Validate ALL metadata before any file content or embedding request.
     if let Some(a) = &archive {
         for p in &metadata.file_paths {
-            a.validate_source_path(p)?;
+            a.validate_source_path(p)
+                .map_err(|e| anyhow::anyhow!("invalid indexed source {}: {e}", p.display()))?;
         }
     }
     let description = args
@@ -215,8 +216,9 @@ pub fn run(continuum: bool) -> Result<()> {
     );
     let vector = embedding(&text, &config.openai.model)?;
     let mut cmd = Command::new(python);
-    cmd.args(["-c", include_str!("../faiss_bridge.py")])
+    cmd.args(["-I", "-c", include_str!("../faiss_bridge.py")])
         .arg(index);
+    cmd.current_dir("/");
     cmd.env_remove("OPENAI_API_KEY")
         .env_remove("OPENAI_BASE_URL");
     let request = serde_json::to_vec(
@@ -225,7 +227,11 @@ pub fn run(continuum: bool) -> Result<()> {
     let out = continuum_mcp::bounded_output(&mut cmd, Some(request), 35)?;
     ensure!(
         out.status.success(),
-        "FAISS query failed; index, metadata and embedding dimensions must agree"
+        "FAISS binding failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(2000)
+            .collect::<String>()
     );
     let neighbors: Vec<Neighbor> =
         serde_json::from_slice(&out.stdout).context("invalid FAISS binding response")?;

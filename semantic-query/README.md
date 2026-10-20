@@ -3,7 +3,11 @@
 The Rust `semantic-query` and `semantic-query-continuum` binaries replace the
 Dotfiles shell/Python query entry points. The Python file here is only the FAISS
 native-library binding. The existing indexer, configurations and indexes remain
-in place; querying never rebuilds an index.
+in place; querying never rebuilds an index. Only structurally compatible indexes
+are usable. The legacy incremental indexer can append a vector without extending
+its path list; count disagreement is now refused explicitly. A synthetic legacy
+indexer parity check does not certify live indexes, so rollout remains held
+until their shape and the whole-request failure policy are accepted.
 
 ## Runtime and build
 
@@ -43,7 +47,8 @@ strictly; malformed files produce errors rather than missing results. Without
 selects the explicit embedding endpoint; otherwise the endpoint is OpenAI `/v1`.
 There is no model/account fallback. Fixture qualification uses only a loopback
 mock endpoint and synthetic vectors, never real notes or embeddings. The key is
-removed before starting the FAISS binding. Config, metadata and result files
+removed before starting the FAISS binding. Python runs in isolated mode (`-I`)
+from `/`, ignoring the caller’s current directory and `PYTHON*` import settings. Config, metadata and result files
 have size limits; HTTP and trusted-helper execution have time/output limits.
 
 The index and configuration are trusted local inputs. This is not sandboxing of

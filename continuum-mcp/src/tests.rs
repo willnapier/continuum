@@ -151,5 +151,23 @@ fn configured_root_alias_is_allowed_but_descendant_alias_is_not() {
         .is_ok());
     let inner = alias.join("codex/2026-10-20/inner-alias");
     symlink(&session, &inner).unwrap();
-    assert!(a.source_text(&inner.join("messages.jsonl")).is_err());
+    assert!(a
+        .source_text(&inner.join("messages.jsonl"))
+        .unwrap_err()
+        .to_string()
+        .contains("symlink refused"));
+}
+
+#[test]
+fn mixed_good_and_bad_sessions_report_the_bad_unit() {
+    let (_temp, a, session) = fixture();
+    let bad = session.parent().unwrap().join("bad-session");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("messages.jsonl"), "{broken").unwrap();
+    let error = a
+        .search("Synthetic", None, None, 10)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("codex/2026-10-20/bad-session/messages.jsonl"));
+    assert!(error.contains("malformed archive message at line 1"));
 }

@@ -29,7 +29,9 @@ relative to pinned directory handles with `NOFOLLOW` on Linux and macOS.
 
 Limits are 1–1000. Files are capped at 32 MiB. Invalid filters, inaccessible
 archives, corrupt records and invalid expressions report MCP errors. A valid
-search with no matches remains a successful empty result. Unicode previews do
+search with no matches remains a successful JSON `[]` result. A corrupt unit
+fails the whole request and names its archive-relative file; partial-result
+policy and a content-free live-shape assessment remain rollout decisions. Unicode previews do
 not split UTF-8 bytes. Query text is not written to server logs.
 
 ## Build and deploy

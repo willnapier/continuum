@@ -190,3 +190,18 @@ fn fresh_corruption_creates_no_capture_and_blank_lines_are_allowed() {
         Imported::Stored(2)
     ));
 }
+
+#[test]
+fn unknown_event_kinds_do_not_block_ordinary_capture() {
+    let (_temp, writer, path) = fixture();
+    let good = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!("{{\"type\":\"future_event\",\"payload\":{{\"synthetic\":true}}}}\n{good}"),
+    )
+    .unwrap();
+    assert!(matches!(
+        import_grok_session(&writer, &path).unwrap(),
+        Imported::Stored(2)
+    ));
+}

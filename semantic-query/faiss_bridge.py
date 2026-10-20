@@ -1,13 +1,23 @@
-# Narrow native-library binding only. CLI, config, HTTP, paths and output belong to Rust.
+"""Native-library binding only; CLI, config, HTTP, validation and formatting live in Rust."""
 import json, sys, signal
-signal.alarm(30)  # independent bound if the Rust parent is interrupted
-import faiss
-import numpy as np
+signal.alarm(30)
+try:
+    import faiss
+    import numpy as np
+except ImportError:
+    sys.exit("FAISS runtime import failed; install the pinned runtime requirements")
 request = json.load(sys.stdin)
-index = faiss.read_index(sys.argv[1])
+try:
+    index = faiss.read_index(sys.argv[1])
+except Exception:
+    sys.exit("FAISS index unreadable; existing index was not changed")
 vector = np.array(request["vector"], dtype=np.float32).reshape(1, -1)
-if index.d != vector.shape[1] or index.ntotal != request["count"]:
-    raise ValueError("FAISS dimensions or metadata count mismatch")
+if index.d != vector.shape[1]:
+    sys.exit("embedding dimension disagrees with FAISS index")
+if index.ntotal != request["count"]:
+    sys.exit("FAISS vector count disagrees with metadata count; index drift")
+if index.metric_type != faiss.METRIC_INNER_PRODUCT:
+    sys.exit("unsupported index metric; expected cosine inner product")
 scores, ids = index.search(vector, min(request["limit"], index.ntotal))
 print(json.dumps([{"index": int(i), "similarity": float(s)}
-                  for s, i in zip(scores[0], ids[0])], allow_nan=False))
+                  for i, s in zip(ids[0], scores[0]) if i >= 0], allow_nan=False))

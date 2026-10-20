@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchConversationsParams {
-    #[schemars(description = "Search query to find in conversation messages")]
+    #[schemars(description = "Case-insensitive regular expression to match conversation messages")]
     query: String,
     #[schemars(description = "Filter by assistant (e.g., 'claude-code', 'codex', 'goose')")]
     assistant: Option<String>,
@@ -109,12 +109,6 @@ impl ContinuumServer {
             }
         };
 
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No matching conversations found. Try different search terms or check that conversations exist in ~/continuum-logs/".to_string()
-            )]));
-        }
-
         info!("Found {} matching messages", results.len());
         let json = serde_json::to_string_pretty(&results)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize results: {}\"}}", e));
@@ -142,12 +136,6 @@ impl ContinuumServer {
                 ))]));
             }
         };
-
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No semantically similar conversations found. Try a different query or broader terms.".to_string()
-            )]));
-        }
 
         info!("Found {} semantically similar conversations", results.len());
         let json = serde_json::to_string_pretty(&results)
@@ -187,13 +175,6 @@ impl ContinuumServer {
                 ))]));
             }
         };
-
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No conversations found for date: {}. Check ~/continuum-logs/",
-                date_str
-            ))]));
-        }
 
         info!("Retrieved {} messages", results.len());
         let json = serde_json::to_string_pretty(&results)
