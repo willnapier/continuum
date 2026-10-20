@@ -146,7 +146,9 @@ fn configured_root_alias_is_allowed_but_descendant_alias_is_not() {
     let a = Archive::open(&alias).unwrap();
     let via_alias = alias.join("codex/2026-10-20/synthetic/messages.jsonl");
     assert!(a.source_text(&via_alias).unwrap().contains("Synthetic"));
-    assert!(a.source_text(&session.join("messages.jsonl")).is_ok());
+    assert!(a
+        .source_text(&session.join("messages.jsonl").canonicalize().unwrap())
+        .is_ok());
     let inner = alias.join("codex/2026-10-20/inner-alias");
     symlink(&session, &inner).unwrap();
     assert!(a.source_text(&inner.join("messages.jsonl")).is_err());
