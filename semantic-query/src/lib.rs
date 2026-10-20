@@ -179,7 +179,7 @@ pub fn run(continuum: bool) -> Result<()> {
         !metadata.file_paths.is_empty(),
         "semantic index metadata is empty"
     );
-    let root = args.root.map(|p| p.canonicalize()).transpose()?;
+    let root = args.root;
     let archive = root
         .as_deref()
         .map(continuum_mcp::Archive::open)

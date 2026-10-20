@@ -137,3 +137,17 @@ fn existing_indexes_may_reference_session_metadata() {
     fs::write(path, "{broken").unwrap();
     assert!(a.parse_semantic(&response).is_err());
 }
+
+#[test]
+fn configured_root_alias_is_allowed_but_descendant_alias_is_not() {
+    let (temp, _a, session) = fixture();
+    let alias = temp.path().join("configured-alias");
+    symlink(temp.path().join("archive"), &alias).unwrap();
+    let a = Archive::open(&alias).unwrap();
+    let via_alias = alias.join("codex/2026-10-20/synthetic/messages.jsonl");
+    assert!(a.source_text(&via_alias).unwrap().contains("Synthetic"));
+    assert!(a.source_text(&session.join("messages.jsonl")).is_ok());
+    let inner = alias.join("codex/2026-10-20/inner-alias");
+    symlink(&session, &inner).unwrap();
+    assert!(a.source_text(&inner.join("messages.jsonl")).is_err());
+}

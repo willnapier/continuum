@@ -102,23 +102,33 @@ pub fn get_continuum_logs_path() -> Result<PathBuf> {
         PathBuf::from(raw)
     };
     ensure!(path.is_dir(), "Continuum archive directory unavailable");
-    Ok(path.canonicalize()?)
+    Ok(path)
 }
 /// Every descendant directory/file is opened relative to a pinned directory fd,
 /// with NOFOLLOW. No archive-controlled symlink is followed, including on races.
 pub struct Archive {
     root: File,
     path: PathBuf,
+    configured_path: PathBuf,
 }
 impl Archive {
     pub fn open(path: &Path) -> Result<Self> {
+        let configured_path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
         let path = path.canonicalize().context("archive root unavailable")?;
         let root = File::from(open(
             &path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
-        Ok(Self { root, path })
+        Ok(Self {
+            root,
+            path,
+            configured_path,
+        })
     }
     fn directory(parent: &File, name: &str) -> Result<File> {
         component(name)?;
@@ -294,6 +304,7 @@ impl Archive {
     fn source_parts(&self, path: &Path) -> Result<Vec<String>> {
         let relative = path
             .strip_prefix(&self.path)
+            .or_else(|_| path.strip_prefix(&self.configured_path))
             .context("semantic result outside archive")?;
         let parts: Vec<_> = relative
             .iter()
@@ -377,7 +388,7 @@ pub fn semantic_search_conversations(query: &str, max: usize) -> Result<Vec<Sema
         "--json",
         "--root",
     ])
-    .arg(&archive.path);
+    .arg(&archive.configured_path);
     if let Some(c) = std::env::var_os("CONTINUUM_SEMANTIC_CONFIG") {
         cmd.arg("--config").arg(c);
     }
