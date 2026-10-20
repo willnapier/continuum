@@ -289,11 +289,23 @@ fn import_grok_session_locked(
 
     let file = std::fs::File::open(chat_history)
         .with_context(|| format!("open {}", chat_history.display()))?;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut index = 0usize;
+    let mut recovered_tail = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 { break; }
+        index += 1;
         if line.trim().is_empty() { continue; }
-        let entry: GrokLine = serde_json::from_str(&line)
-            .map_err(|_| color_eyre::eyre::eyre!("malformed Grok transcript at line {}; capture unchanged", index + 1))?;
+        let entry: GrokLine = match serde_json::from_str(&line) {
+            Ok(entry) => entry,
+            Err(e) if e.is_eof() && !line.ends_with('\n') => {
+                recovered_tail = true;
+                eprintln!("continuum-grok: incomplete final record at line {index}; importing complete prefix");
+                break;
+            }
+            Err(_) => return Err(color_eyre::eyre::eyre!("malformed Grok transcript at line {index}; capture unchanged")),
+        };
 
         match entry.kind.as_str() {
             "user" => {
@@ -342,6 +354,30 @@ fn import_grok_session_locked(
     }
 
     let compressed = MessageCompressor::new().compress_batch(&messages);
+    if recovered_tail {
+        // An interrupted rewrite must not erase or change previously captured turns.
+        // This check runs under the same session lock as publication.
+        let target = writer.base_dir().join(SOURCE)
+            .join(PlainTextWriter::extract_date(Some(&start_time))).join(&session_id);
+        match std::fs::read_to_string(target.join("messages.jsonl")) {
+            Ok(previous) => {
+                for (position, line) in previous.lines().enumerate() {
+                    let old: serde_json::Value = serde_json::from_str(line)
+                        .wrap_err("cannot verify previous Grok capture; capture unchanged")?;
+                    let matches = compressed.get(position).is_some_and(|(role, content)| {
+                        old.get("role").and_then(|v| v.as_str()) == Some(role.as_str())
+                            && old.get("content").and_then(|v| v.as_str()) == Some(content.as_str())
+                    });
+                    if !matches {
+                        return Err(color_eyre::eyre::eyre!("incomplete Grok transcript does not preserve prior capture; capture unchanged"));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                && !target.join("session.json").exists() => {}
+            Err(e) => return Err(e).wrap_err("cannot verify previous Grok capture; capture unchanged"),
+        }
+    }
     if compressed.is_empty() {
         return Ok(Imported::Empty);
     }
