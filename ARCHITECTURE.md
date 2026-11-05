@@ -110,6 +110,30 @@ and `continuum codex which` reports which binary is selected. One resolver in
 `continuum-core` serves both the wrapper and the Codex usage probe, and it
 refuses to start itself recursively.
 
+**Codex clipboard in Linux Zellij.** For a launch with both input and output
+attached to a terminal and a nonempty `ZELLIJ`, `continuum-codex` gives the child
+empty `DISPLAY` and `WAYLAND_DISPLAY` values and removes `WAYLAND_SOCKET`.
+Codex 0.163 otherwise writes only to the server's desktop clipboard when a
+persistent pane was started locally, even after a remote terminal attaches.
+Disabling its native backend selects Codex's existing OSC 52 terminal fallback.
+Zellij and the attached terminal must allow clipboard writes; sending OSC 52
+cannot acknowledge delivery. Restart a client and resume its saved conversation
+to pick up the launcher change; existing clients keep their environment.
+
+The parent shell, redirected launches, non-Zellij launches and macOS launches
+retain their display environment. The Codex child and its tools cannot use the
+Linux desktop display or native image clipboard in this mode. Attach images by
+file, or explicitly retain the local desktop connection with Nushell
+`with-env {CONTINUUM_CODEX_NATIVE_CLIPBOARD: "1"} { codex resume }`.
+That opt-out restores native copying and may reproduce the remote-copy issue.
+The wrapper does not alter SSH identity, Codex arguments or clipboard contents.
+
+Offline process controls: build `cargo build --locked -p continuum-codex`, then
+run `python3 continuum-codex/tests/clipboard_launch.py target/debug/continuum-codex`.
+These use a fake child in a private home and pseudo-terminals, with no provider
+calls or access to a real clipboard. Physical Mac/Ghostty/mosh delivery still
+needs a selection and paste check after reopening a client.
+
 Since the per-turn hooks arrived (October 2026), capture no longer depends on the
 wrappers: an unwrapped Claude Code or Codex session is still recorded. What the
 wrappers still add is the import at exit, the DayPage line, the managed Codex

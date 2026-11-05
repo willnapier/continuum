@@ -7,7 +7,26 @@
 // itself forever. Resolution now skips our own executable by identity.
 
 use color_eyre::{eyre::Context, Result};
+use std::io::IsTerminal;
 use std::process::{Command, Stdio};
+
+/// Persistent Zellij panes can acquire remote clients after launch. Codex 0.163
+/// does not recognize Zellij as a reason to forward successful native copies.
+/// Make its native backend unavailable so it uses its normal OSC 52 fallback.
+fn configure_clipboard(command: &mut Command) {
+    if cfg!(target_os = "linux")
+        && std::env::var_os("ZELLIJ").is_some_and(|value| !value.is_empty())
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::env::var("CONTINUUM_CODEX_NATIVE_CLIPBOARD").as_deref() != Ok("1")
+    {
+        // Empty values deliberately prevent default-display discovery. Removing
+        // WAYLAND_DISPLAY alone can reconnect to $XDG_RUNTIME_DIR/wayland-0.
+        // Apply only to the child; never change the launcher's process environment.
+        command.env("DISPLAY", "").env("WAYLAND_DISPLAY", "");
+        command.env_remove("WAYLAND_SOCKET");
+    }
+}
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -50,6 +69,7 @@ fn main() -> Result<()> {
 
     // Spawn codex as a child process
     let mut command = Command::new(&real_codex);
+    configure_clipboard(&mut command);
     if skip_saving {
         // Seen by the per-turn Stop hook through codex's environment.
         command.env(continuum_core::import::NOSAVE_ENV, "1");
