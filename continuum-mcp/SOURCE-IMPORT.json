@@ -1,0 +1,13 @@
+{
+  "source": "/home/will/continuum-mcp",
+  "original_git_head": null,
+  "files": {
+    "Cargo.toml": "95afc28a737a00e30a408aefdbf6c035be3e3016eb46f7689d9929af691043ed",
+    "Cargo.lock": "b4c384e6125ff70a800137036646c738911c979075d5b704ff1a0444e5111b46",
+    ".gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
+    "README.md": "162c5094535cc7267f4ea8ae1f18bda166dfc7b2910693d33624d318fe11adbf",
+    "src/lib.rs": "d5a18f8163b26049763426672a0a932b31d2c070d3ac4d4e7219bf5de9a1fd23",
+    "src/main.rs": "0b85d0b4bb1a8e155fcdaef159dc305b48738e887c790da8a4d30d48ebd88ed3"
+  },
+  "scope": "baseline imported for versioned repair; installed-binary correspondence unproven"
+}

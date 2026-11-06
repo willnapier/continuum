@@ -42,6 +42,19 @@ It fills a gap, but it's a small gap for a specific audience.
 - **Activity reporting**: Daily AI activity extraction with skill tagging and cross-session context loading
 - **Terminal-native**: Built for fd, rg, sk, Nushell workflows
 
+## Retrieval tools
+
+Versioned MCP source now lives in [`continuum-mcp`](continuum-mcp/README.md).
+The [`semantic-query`](semantic-query/README.md) crate provides both query CLIs
+and their JSON contract, using a separately installed host-local FAISS runtime.
+Grok imports refuse malformed nonblank transcript records before replacing an
+existing session. A syntactically unfinished, unterminated final JSON record is
+ignored so a complete prefix can be captured, matching the other native importers.
+Recovery also requires every previously captured turn to remain an unchanged prefix;
+a shorter or changed prefix is refused. Newline-terminated damage and invalid JSON
+syntax still refuse capture.
+Retrieval boundary checks do not erase previously captured data.
+
 ## Architecture Overview
 
 Continuum has three layers:
