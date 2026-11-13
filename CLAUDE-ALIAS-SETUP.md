@@ -14,6 +14,14 @@ When you type `claude`, the system uses `continuum-claude` wrapper which:
    - Captures output in `stream-json` format
    - Writes to `~/continuum-logs/claude-code/`
 
+In both modes it removes `ANTHROPIC_API_KEY` from Claude Code's environment
+(since 13 Nov 2026). The shell exports that key for PracticeForge, and Claude
+Code would otherwise use it in place of the subscription login wherever the
+key is approved. Zellij's session resurrection, for one, re-runs
+`continuum-claude --resume <id>` without the Nushell wrapper that also strips
+it. The clinical path, `cc-clinical`, runs its own pinned binary and is not
+affected.
+
 ## Setup on Linux (Already Done)
 
 Your Linux system is already set up:
