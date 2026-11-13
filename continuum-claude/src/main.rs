@@ -11,6 +11,32 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+/// Never passed on to Claude Code. When it holds a key approved in
+/// ~/.claude.json (cc-clinical approves the DPA key), Claude Code uses it in
+/// place of the subscription login, so the session runs on the metered API
+/// outside cc-clinical. The shell environment exports it for PracticeForge
+/// (env-secret.nu). The Nushell `claude` function strips it, but some launches
+/// reach this wrapper without that function. When a Zellij session is
+/// resurrected, the server re-runs each pane's `continuum-claude --resume <id>`
+/// in its own environment (13 Nov 2026: twelve sessions came back on the key).
+/// The same happens with `zellij action new-tab -- continuum-claude` and with
+/// the bash alias. cc-clinical runs its pinned binary, not this wrapper, so no
+/// launch through here needs the key.
+const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The command that runs Claude Code, for both modes.
+fn claude_command(program: &str, skip_saving: bool) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove(API_KEY_ENV);
+    if skip_saving {
+        // CONTINUUM_NOSAVE reaches the per-turn Stop hook (`continuum import
+        // --hook`) through claude's environment, so a nosave session is not
+        // imported turn by turn either.
+        command.env(continuum_core::import::NOSAVE_ENV, "1");
+    }
+    command
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -70,14 +96,8 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
         None
     };
 
-    // Spawn claude process. CONTINUUM_NOSAVE reaches the per-turn Stop hook
-    // (`continuum import --hook`) through claude's environment, so a nosave
-    // session is not imported turn by turn either.
-    let mut command = Command::new("claude");
-    if skip_saving {
-        command.env(continuum_core::import::NOSAVE_ENV, "1");
-    }
-    let mut child = command
+    // Spawn claude process.
+    let mut child = claude_command("claude", skip_saving)
         .args(&args)
         .stdin(if user_prompt.is_some() {
             Stdio::piped()
@@ -364,12 +384,7 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     // Identify *this* child's session while it runs (open jsonl / --resume id).
     // Do not use "newest jsonl after exit": two Claudes dying together used to
     // make every wrapper auto-log the same file (identical DayPage twins).
-    let mut command = Command::new(&real_claude);
-    if skip_saving {
-        // Seen by the per-turn Stop hook through claude's environment.
-        command.env(continuum_core::import::NOSAVE_ENV, "1");
-    }
-    let mut child = command
+    let mut child = claude_command(&real_claude, skip_saving)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -959,11 +974,41 @@ enum Content {
 #[cfg(test)]
 mod tests {
     use super::{
-        clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
-        session_id_is_safe, try_claim_autolog,
+        claude_command, clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
+        session_id_is_safe, try_claim_autolog, API_KEY_ENV,
     };
     use std::collections::HashSet;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// What the command does with `key`: None if it leaves it inherited,
+    /// Some(None) if it removes it, Some(Some(v)) if it sets it to v.
+    fn env_action(command: &tokio::process::Command, key: &str) -> Option<Option<String>> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new(key))
+            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn api_key_never_reaches_claude() {
+        for skip_saving in [false, true] {
+            let command = claude_command("claude", skip_saving);
+            assert_eq!(
+                env_action(&command, API_KEY_ENV),
+                Some(None),
+                "the API key must be removed from claude's environment (skip_saving={skip_saving})"
+            );
+        }
+    }
+
+    #[test]
+    fn nosave_marker_still_reaches_claude() {
+        let nosave = continuum_core::import::NOSAVE_ENV;
+        assert_eq!(env_action(&claude_command("claude", true), nosave), Some(Some("1".into())));
+        assert_eq!(env_action(&claude_command("claude", false), nosave), None);
+    }
 
     #[test]
     fn marked_session_is_protected_unmarked_imports() {
