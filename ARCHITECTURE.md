@@ -119,29 +119,51 @@ directly instead (install the launcher with `rust-redeploy --only ai-masked`).
 When the launcher itself refuses, it prints its reason and the wrapper exits
 with the launcher's code, 113. The usage probes that start a harness follow the
 same rule (section 3). The rule is one file, `continuum-core/src/masked_launch.rs`,
-which `continuum-usage-core` also compiles. macOS launches are unchanged until
-the mask reaches the Mac. What is hidden, and how to tell that a session is
-masked: `~/Assistants/shared/AI-FOOTING-MASK.md`.
+which `continuum-usage-core` also compiles. On macOS the harness is still
+started directly, until the mask reaches the Mac. What is hidden, and how to
+tell that a session is masked: `~/Assistants/shared/AI-FOOTING-MASK.md`.
 
 **A no-save request is used up only by a session that started.** A wrapper
 that finds `~/.continuum-nosave` does not delete it at once. It reserves it,
 by renaming it to `.continuum-nosave.reserved-<its own PID>`, so of two
-wrappers started together exactly one takes the request. When the harness has
-run, the wrapper removes the reservation: the request is used up. When nothing
-was started, the wrapper renames the reservation back to the marker, so the
-next start is still not saved. "Nothing was started" means the start failed
-(the launcher could not be run), or the child exited with one of the
-launcher's own codes: 113 (it refused) or 126 and 127 (it could not run the
-harness). In that case the wrapper also does no import, deletion or DayPage
-line, because there is no session of that start (`continuum-claude` still does
-them when it saw that child hold a transcript open, which shows that a session
-did run). Those codes are not reserved
-for the launcher. A harness that itself exits with one of them after a real
-session gets its request back too, and the next session is then not saved
-either. That mistake is made in the safe direction, towards not saving. A
-wrapper that is killed leaves its reservation file behind; nothing reads it,
-and no wrapper touches a reservation that is not its own
-(`continuum-core/src/nosave_request.rs`).
+wrappers started together exactly one takes the request. This part is the same
+on macOS. The request is then settled when the child has ended
+(`continuum-core/src/nosave_request.rs`):
+
+| How the child ended | The no-save request | Import, deletion, DayPage line |
+|---|---|---|
+| The start itself failed (the launcher could not be run) | given back | none |
+| Exit with a status that is not one of the launcher's | used up | as usual |
+| Exit 113 (the launcher refused), 126 or 127 (it could not run the harness) | given back | only if the wrapper saw a session |
+| A signal | used up only if the wrapper saw a session; otherwise given back | only if the wrapper saw a session |
+
+"Given back" means the reservation is renamed to the marker again, so the next
+start is still not saved. Only an exit with a status that is not the
+launcher's own shows that a harness ran. A signal does not: the child is the
+launcher until its exec, and a signal may have ended it before that. Without
+this rule a no-save `continuum-claude --continue` whose launcher refused or
+was killed would have deleted the newest earlier transcript, which that start
+never ran.
+
+"The wrapper saw a session" is evidence of the wrapper's own, tied to its
+child. `continuum-claude` has it when it saw that child hold a transcript open
+(interactive mode; this needs `lsof`) or when the child printed a session
+event (print mode). `continuum-codex`, `continuum-gemini` and `continuum-goose`
+have none: they only know the newest session, which may be another start's.
+
+Two consequences are accepted, both towards not saving. The launcher's codes
+are not reserved, and a signal can end a real harness: a harness that ends in
+one of those ways after a real session the wrapper did not see gets its
+request back, and the next session is then not saved either. The wrapper also
+does no work at exit for that session; the hooks and timers still record a
+Claude Code or Codex session, but a Gemini or Goose session that a signal
+ended is not imported.
+
+One case is not covered. A wrapper that is itself killed between reserving
+and settling leaves its reservation file behind. If the harness had started,
+the request was delivered. If it had not (the wrapper was killed in the moment
+before the launcher's exec), the request is lost, as it was when the marker
+was deleted first. No wrapper touches a reservation that is not its own.
 
 **Continuum owns the real Codex CLI.** It installs Codex off `PATH`, under
 `~/.local/share/continuum/codex/`. `continuum codex update` updates that copy,

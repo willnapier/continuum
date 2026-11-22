@@ -29,16 +29,21 @@ itself for the same reason as the key removal: Zellij's session resurrection
 runs `continuum-claude` without the Nushell function. If `ai-masked` is not on
 `PATH` or in `~/.local/bin`, the wrapper says so and exits without starting
 Claude Code; it never starts it directly instead. Install the launcher with
-`rust-redeploy --only ai-masked`. macOS is unchanged for now. `cc-clinical` is
-never started through the launcher. See `~/Assistants/shared/AI-FOOTING-MASK.md`
-and "Wrap" in `ARCHITECTURE.md`.
+`rust-redeploy --only ai-masked`. On macOS Claude Code is still started
+directly for now. `cc-clinical` is never started through the launcher. See
+`~/Assistants/shared/AI-FOOTING-MASK.md` and "Wrap" in `ARCHITECTURE.md`.
 
 A no-save request (`~/.continuum-nosave`) is used up only when Claude Code has
-started. If the launcher refuses (the wrapper then exits 113) or cannot be
-run, the request is kept for the next start. A Claude Code that itself exits
-113, 126 or 127 after a real session also gets its request back, so the next
-session is not saved either; that errs towards not saving. The details are
-under "Wrap" in `ARCHITECTURE.md`.
+started (on macOS too). The wrapper reserves the marker and settles it when
+its child has ended. The request is kept for the next start when the launcher
+cannot be run, when it refuses (the wrapper then exits 113) or cannot run
+Claude Code (126, 127), and when a signal ends the child and the wrapper saw
+no session of it: a signal may have ended the launcher before Claude Code
+started. In those cases the wrapper also leaves earlier sessions alone, where
+`--continue` or `--resume` would otherwise name one. A Claude Code that itself
+ends in one of those ways after a real session the wrapper did not see also
+gets its request back, so the next session is not saved either; that errs
+towards not saving. The details are under "Wrap" in `ARCHITECTURE.md`.
 
 ## Setup on Linux (Already Done)
 
