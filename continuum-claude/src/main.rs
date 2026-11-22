@@ -40,13 +40,17 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// at all: there is no direct start to fall back to.
 ///
 /// Finding the launcher does not mean Claude Code will start: the launcher
-/// may refuse (exit 113), or may not be runnable. A no-save request is
-/// therefore only reserved before the start (`NoSaveRequest::reserve`), never
-/// used up there. It is used up when Claude Code has run, and given back when
-/// the spawn fails or the child's exit code says nothing was started
-/// (`nosave_request::settle_at_exit`). A Claude Code that itself exits 113,
-/// 126 or 127 after a real session also gets its request back, so the next
-/// session is not saved either: the mistake is made in the safe direction.
+/// may refuse (exit 113), may not be runnable, or may be ended by a signal
+/// before its exec. A no-save request is therefore only reserved before the
+/// start (`NoSaveRequest::reserve`), never used up there. It is used up when
+/// the child exited with a status that is not one of the launcher's own, which
+/// shows that Claude Code ran. It is given back when the spawn fails, when
+/// the child exits with one of the launcher's codes (113, 126, 127), and when
+/// a signal ends the child and this wrapper saw no session of it
+/// (`nosave_request::settle_at_exit`). A Claude Code that itself exits with
+/// one of those codes, or is ended by a signal unseen, after a real session
+/// also gets its request back, so the next session is not saved either: the
+/// mistake is made in the safe direction.
 fn claude_launch(program: &str) -> Result<Launch> {
     masked_launch::harness_launch(program).map_err(|reason| color_eyre::eyre::eyre!(reason))
 }
@@ -172,6 +176,10 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     let mut session_id: Option<String> = None;
     let mut session_start_time: Option<String> = None;
     let mut message_count: usize = 0;
+    // Whether this child printed a session event of Claude Code's. The mask
+    // launcher prints nothing on stdout, so one such event is evidence that
+    // Claude Code itself ran (used when the child's end does not show it).
+    let mut session_seen = false;
 
     // Process stdout line by line
     let mut reader = BufReader::new(stdout).lines();
@@ -182,6 +190,9 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
 
         // Try to parse as JSON and log to plain-text
         if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
+            if !matches!(event, ClaudeEvent::Other) {
+                session_seen = true;
+            }
             match event {
                 ClaudeEvent::System { session_id: sid, .. } => {
                     let start_time = chrono::Utc::now().to_rfc3339();
@@ -322,9 +333,12 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     // Wait for process to complete
     let status = child.wait().await?;
 
-    // Use the no-save request up, or give it back if nothing was started.
-    // Before the exit below, which runs no destructors.
-    nosave_request::settle_at_exit(nosave, status.code());
+    // Use the no-save request up, or give it back: it is used up only when
+    // Claude Code exited with a status of its own, or was ended by a signal
+    // after it had printed a session event. A launcher code, or a signal with
+    // no event seen, gives it back (`nosave_request::AfterChild`). Before the
+    // exit below, which runs no destructors.
+    nosave_request::settle_at_exit(nosave, status.code(), session_seen);
 
     // Session saved silently - no prompt needed
 
@@ -463,16 +477,18 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     let _ = watch_handle.join();
     let watched_path = watched.lock().ok().and_then(|guard| guard.clone());
 
-    // Use the no-save request up, or give it back if nothing was started.
-    let started = nosave_request::settle_at_exit(nosave, status.code());
-    if !started && watched_path.is_none() {
-        // The launcher started nothing, and no transcript was seen open under
-        // this child: there is no session of this start to import, delete or
-        // log. Without this, `--resume <id>` or `--continue` would name an
-        // earlier session below, and a no-save start would delete its
-        // transcript although it never ran here. (If a transcript was seen,
-        // a Claude Code did run and then exited with one of the launcher's
-        // codes: the session is handled as usual.)
+    // Settle the no-save request and decide whether there is a session of
+    // this start to work on (`nosave_request::AfterChild`). The evidence this
+    // wrapper has of its own is a transcript seen open under the child.
+    let after = nosave_request::settle_at_exit(nosave, status.code(), watched_path.is_some());
+    if !after.session_of_this_start {
+        // The child did not exit with a status of Claude Code's own (it gave
+        // one of the launcher's codes, or a signal ended it, perhaps before
+        // the launcher's exec), and no transcript was seen open under it.
+        // Nothing shows a session of this start, so none is imported, deleted
+        // or logged. Without this, `--resume <id>` or `--continue` would name
+        // an earlier session below, and a no-save start would delete its
+        // transcript although it never ran here.
         std::process::exit(status.code().unwrap_or(1));
     }
 

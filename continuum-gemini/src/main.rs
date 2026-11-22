@@ -59,10 +59,12 @@ fn main() -> Result<()> {
         .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
 
     // Reserve the no-save request, if there is one; do not use it up yet. It
-    // is used up when Gemini has run, and given back when the spawn fails or
-    // the exit code says the launcher started nothing
-    // (`continuum_core::nosave_request`). A Gemini that itself exits 113, 126
-    // or 127 after a real session gets its request back too, so the next
+    // is used up only when the child exited with a status that is not one of
+    // the launcher's own, which shows that Gemini ran. It is given back when
+    // the spawn fails, when the child exits 113, 126 or 127, and when a signal
+    // ends the child, perhaps before the launcher's exec
+    // (`continuum_core::nosave_request`). A Gemini that itself ends in one of
+    // those ways after a real session gets its request back too, so the next
     // session is not saved either: the mistake is made in the safe direction.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
@@ -87,9 +89,13 @@ fn main() -> Result<()> {
         .with_context(|| continuum_core::masked_launch::spawn_failure("gemini"))?
         .wait()?;
 
-    // Use the no-save request up, or give it back if nothing was started. In
-    // that case there is no session of this start to import.
-    if !nosave_request::settle_at_exit(nosave, status.code()) {
+    // Settle the no-save request and decide whether there is a session of
+    // this start to work on (`nosave_request::AfterChild`). This wrapper has
+    // no evidence of its own that ties a session to its child, so it passes
+    // none: after a launcher code or a signal it imports nothing. (A real
+    // Gemini session that a signal ended is then not imported at exit.)
+    let after = nosave_request::settle_at_exit(nosave, status.code(), false);
+    if !after.session_of_this_start {
         std::process::exit(status.code().unwrap_or(1));
     }
 

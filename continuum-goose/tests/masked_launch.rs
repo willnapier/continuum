@@ -76,3 +76,34 @@ fn a_started_session_uses_the_no_save_request_up() {
         &scratch, WRAPPER, "goose", "exit 0", &ARGS, "nosave:unset",
     );
 }
+
+/// A signal that ends the launcher before it becomes Goose: nothing ran, so
+/// the request is kept.
+#[test]
+fn a_signalled_launcher_keeps_the_no_save_request() {
+    let Some(scratch) = scratch("goose-nosave-signalled") else { return };
+    masked_fixture::a_signalled_launcher_keeps_the_request(&scratch, WRAPPER, "goose", &ARGS);
+}
+
+/// This wrapper cannot tie a session to its child, so a Goose that ran and
+/// was then ended by a signal gets its request back: the next session is not
+/// saved either. That errs towards not saving.
+#[test]
+fn a_signalled_goose_gets_the_no_save_request_back() {
+    let Some(scratch) = scratch("goose-nosave-signalled-harness") else { return };
+    masked_fixture::a_signalled_harness_that_was_not_seen_gets_the_request_back(
+        &scratch, WRAPPER, "goose", masked_fixture::SIGNAL_SELF, &ARGS, "nosave:unset",
+    );
+}
+
+/// The launcher's failed exec (127: not found; 126: would not run) is a start
+/// that reached nothing, like its refusal.
+#[test]
+fn a_launcher_that_cannot_run_goose_keeps_the_no_save_request() {
+    for code in [126, 127] {
+        let Some(scratch) = scratch(&format!("goose-nosave-exec-{code}")) else { return };
+        masked_fixture::a_launcher_that_cannot_run_the_harness_keeps_the_request(
+            &scratch, WRAPPER, "goose", &ARGS, code,
+        );
+    }
+}

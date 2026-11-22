@@ -83,6 +83,30 @@ impl Scratch {
         self.script(LAUNCHER, &body)
     }
 
+    /// A launcher that cannot become the harness, as the real one reports a
+    /// failed exec: a line on stderr, exit `code` (127 or 126), nothing
+    /// started.
+    pub fn failed_exec_launcher(&self, code: i32) -> PathBuf {
+        let body = format!(
+            "{}\nprintf '%s\\n' 'ai-masked: cannot run the harness' >&2\nexit {code}",
+            self.record("launcher-exec-failed", "")
+        );
+        self.script(LAUNCHER, &body)
+    }
+
+    /// A launcher that a signal ends before it becomes the harness: it
+    /// records its arguments, then sends itself SIGTERM. Nothing is started,
+    /// and the wrapper's child has no exit code.
+    pub fn signalled_launcher(&self) -> PathBuf {
+        let body = format!("{}\n{SIGNAL_SELF}", self.record("launcher-signalled", ""));
+        self.script(LAUNCHER, &body)
+    }
+
+    /// Any other program on the scratch `PATH` (sh body).
+    pub fn tool(&self, name: &str, body: &str) -> PathBuf {
+        self.script(name, body)
+    }
+
     /// A file with the launcher's name that cannot be run (no execute bit):
     /// it is found, and the start then fails.
     pub fn unrunnable_launcher(&self) -> PathBuf {
@@ -196,6 +220,10 @@ impl Drop for Scratch {
     }
 }
 
+/// sh: end this process by a signal, so that it has no exit code. (The
+/// `exit 98` is never reached; it would show up as a wrong exit code.)
+pub const SIGNAL_SELF: &str = "kill -TERM $$\nexit 98";
+
 /// The no-save marker's name in the home folder.
 pub const NOSAVE_MARKER: &str = ".continuum-nosave";
 /// A reservation that belongs to another wrapper process.
@@ -230,6 +258,79 @@ pub fn a_refusing_launcher_keeps_the_request(
     assert!(!log.iter().any(|line| line.starts_with("harness:")), "{harness} never ran: {log:?}");
     assert_eq!(scratch.nosave_seen(), Vec::<String>::new());
     assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must still be there\n{}", said(&output));
+}
+
+/// With a no-save request waiting, the launcher cannot become the harness
+/// and exits `code` (127 or 126): the harness never runs, the wrapper exits
+/// with that code, and the request is kept.
+pub fn a_launcher_that_cannot_run_the_harness_keeps_the_request(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    args: &[&str],
+    code: i32,
+) {
+    scratch.failed_exec_launcher(code);
+    scratch.harness(harness, "exit 0");
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(code), "the launcher's code comes back\n{}", said(&output));
+    let log = scratch.log();
+    assert_eq!(log.first().map(String::as_str), Some("launcher-exec-failed"), "{log:?}");
+    assert!(!log.iter().any(|line| line.starts_with("harness:")), "{harness} never ran: {log:?}");
+    assert_eq!(scratch.nosave_seen(), Vec::<String>::new());
+    assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must still be there\n{}", said(&output));
+}
+
+/// With a no-save request waiting, a signal ends the launcher before it
+/// becomes the harness: the harness never runs, the wrapper fails, and the
+/// request is kept. The wrapper's child has no exit code here, and that alone
+/// must not be taken for a harness that ran.
+pub fn a_signalled_launcher_keeps_the_request(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    args: &[&str],
+) {
+    scratch.signalled_launcher();
+    scratch.harness(harness, "exit 0");
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "a child ended by a signal is a failure\n{}", said(&output));
+    let log = scratch.log();
+    assert_eq!(log.first().map(String::as_str), Some("launcher-signalled"), "{log:?}");
+    assert!(!log.iter().any(|line| line.starts_with("harness:")), "{harness} never ran: {log:?}");
+    assert_eq!(scratch.nosave_seen(), Vec::<String>::new());
+    assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must still be there\n{}", said(&output));
+}
+
+/// With a no-save request waiting, the harness runs (`then`, sh, must end it
+/// by a signal) and the wrapper saw no session of it: the request is given
+/// back, so the next session is not saved either. The mistake, if the harness
+/// did run a session, is made towards not saving.
+pub fn a_signalled_harness_that_was_not_seen_gets_the_request_back(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    then: &str,
+    args: &[&str],
+    seen: &str,
+) {
+    scratch.stand_in_launcher();
+    scratch.harness(harness, then);
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "a child ended by a signal is a failure\n{}", said(&output));
+    let log = scratch.log();
+    assert!(log.iter().any(|line| line == &format!("harness:{harness}")), "{harness} ran: {log:?}");
+    assert_eq!(scratch.nosave_seen(), [seen], "{}", said(&output));
+    assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must be given back\n{}", said(&output));
 }
 
 /// With a no-save request waiting, the launcher is found but cannot be run:

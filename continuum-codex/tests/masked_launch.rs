@@ -36,6 +36,43 @@ fn a_started_session_uses_the_no_save_request_up() {
     );
 }
 
+/// A signal that ends the launcher before it becomes Codex: nothing ran, so
+/// the request is kept, and an earlier session's file is left alone.
+#[test]
+fn a_signalled_launcher_keeps_the_no_save_request() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-nosave-signalled");
+    let earlier = scratch.home.join(".codex/sessions/2026/01/01/rollout-zz99-earlier.jsonl");
+    std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+    std::fs::write(&earlier, b"{}\n").unwrap();
+
+    masked_fixture::a_signalled_launcher_keeps_the_request(&scratch, WRAPPER, "codex", &ARGS);
+
+    assert_eq!(std::fs::read(&earlier).ok().as_deref(), Some(&b"{}\n"[..]));
+}
+
+/// This wrapper cannot tie a session to its child, so a Codex that ran and
+/// was then ended by a signal gets its request back: the next session is not
+/// saved either. That errs towards not saving.
+#[test]
+fn a_signalled_codex_gets_the_no_save_request_back() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-nosave-signalled-harness");
+    masked_fixture::a_signalled_harness_that_was_not_seen_gets_the_request_back(
+        &scratch, WRAPPER, "codex", masked_fixture::SIGNAL_SELF, &ARGS, "nosave:1",
+    );
+}
+
+/// The launcher's failed exec (127: not found; 126: would not run) is a start
+/// that reached nothing, like its refusal.
+#[test]
+fn a_launcher_that_cannot_run_codex_keeps_the_no_save_request() {
+    for code in [126, 127] {
+        let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), &format!("codex-nosave-exec-{code}"));
+        masked_fixture::a_launcher_that_cannot_run_the_harness_keeps_the_request(
+            &scratch, WRAPPER, "codex", &ARGS, code,
+        );
+    }
+}
+
 #[test]
 fn codex_starts_through_the_launcher_with_the_depth_guard_set() {
     let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-wrapper");

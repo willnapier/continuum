@@ -341,28 +341,35 @@ fn read_codex_rate_limits() -> Result<Value> {
     )
 }
 
-/// When the mask launcher refused to start anything, say so. Its own reason
-/// went to stderr, which this probe does not keep, and what is left ("exited
-/// without responding", or a broken pipe) reads as a fault in Codex. Only an
-/// error on a masked system with the launcher's refusal code is reworded.
+/// When the mask launcher started nothing, say so. Its own reason went to
+/// stderr, which this probe does not keep, and what is left ("exited without
+/// responding", or a broken pipe) reads as a fault in Codex. Only an error on
+/// a masked system with one of the launcher's own codes is reworded: its
+/// refusal (113) or a failed exec (126, 127), by the same reading as the
+/// wrappers use (`masked_launch::ChildEnd`).
 fn explain_launcher_refusal(
     result: Result<Value>,
     exit_code: Option<i32>,
     codex: &std::path::Path,
     masked: bool,
 ) -> Result<Value> {
-    match result {
-        Err(error) if masked && exit_code == Some(masked_launch::REFUSED_EXIT) => {
+    let started_nothing = masked_launch::ChildEnd::of(masked, exit_code)
+        == masked_launch::ChildEnd::LauncherStartedNothing;
+    match (result, exit_code) {
+        (Err(error), Some(code)) if started_nothing => {
+            let did = if code == masked_launch::REFUSED_EXIT {
+                "refused to start"
+            } else {
+                "could not run"
+            };
             Err(error.wrap_err(format!(
-                "`{launcher}` refused to start the Codex app-server (exit {code}), so no \
-                 reading was taken. Run `{launcher} {codex} --version` in a terminal to see \
-                 its reason.",
+                "`{launcher}` {did} the Codex app-server (exit {code}), so no reading was \
+                 taken. Run `{launcher} {codex} --version` in a terminal to see its reason.",
                 launcher = masked_launch::LAUNCHER,
-                code = masked_launch::REFUSED_EXIT,
                 codex = codex.display(),
             )))
         }
-        other => other,
+        (other, _) => other,
     }
 }
 
@@ -468,6 +475,15 @@ mod tests {
         assert!(text.contains("ai-masked /opt/real/codex --version"), "{text}");
         // Not one of the words `probe()` reads as an outage or a login fault.
         assert!(!text.contains("timed out") && !text.to_lowercase().contains("auth"), "{text}");
+
+        // The launcher's failed exec is named too, not left as a Codex fault.
+        for code in [126, 127] {
+            let text = explain_launcher_refusal(dead(), Some(code), codex, true)
+                .unwrap_err()
+                .to_string();
+            assert!(text.contains("`ai-masked` could not run the Codex app-server"), "{text}");
+            assert!(text.contains(&format!("(exit {code})")), "{text}");
+        }
 
         // Any other exit, a child that was killed, and a system without the
         // mask keep the original error.

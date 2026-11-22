@@ -18,10 +18,11 @@
 //! **It fails closed.** Where the mask applies and the launcher cannot be
 //! found, [`harness_launch`] returns an error and nothing is started. No
 //! caller may start the harness directly in its place. A launcher that is
-//! found can still start nothing (it refuses, or cannot run the harness);
-//! [`launcher_started_nothing`] reads that from the child's exit code.
+//! found can still start nothing: it refuses, it cannot run the harness, or a
+//! signal ends it before its exec. [`child_end`] says what the child's end
+//! shows, and only a status that is not the launcher's own shows a harness.
 //!
-//! macOS is unchanged until work order `ai-footing-mask-mac`:
+//! The launch on macOS is unchanged until work order `ai-footing-mask-mac`:
 //! [`masked_on_this_system`] is the one place that says which systems are
 //! masked.
 //!
@@ -111,24 +112,51 @@ pub fn spawn_failure(what: &str) -> String {
     }
 }
 
-/// Whether a child's exit code says the launcher started no harness: its
-/// refusal ([`REFUSED_EXIT`]) or a failed exec ([`EXEC_FAILED_EXITS`]). Always
-/// false on a system without the mask, where the child is the harness itself.
+/// What the end of a caller's child says about whether a harness ran.
 ///
-/// [`harness_launch`] finding the launcher does not mean a harness started, so
-/// a wrapper asks this after its child has finished. The codes are not
-/// reserved: a harness that itself exits with one of them after a real session
-/// reads the same. A caller may therefore use the answer only where a wrong
-/// "nothing started" errs in the safe direction: giving a no-save request
-/// back (the next session is then not saved either), or skipping work that is
-/// done again elsewhere.
-pub fn launcher_started_nothing(exit_code: Option<i32>) -> bool {
-    started_nothing(masked_on_this_system(), exit_code)
+/// [`harness_launch`] finding the launcher does not mean a harness started.
+/// On a masked system the child is the launcher until its exec succeeds, and
+/// only then the harness, in the same process. So the child's end is read
+/// three ways, and only the first says that a harness ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildEnd {
+    /// The child exited with a status that is not one of the launcher's own.
+    /// The launcher never exits that way, so the harness ran and this is its
+    /// status. Also every end on a system without the mask, where the child
+    /// is the harness from the start.
+    HarnessExited,
+    /// The child exited with one of the launcher's own codes: its refusal
+    /// ([`REFUSED_EXIT`]) or a failed exec ([`EXEC_FAILED_EXITS`]). The codes
+    /// are not reserved: a harness that itself exits with one of them after a
+    /// real session reads the same.
+    LauncherStartedNothing,
+    /// A signal ended the child. That does not say which program it ended:
+    /// the launcher before its exec (nothing ran), or the harness after it.
+    Signalled,
 }
 
-fn started_nothing(masked: bool, exit_code: Option<i32>) -> bool {
-    masked
-        && exit_code.is_some_and(|code| code == REFUSED_EXIT || EXEC_FAILED_EXITS.contains(&code))
+impl ChildEnd {
+    /// Read the child's exit code (`None` when a signal ended it) on a system
+    /// that is or is not masked.
+    pub fn of(masked: bool, exit_code: Option<i32>) -> Self {
+        match exit_code {
+            _ if !masked => Self::HarnessExited,
+            Some(code) if code == REFUSED_EXIT || EXEC_FAILED_EXITS.contains(&code) => {
+                Self::LauncherStartedNothing
+            }
+            Some(_) => Self::HarnessExited,
+            None => Self::Signalled,
+        }
+    }
+}
+
+/// [`ChildEnd::of`] for this system. Only [`ChildEnd::HarnessExited`] shows
+/// that a harness ran. After either of the others a caller must not act as if
+/// one did, unless it has evidence of its own (it saw that child's session):
+/// a no-save request is not used up, and no earlier session is taken for the
+/// one this start would have made.
+pub fn child_end(exit_code: Option<i32>) -> ChildEnd {
+    ChildEnd::of(masked_on_this_system(), exit_code)
 }
 
 /// The rule itself, with the system and the launcher lookup passed in so that
@@ -258,17 +286,31 @@ mod tests {
     }
 
     #[test]
-    fn only_the_launchers_own_codes_on_a_masked_system_mean_nothing_started() {
+    fn only_an_exit_that_is_not_the_launchers_own_shows_that_a_harness_ran() {
         for code in [113, 126, 127] {
-            assert!(started_nothing(true, Some(code)), "{code}");
-            // Without the mask the child is the harness: it ran.
-            assert!(!started_nothing(false, Some(code)), "{code}");
+            assert_eq!(ChildEnd::of(true, Some(code)), ChildEnd::LauncherStartedNothing, "{code}");
         }
-        // Any other exit, and a child ended by a signal, is a harness that ran.
-        for code in [Some(0), Some(1), Some(2), Some(130), Some(143), None] {
-            assert!(!started_nothing(true, code), "{code:?}");
+        for code in [0, 1, 2, 130, 143] {
+            assert_eq!(ChildEnd::of(true, Some(code)), ChildEnd::HarnessExited, "{code}");
         }
-        assert_eq!(launcher_started_nothing(Some(113)), cfg!(target_os = "linux"));
+        // A signal may have ended the launcher before its exec: it shows no
+        // harness. (Red control: reading it as `HarnessExited`, the rule
+        // before, fails here.)
+        assert_eq!(ChildEnd::of(true, None), ChildEnd::Signalled);
+        assert_ne!(ChildEnd::of(true, None), ChildEnd::HarnessExited);
+    }
+
+    #[test]
+    fn without_the_mask_the_child_is_the_harness_however_it_ends() {
+        for code in [Some(0), Some(1), Some(113), Some(126), Some(127), None] {
+            assert_eq!(ChildEnd::of(false, code), ChildEnd::HarnessExited, "{code:?}");
+        }
+        let here = if cfg!(target_os = "linux") {
+            ChildEnd::Signalled
+        } else {
+            ChildEnd::HarnessExited
+        };
+        assert_eq!(child_end(None), here);
     }
 
     #[test]

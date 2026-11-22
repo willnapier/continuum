@@ -20,13 +20,30 @@
 //!    value is dropped without being settled, so an error on the way to the
 //!    start gives the request back too.
 //!
-//! Every doubtful case errs towards not saving. A harness that itself exits
-//! with one of the launcher's "nothing started" codes after a real session
-//! gets its request back, and the next session is then not saved either
-//! (`masked_launch::launcher_started_nothing`). A wrapper that is killed
-//! leaves its reservation file behind; nothing reads it, and no other wrapper
-//! touches a reservation that is not its own.
+//! When the child has ended, the wrapper decides two things, and they are
+//! kept apart ([`AfterChild`]): whether the request was delivered, and whether
+//! there is a session of this start to work on. Only a child that exited with
+//! a status that is not one of the launcher's own shows that a harness ran
+//! (`masked_launch::ChildEnd`). After one of the launcher's codes, or a signal
+//! (which may have ended the launcher before its exec), the request is given
+//! back, and no post-session work is done, unless the wrapper itself saw a
+//! session of that child.
+//!
+//! While the wrapper lives, a doubtful end errs towards not saving. A harness
+//! that itself exits with one of the launcher's codes, or is ended by a
+//! signal, after a real session that the wrapper did not see, gets its
+//! request back, and the next session is then not saved either.
+//!
+//! One case is not covered. A wrapper that is itself killed between reserving
+//! and settling leaves its reservation file behind. If the harness had
+//! started, the request was delivered and nothing is lost. If it had not (the
+//! wrapper was killed in the moment before the launcher's exec), the request
+//! is lost, as it was when the marker was deleted first. No other wrapper
+//! touches a reservation that is not its own, because it cannot tell those
+//! two cases apart, and taking the request up again would leave a later
+//! session unsaved that was meant to be saved.
 
+use crate::masked_launch::ChildEnd;
 use std::path::{Path, PathBuf};
 
 /// The marker's name in the home folder.
@@ -101,12 +118,12 @@ impl Drop for NoSaveRequest {
     }
 }
 
-/// Settle a wrapper's request once its child has finished: used up when the
-/// harness started, given back when it did not. Returns whether it was given
+/// Settle a wrapper's request once its child has finished: used up when it
+/// was delivered, given back when it was not. Returns whether it was given
 /// back. Call it before `std::process::exit`, which runs no destructors.
-pub fn settle(request: Option<NoSaveRequest>, harness_started: bool) -> bool {
+pub fn settle(request: Option<NoSaveRequest>, delivered: bool) -> bool {
     match request {
-        Some(request) if harness_started => {
+        Some(request) if delivered => {
             request.delivered();
             false
         }
@@ -118,18 +135,65 @@ pub fn settle(request: Option<NoSaveRequest>, harness_started: bool) -> bool {
     }
 }
 
-/// [`settle`] for a wrapper whose child has just finished with `exit_code`.
-/// Whether the harness started is read from the code
-/// (`masked_launch::launcher_started_nothing`): on Linux the mask launcher's
-/// refusal (113) and its failed exec (126, 127) mean nothing was started, and
-/// the request is given back. Returns whether the harness started. A wrapper
-/// that gets `false` has no session of its own to import, delete or log.
-pub fn settle_at_exit(request: Option<NoSaveRequest>, exit_code: Option<i32>) -> bool {
-    let started = !crate::masked_launch::launcher_started_nothing(exit_code);
-    if settle(request, started) {
-        eprintln!("↩ Nothing was started, so the no-save request is kept for the next start");
+/// What a wrapper may do once its child has ended. Two separate answers: being
+/// allowed to give a no-save request back is not proof that no session
+/// exists, and neither answer is derived from the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AfterChild {
+    /// The no-save request reached a session and is used up. When false it is
+    /// given back, which costs at most one more unsaved session.
+    pub request_delivered: bool,
+    /// There is a session of this start for the wrapper to import, delete or
+    /// log. When false the wrapper does no post-session work at all: any
+    /// session it could name would be an earlier one, or another start's.
+    pub session_of_this_start: bool,
+}
+
+impl AfterChild {
+    /// `session_seen`: the wrapper has evidence of its own that this child
+    /// ran a session (it saw the child's transcript, or its output).
+    ///
+    /// | child's end | request | post-session work |
+    /// |---|---|---|
+    /// | exited, not a launcher code | delivered | yes |
+    /// | launcher code (113, 126, 127) | given back | only if a session was seen |
+    /// | signal | delivered only if a session was seen | only if a session was seen |
+    ///
+    /// A launcher code gives the request back even when a session was seen:
+    /// the codes are not reserved, and a real harness that exits with one is
+    /// treated as the launcher would be, towards not saving.
+    pub fn of(end: ChildEnd, session_seen: bool) -> Self {
+        Self {
+            request_delivered: match end {
+                ChildEnd::HarnessExited => true,
+                ChildEnd::Signalled => session_seen,
+                ChildEnd::LauncherStartedNothing => false,
+            },
+            session_of_this_start: end == ChildEnd::HarnessExited || session_seen,
+        }
     }
-    started
+}
+
+/// [`settle`] for a wrapper whose child has just ended with `exit_code`
+/// (`None` when a signal ended it), by the rule in [`AfterChild::of`]. The
+/// wrapper must then do its post-session work only when
+/// `session_of_this_start` is true.
+pub fn settle_at_exit(
+    request: Option<NoSaveRequest>,
+    exit_code: Option<i32>,
+    session_seen: bool,
+) -> AfterChild {
+    let end = crate::masked_launch::child_end(exit_code);
+    let after = AfterChild::of(end, session_seen);
+    if settle(request, after.request_delivered) {
+        match end {
+            ChildEnd::Signalled => eprintln!(
+                "↩ The start was ended by a signal and no session was seen, so the no-save request is kept for the next start"
+            ),
+            _ => eprintln!("↩ Nothing was started, so the no-save request is kept for the next start"),
+        }
+    }
+    after
 }
 
 #[cfg(test)]
@@ -151,6 +215,25 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn only_a_harness_exit_or_a_seen_session_uses_the_request_up_or_allows_work() {
+        let after = |end, seen| {
+            let after = AfterChild::of(end, seen);
+            (after.request_delivered, after.session_of_this_start)
+        };
+        // A harness that exited: delivered, and its session is worked on.
+        assert_eq!(after(ChildEnd::HarnessExited, false), (true, true));
+        assert_eq!(after(ChildEnd::HarnessExited, true), (true, true));
+        // A launcher code: given back even with a session seen; work only
+        // with a session seen.
+        assert_eq!(after(ChildEnd::LauncherStartedNothing, false), (false, false));
+        assert_eq!(after(ChildEnd::LauncherStartedNothing, true), (false, true));
+        // A signal shows nothing by itself (the launcher may have been ended
+        // before its exec): given back and no work, unless a session was seen.
+        assert_eq!(after(ChildEnd::Signalled, false), (false, false));
+        assert_eq!(after(ChildEnd::Signalled, true), (true, true));
     }
 
     #[test]
