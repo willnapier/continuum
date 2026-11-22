@@ -11,6 +11,12 @@
 
 pub mod discover;
 pub mod envelope;
+/// How a probe starts a harness: through the mask launcher `ai-masked` on
+/// Linux (`~/Assistants/shared/AI-FOOTING-MASK.md`). The same source file as
+/// `continuum_core::masked_launch`, compiled here as well because this crate
+/// does not depend on `continuum-core`; the file uses only `std`.
+#[path = "../../continuum-core/src/masked_launch.rs"]
+pub mod masked_launch;
 pub mod notify;
 pub mod policy;
 pub mod render;
