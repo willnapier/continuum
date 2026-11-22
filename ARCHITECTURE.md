@@ -146,10 +146,29 @@ was killed would have deleted the newest earlier transcript, which that start
 never ran.
 
 "The wrapper saw a session" is evidence of the wrapper's own, tied to its
-child. `continuum-claude` has it when it saw that child hold a transcript open
-(interactive mode; this needs `lsof`) or when the child printed a session
-event (print mode). `continuum-codex`, `continuum-gemini` and `continuum-goose`
-have none: they only know the newest session, which may be another start's.
+child's PID. In interactive mode `continuum-claude` looks while the child
+runs, in two places. The first is Claude Code's record of itself,
+`~/.claude/sessions/<pid>.json`, which names the session that process is
+running; it counts only if it was written after the child was spawned and
+names that PID. Claude Code appends to its transcript and closes it again, so
+this record is what identifies a session in practice. The second is a
+transcript the child holds open, read from `/proc/<pid>/fd` on Linux (`lsof` is
+asked only where there is no `/proc`). In print mode the evidence is a session
+event on the child's output. `continuum-codex`, `continuum-gemini` and
+`continuum-goose` have none: they only know the newest session, which may be
+another start's.
+
+**A no-save session stays out of Continuum whatever the wrapper sees.** The
+wrapper starts the harness with `CONTINUUM_NOSAVE=1`. The harness's
+SessionStart and Stop hooks (`continuum import --hook`) then enter that
+session's id in the no-save registry
+(`~/.local/share/continuum/nosave-sessions/`), and every importer, the
+5-minute sync included, consults the registry before it reads a transcript
+(`continuum-core/src/import.rs`). So a no-save session that a signal ended,
+and that the wrapper did not see, is still refused by the later sync; what
+the wrapper then leaves undone is deleting Claude Code's own transcript. When
+the wrapper did see the session, it enters it in the registry itself and
+deletes the transcript, as at any no-save exit.
 
 Two consequences are accepted, both towards not saving. The launcher's codes
 are not reserved, and a signal can end a real harness: a harness that ends in
@@ -161,9 +180,9 @@ ended is not imported.
 
 One case is not covered. A wrapper that is itself killed between reserving
 and settling leaves its reservation file behind. If the harness had started,
-the request was delivered. If it had not (the wrapper was killed in the moment
-before the launcher's exec), the request is lost, as it was when the marker
-was deleted first. No wrapper touches a reservation that is not its own.
+the request was delivered. If it had not (the wrapper was killed before the
+launcher's exec), the request is lost, as it was when the marker was deleted
+first. No wrapper touches a reservation that is not its own.
 
 **Continuum owns the real Codex CLI.** It installs Codex off `PATH`, under
 `~/.local/share/continuum/codex/`. `continuum codex update` updates that copy,
