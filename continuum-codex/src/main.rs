@@ -108,8 +108,12 @@ fn main() -> Result<()> {
     // the newest session file, which may be another Codex's), so it passes
     // none. After a launcher code or a signal there is then nothing to import
     // or discard here: the newest session file below would be some other
-    // session's. A real Codex session that ended that way is still recorded
-    // by the hooks and the timer.
+    // session's. A real Codex session that ended that way is recorded by its
+    // own hooks, which also register it as no-save when it was started so.
+    // If those hooks did not run (a hook that failed or is not trusted yet),
+    // the no-save backstop below does not run either, and the timer may later
+    // store a no-save session that ended this way. That is a known limit, not
+    // a guarantee of this wrapper.
     let after = nosave_request::settle_at_exit(nosave, status.code(), false);
     if !after.session_of_this_start {
         std::process::exit(status.code().unwrap_or(1));
