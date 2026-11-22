@@ -30,7 +30,8 @@ claude        # Start Claude Code - won't be saved
      `~/.continuum-nosave.reserved-<PID>` while the assistant runs, and removed
      when it exits)
    - Runs normally but doesn't save to `~/continuum-logs/`
-   - If the assistant could not be started at all, puts the marker back, so
+   - If the assistant could not be started, or ended in a way that does not
+     show it ran (a signal, with no session seen), puts the marker back, so
      the next start is still not saved (see "Wrap" in `ARCHITECTURE.md`)
 
 ### Use Cases
@@ -238,7 +239,7 @@ Use review mode (`r`) when:
 - **Created by**: `nosave` command
 - **Consumed by**: First assistant that starts after marker is created
 - **Taken**: when detected, by renaming it to `~/.continuum-nosave.reserved-<PID>` (single-use)
-- **Removed**: when that assistant exits; **put back** if it could not be started
+- **Removed**: when that assistant exits; **put back** if it could not be started, or ended without showing that it ran
 
 ### Session Directory Structure
 

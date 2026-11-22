@@ -158,25 +158,39 @@ event on the child's output. `continuum-codex`, `continuum-gemini` and
 `continuum-goose` have none: they only know the newest session, which may be
 another start's.
 
-**A no-save session stays out of Continuum whatever the wrapper sees.** The
-wrapper starts the harness with `CONTINUUM_NOSAVE=1`. The harness's
-SessionStart and Stop hooks (`continuum import --hook`) then enter that
-session's id in the no-save registry
-(`~/.local/share/continuum/nosave-sessions/`), and every importer, the
-5-minute sync included, consults the registry before it reads a transcript
-(`continuum-core/src/import.rs`). So a no-save session that a signal ended,
-and that the wrapper did not see, is still refused by the later sync; what
-the wrapper then leaves undone is deleting Claude Code's own transcript. When
-the wrapper did see the session, it enters it in the registry itself and
-deletes the transcript, as at any no-save exit.
+**What keeps a no-save session out of Continuum when the wrapper did not see
+it.** Every importer, the timers included, consults the no-save registry
+(`~/.local/share/continuum/nosave-sessions/`) before it reads a transcript
+(`continuum-core/src/import.rs`). Who enters the session there differs:
+
+- **Claude Code.** The wrapper starts it with `CONTINUUM_NOSAVE=1`, and its
+  SessionStart and Stop hooks (`continuum import --hook`) enter the session's
+  id. So a no-save session that a signal ended, and that the wrapper did not
+  see, is refused by the later sync; what the wrapper leaves undone is
+  deleting Claude Code's own transcript. When the wrapper did see the session,
+  it enters it itself and deletes the transcript, as at any no-save exit.
+- **Codex.** Its hooks do the same, but Codex runs a hook only once it is
+  trusted on that machine, and `continuum-codex` cannot tell which session was
+  its own. So when a no-save start ends by a signal or with one of the
+  launcher's codes, the wrapper enters every rollout made since it started.
+  It deletes nothing and leaves alone every rollout that was there before.
+  The cost: another Codex session that began in that time is entered too and
+  is not saved from then on. Not covered: a no-save `codex resume`, which
+  writes on in a rollout that was there before, and so still relies on its
+  hooks.
+- **Gemini and Goose.** No hook or timer imports their sessions: only their
+  own wrapper does, at exit. So a session the wrapper does not import is not
+  put in Continuum later, and there is no importer for a registry entry to
+  stop. (`continuum import -a goose`, run by hand, imports the newest Goose
+  session and does not consult the registry.)
 
 Two consequences are accepted, both towards not saving. The launcher's codes
 are not reserved, and a signal can end a real harness: a harness that ends in
 one of those ways after a real session the wrapper did not see gets its
 request back, and the next session is then not saved either. The wrapper also
-does no work at exit for that session; the hooks and timers still record a
-Claude Code or Codex session, but a Gemini or Goose session that a signal
-ended is not imported.
+does no import at exit for that session. A Claude Code or Codex session that
+was not no-save is still recorded by its hooks and the timers; a Gemini or
+Goose session that a signal ended is not imported.
 
 One case is not covered. A wrapper that is itself killed between reserving
 and settling leaves its reservation file behind. If the harness had started,
