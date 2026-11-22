@@ -12,14 +12,15 @@
 //! `primary`/`secondary` slot — Pro Lite puts the week in `primary`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use color_eyre::{
-    eyre::{bail, Context, ContextCompat},
+    eyre::{bail, eyre, Context, ContextCompat},
     Result,
 };
+use continuum_usage_core::masked_launch;
 use continuum_usage_core::envelope::{
     Facets, FailureKind, KindHint, Measure, MeterScope, Monetary, Observation, Outcome, Resource,
     SideEffect,
@@ -236,13 +237,21 @@ fn probe() -> Observation {
 
 fn read_codex_rate_limits() -> Result<Value> {
     let codex = continuum_core::codex_cli::resolve_codex(None)?.path;
-    let mut child = Command::new(codex)
+    // On Linux through the mask launcher, `ai-masked <codex> app-server`;
+    // directly elsewhere (`continuum_usage_core::masked_launch`,
+    // ~/Assistants/shared/AI-FOOTING-MASK.md). It matters most here: a
+    // `codex app-server` outside the mask makes the launcher refuse every
+    // other Codex start while it lives, and is a red health finding. The
+    // launcher becomes Codex by exec, so the pipes and the kill below reach
+    // Codex itself. A missing launcher is the error, never a direct start.
+    let mut child = masked_launch::harness_command(&codex)
+        .map_err(|reason| eyre!(reason))?
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start Codex app-server usage probe")?;
+        .with_context(|| masked_launch::spawn_failure("the Codex app-server usage probe"))?;
     let mut stdin = child
         .stdin
         .take()
@@ -260,13 +269,6 @@ fn read_codex_rate_limits() -> Result<Value> {
         }
     });
 
-    writeln!(
-        stdin,
-        "{}",
-        json!({"method":"initialize","id":0,"params":{"clientInfo":{"name":"usage_probe_codex","title":"Continuum Usage Probe: Codex","version":VERSION}}})
-    )?;
-    stdin.flush()?;
-
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let recv_until = |rx: &mpsc::Receiver<std::io::Result<String>>, what: &str| -> Result<String> {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -283,6 +285,14 @@ fn read_codex_rate_limits() -> Result<Value> {
     };
 
     let result = (|| -> Result<Value> {
+        // Inside the closure, so a child that has already gone (a launcher
+        // refusal closes the pipe at once) is still reaped and explained below.
+        writeln!(
+            stdin,
+            "{}",
+            json!({"method":"initialize","id":0,"params":{"clientInfo":{"name":"usage_probe_codex","title":"Continuum Usage Probe: Codex","version":VERSION}}})
+        )?;
+        stdin.flush()?;
         loop {
             let line = recv_until(&rx, "initializing Codex usage probe")?;
             // A banner, an update notice or an ANSI progress line is not a
@@ -322,8 +332,38 @@ fn read_codex_rate_limits() -> Result<Value> {
         }
     })();
     let _ = child.kill();
-    let _ = child.wait();
-    result
+    let exit_code = child.wait().ok().and_then(|status| status.code());
+    explain_launcher_refusal(
+        result,
+        exit_code,
+        &codex,
+        masked_launch::masked_on_this_system(),
+    )
+}
+
+/// When the mask launcher refused to start anything, say so. Its own reason
+/// went to stderr, which this probe does not keep, and what is left ("exited
+/// without responding", or a broken pipe) reads as a fault in Codex. Only an
+/// error on a masked system with the launcher's refusal code is reworded.
+fn explain_launcher_refusal(
+    result: Result<Value>,
+    exit_code: Option<i32>,
+    codex: &std::path::Path,
+    masked: bool,
+) -> Result<Value> {
+    match result {
+        Err(error) if masked && exit_code == Some(masked_launch::REFUSED_EXIT) => {
+            Err(error.wrap_err(format!(
+                "`{launcher}` refused to start the Codex app-server (exit {code}), so no \
+                 reading was taken. Run `{launcher} {codex} --version` in a terminal to see \
+                 its reason.",
+                launcher = masked_launch::LAUNCHER,
+                code = masked_launch::REFUSED_EXIT,
+                codex = codex.display(),
+            )))
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +455,29 @@ mod tests {
         let ok = window(&fraction, "primary", "p", true).unwrap();
         assert!(ok.facets.utilization.unwrap() < 0.01);
         assert_eq!(ok.label, "Session (5 hours)");
+    }
+
+    #[test]
+    fn a_launcher_refusal_is_named_and_nothing_else_is_reworded() {
+        let codex = std::path::Path::new("/opt/real/codex");
+        let dead = || -> Result<Value> { bail!("Codex app-server exited without responding") };
+
+        let refused = explain_launcher_refusal(dead(), Some(113), codex, true).unwrap_err();
+        let text = refused.to_string();
+        assert!(text.contains("`ai-masked` refused to start"), "{text}");
+        assert!(text.contains("ai-masked /opt/real/codex --version"), "{text}");
+        // Not one of the words `probe()` reads as an outage or a login fault.
+        assert!(!text.contains("timed out") && !text.to_lowercase().contains("auth"), "{text}");
+
+        // Any other exit, a child that was killed, and a system without the
+        // mask keep the original error.
+        for (code, masked) in [(Some(1), true), (None, true), (Some(113), false)] {
+            let kept = explain_launcher_refusal(dead(), code, codex, masked).unwrap_err();
+            assert_eq!(kept.to_string(), "Codex app-server exited without responding");
+        }
+        // A reading that arrived is never turned into an error.
+        let reading = explain_launcher_refusal(Ok(snapshot()), Some(113), codex, true);
+        assert_eq!(reading.unwrap(), snapshot());
     }
 
     #[test]

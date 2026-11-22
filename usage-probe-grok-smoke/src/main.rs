@@ -42,11 +42,12 @@
 //! cent comes from the wallet instead.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use continuum_core::adapters::grok_cli::{is_smoke_cwd, SMOKE_CWD_NAME};
 use continuum_usage_core::envelope::{FailureKind, Observation, Outcome};
+use continuum_usage_core::masked_launch;
 use continuum_usage_core::smoke::{
     self, kind_for, tail, Run, SmokeProbe, Verdict, PROMPT, REQUEST_TIMEOUT,
 };
@@ -118,7 +119,9 @@ fn probe() -> Observation {
 fn run_grok(grok: &Path) -> Result<Run, String> {
     let workdir = std::env::temp_dir().join(SMOKE_CWD_NAME);
     std::fs::create_dir_all(&workdir).map_err(|e| format!("scratch dir: {e}"))?;
-    let mut cmd = Command::new(grok);
+    // Through the mask launcher on Linux (`ai-masked <grok> …`), directly
+    // elsewhere; a missing launcher is the error, never a direct start.
+    let mut cmd = masked_launch::harness_command(grok)?;
     cmd.args(["-p", PROMPT, "--verbatim", "--output-format", "json", "--cwd"])
         .arg(&workdir)
         .args([
