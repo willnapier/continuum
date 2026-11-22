@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use color_eyre::{eyre::Context, Result};
+use continuum_core::masked_launch::{self, Launch};
 use continuum_core::{PlainTextWriter, NoiseFilter};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -21,12 +22,31 @@ use tokio::process::Command;
 /// in its own environment (13 Nov 2026: twelve sessions came back on the key).
 /// The same happens with `zellij action new-tab -- continuum-claude` and with
 /// the bash alias. cc-clinical runs its pinned binary, not this wrapper, so no
-/// launch through here needs the key.
+/// launch through here needs the key. On Linux the mask launcher drops it as
+/// well; it is still removed here, so macOS and a launcher that changes later
+/// are covered.
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-/// The command that runs Claude Code, for both modes.
-fn claude_command(program: &str, skip_saving: bool) -> Command {
-    let mut command = Command::new(program);
+/// How Claude Code is started, for both modes: on Linux through the mask
+/// launcher, `ai-masked <program> …`, which hides the protected folders and
+/// then becomes Claude Code in the same process; on macOS directly, as before.
+/// The rule and its reasons are in `continuum_core::masked_launch` and
+/// `~/Assistants/shared/AI-FOOTING-MASK.md`. The Nushell `claude` function
+/// starts this wrapper through the launcher too, but Zellij's session
+/// resurrection and other callers run `continuum-claude …` directly.
+///
+/// An error means the launcher was not found. Claude Code is then not started
+/// at all: there is no direct start to fall back to. Call this before the
+/// no-save marker is consumed, so a refused start does not use it up.
+fn claude_launch(program: &str) -> Result<Launch> {
+    masked_launch::harness_launch(program).map_err(|reason| color_eyre::eyre::eyre!(reason))
+}
+
+/// The command that runs Claude Code, for both modes. The caller adds the
+/// user's arguments.
+fn claude_command(launch: &Launch, skip_saving: bool) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.args(&launch.lead_args);
     command.env_remove(API_KEY_ENV);
     if skip_saving {
         // CONTINUUM_NOSAVE reaches the per-turn Stop hook (`continuum import
@@ -59,6 +79,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_with_logging(original_args: &[String]) -> Result<()> {
+    let launch = claude_launch("claude")?;
+
     // Check for no-save marker file
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
@@ -97,7 +119,7 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     };
 
     // Spawn claude process.
-    let mut child = claude_command("claude", skip_saving)
+    let mut child = claude_command(&launch, skip_saving)
         .args(&args)
         .stdin(if user_prompt.is_some() {
             Stdio::piped()
@@ -107,7 +129,7 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn claude process")?;
+        .with_context(|| masked_launch::spawn_failure("claude"))?;
 
     // If we captured stdin, write it to claude's stdin
     if let Some(ref prompt) = user_prompt {
@@ -363,6 +385,8 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
         claude_path_str
     };
 
+    let launch = claude_launch(&real_claude)?;
+
     // Check for no-save marker file
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
@@ -384,13 +408,15 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     // Identify *this* child's session while it runs (open jsonl / --resume id).
     // Do not use "newest jsonl after exit": two Claudes dying together used to
     // make every wrapper auto-log the same file (identical DayPage twins).
-    let mut child = claude_command(&real_claude, skip_saving)
+    // The mask launcher becomes Claude Code by exec, so the child's PID is
+    // still Claude Code's own.
+    let mut child = claude_command(&launch, skip_saving)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn claude process")?;
+        .with_context(|| masked_launch::spawn_failure("claude"))?;
 
     let child_pid = child.id();
     let watched = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
@@ -975,11 +1001,49 @@ enum Content {
 mod tests {
     use super::{
         claude_command, clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
-        session_id_is_safe, try_claim_autolog, API_KEY_ENV,
+        session_id_is_safe, try_claim_autolog, Launch, API_KEY_ENV,
     };
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    const LAUNCHER: &str = "/opt/bin/ai-masked";
+    const REAL_CLAUDE: &str = "/opt/real/claude";
+
+    /// The start on Linux, and the start elsewhere (and everywhere before the
+    /// mask).
+    fn masked() -> Launch {
+        Launch::through(Path::new(LAUNCHER), OsStr::new(REAL_CLAUDE))
+    }
+    fn direct() -> Launch {
+        Launch::direct(OsStr::new(REAL_CLAUDE))
+    }
+
+    /// Program then arguments, as the command would be run.
+    fn command_line(command: &tokio::process::Command) -> Vec<String> {
+        let std = command.as_std();
+        std::iter::once(std.get_program())
+            .chain(std.get_args())
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn on_linux_claude_starts_through_the_launcher_with_the_arguments_unchanged() {
+        let user_args = ["--resume", "ZZ99 session", "--model", "x"];
+        let masked_line = [LAUNCHER, REAL_CLAUDE, "--resume", "ZZ99 session", "--model", "x"];
+
+        let mut command = claude_command(&masked(), false);
+        command.args(user_args);
+        assert_eq!(command_line(&command), masked_line);
+
+        // Red control: the start as it was before the mask is not that line.
+        let mut old = claude_command(&direct(), false);
+        old.args(user_args);
+        assert_ne!(command_line(&old), masked_line);
+        // It is the unchanged direct start, which macOS keeps.
+        assert_eq!(command_line(&old), [REAL_CLAUDE, "--resume", "ZZ99 session", "--model", "x"]);
+    }
 
     /// What the command does with `key`: None if it leaves it inherited,
     /// Some(None) if it removes it, Some(Some(v)) if it sets it to v.
@@ -993,21 +1057,26 @@ mod tests {
 
     #[test]
     fn api_key_never_reaches_claude() {
-        for skip_saving in [false, true] {
-            let command = claude_command("claude", skip_saving);
-            assert_eq!(
-                env_action(&command, API_KEY_ENV),
-                Some(None),
-                "the API key must be removed from claude's environment (skip_saving={skip_saving})"
-            );
+        for launch in [masked(), direct()] {
+            for skip_saving in [false, true] {
+                let command = claude_command(&launch, skip_saving);
+                assert_eq!(
+                    env_action(&command, API_KEY_ENV),
+                    Some(None),
+                    "the API key must be removed from claude's environment \
+                     (skip_saving={skip_saving}, {launch:?})"
+                );
+            }
         }
     }
 
     #[test]
     fn nosave_marker_still_reaches_claude() {
         let nosave = continuum_core::import::NOSAVE_ENV;
-        assert_eq!(env_action(&claude_command("claude", true), nosave), Some(Some("1".into())));
-        assert_eq!(env_action(&claude_command("claude", false), nosave), None);
+        for launch in [masked(), direct()] {
+            assert_eq!(env_action(&claude_command(&launch, true), nosave), Some(Some("1".into())));
+            assert_eq!(env_action(&claude_command(&launch, false), nosave), None);
+        }
     }
 
     #[test]

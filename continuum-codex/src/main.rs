@@ -51,6 +51,17 @@ fn main() -> Result<()> {
     }
     let real_codex = resolution.path.to_string_lossy().into_owned();
 
+    // On Linux Codex starts through the mask launcher, `ai-masked <codex> …`,
+    // which hides the protected folders and then becomes Codex in the same
+    // process; on macOS it starts directly, as before
+    // (`continuum_core::masked_launch`, ~/Assistants/shared/AI-FOOTING-MASK.md).
+    // A missing launcher is an error here, before the no-save marker is
+    // consumed: there is no direct start to fall back to. The resolver above
+    // is unaffected: it has already chosen the real Codex by path, and the
+    // depth guard below still reaches Codex through the launcher.
+    let launch = continuum_core::masked_launch::harness_launch(&real_codex)
+        .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
+
     // Check for no-save marker file
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
@@ -68,7 +79,7 @@ fn main() -> Result<()> {
     let before_session = find_latest_session_file(&sessions_dir);
 
     // Spawn codex as a child process
-    let mut command = Command::new(&real_codex);
+    let mut command = launch.command();
     configure_clipboard(&mut command);
     if skip_saving {
         // Seen by the per-turn Stop hook through codex's environment.
@@ -81,7 +92,7 @@ fn main() -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn codex process")?;
+        .with_context(|| continuum_core::masked_launch::spawn_failure("codex"))?;
     let status = child.wait()?;
 
     // After codex exits, find the session that was just modified

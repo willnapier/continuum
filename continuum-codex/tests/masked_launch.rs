@@ -1,0 +1,43 @@
+//! `continuum-codex` run as a real process: on Linux it starts Codex through
+//! `ai-masked`, and without the launcher it starts nothing
+//! (`~/Assistants/shared/AI-FOOTING-MASK.md`). Stand-in programs only; see
+//! the fixture.
+#![cfg(target_os = "linux")]
+
+#[path = "../../continuum-core/tests/support/masked_fixture.rs"]
+mod masked_fixture;
+
+use masked_fixture::{said, Scratch};
+
+const WRAPPER: &str = env!("CARGO_BIN_EXE_continuum-codex");
+
+#[test]
+fn codex_starts_through_the_launcher_with_the_depth_guard_set() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-wrapper");
+    scratch.stand_in_launcher();
+    // Found on the scratch PATH by the shared resolver, as a real Codex is.
+    let codex = scratch.harness("codex", "exit 7");
+    let args = ["resume", "ZZ99", "--no-alt-screen"];
+
+    let output = scratch.command(WRAPPER).args(args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(7), "codex's exit code comes back\n{}", said(&output));
+    assert_eq!(scratch.log(), Scratch::masked_log(&codex, "codex", &args, "unset", "1"));
+}
+
+#[test]
+fn without_the_launcher_codex_is_not_started() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-wrapper-refuse");
+    scratch.harness("codex", "exit 0");
+    let marker = scratch.home.join(".continuum-nosave");
+    std::fs::write(&marker, b"").unwrap();
+
+    let output = scratch.command(WRAPPER).args(["resume", "ZZ99"]).output().unwrap();
+
+    assert!(!output.status.success(), "a missing launcher is a failure\n{}", said(&output));
+    assert_eq!(scratch.log(), Vec::<String>::new(), "codex must not be started directly");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only through `ai-masked`"), "{stderr}");
+    assert!(stderr.contains("rust-redeploy --only ai-masked"), "{stderr}");
+    assert!(marker.exists(), "a refused start must not use up the no-save marker");
+}
