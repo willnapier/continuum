@@ -267,6 +267,110 @@ fn a_signalled_no_save_session_is_cleaned_up_and_a_later_import_refuses_it() {
     assert!(logs.join("claude-code").exists());
 }
 
+/// The real `continuum` binary, built from this tree. Cargo builds only this
+/// package's own binaries for its tests, and `continuum` belongs to another
+/// package, so it is built here, into the same target folder (found from the
+/// wrapper's own path), with a time limit.
+fn continuum_binary() -> std::path::PathBuf {
+    let profile_dir = Path::new(WRAPPER).parent().unwrap();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = std::process::Command::new(cargo);
+    build.args(["build", "-p", "continuum", "--bin", "continuum"]).current_dir(env!("CARGO_MANIFEST_DIR"));
+    if profile_dir.file_name().is_some_and(|name| name == "release") {
+        build.arg("--release");
+    }
+    let mut child = build.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("building `continuum` did not finish in time");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert!(status.success(), "building `continuum` failed");
+    let binary = profile_dir.join("continuum");
+    assert!(binary.is_file(), "no `continuum` binary at {}", binary.display());
+    binary
+}
+
+/// The session's own no-save protection does not depend on the wrapper seeing
+/// anything. Here the wrapper sees nothing: Claude Code writes no record of
+/// itself, holds no transcript open, and a signal ends it. But it was started
+/// with `CONTINUUM_NOSAVE=1`, and its SessionStart and Stop hooks ran, as
+/// Claude Code runs them: the real `continuum import -a claude-code --hook`
+/// with the hook's JSON on stdin. The hook enters the session in the no-save
+/// registry. A plain import of the transcript afterwards (what the 5-minute
+/// sync does) is refused, and nothing of the session is in Continuum. The
+/// same transcript under another session's id, with no no-save start, is
+/// stored. (Red control: with the hook's registration skipped, the session is
+/// stored.)
+#[test]
+fn an_unseen_no_save_session_is_kept_out_of_a_later_import_by_the_hook() {
+    const UNSEEN_ID: &str = "zz99-unseen-session";
+    let Some(scratch) = scratch("cc-nosave-unseen-hook") else { return };
+    let continuum = continuum_binary();
+    let project = scratch.home.join(".claude/projects/zz99-project");
+    std::fs::create_dir_all(&project).unwrap();
+    // The registry of clinical sessions must exist for any import to run.
+    std::fs::create_dir_all(scratch.home.join(".local/share/continuum/claude-clinical-sessions")).unwrap();
+    let live = project.join(format!("{UNSEEN_ID}.jsonl"));
+    let answer = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"zz99 answer"}]},"timestamp":"2026-10-06T21:00:01.000Z"}"#;
+    let hook = |event: &str| {
+        format!(
+            "printf '%s' '{{\"session_id\":\"{UNSEEN_ID}\",\"transcript_path\":\"{live}\",\"hook_event_name\":\"{event}\",\"source\":\"startup\"}}' | '{continuum}' import -a claude-code --hook",
+            live = live.display(),
+            continuum = continuum.display(),
+        )
+    };
+    // Transcript lines are written by a child of the harness, so the harness
+    // itself never has the transcript open, not even for a moment.
+    let then = format!(
+        "{start}\n( printf '%s\\n' '{LIVE_LINE}' >> '{live}' )\n( printf '%s\\n' '{answer}' >> '{live}' )\n{stop}\n{signal}",
+        start = hook("SessionStart"),
+        stop = hook("Stop"),
+        live = live.display(),
+        signal = masked_fixture::SIGNAL_SELF,
+    );
+    scratch.stand_in_launcher();
+    scratch.harness("claude", &then);
+    scratch.request_no_save();
+
+    let output = scratch.command(WRAPPER).args(["--model", "zz99"]).output().unwrap();
+
+    // The wrapper saw nothing: the request is given back and the transcript
+    // is left as Claude Code wrote it.
+    assert_eq!(output.status.code(), Some(1), "{}", said(&output));
+    assert_eq!(scratch.nosave_seen(), ["nosave:1"], "{}", said(&output));
+    assert_eq!(scratch.nosave_state(), masked_fixture::REQUEST_KEPT, "{}", said(&output));
+    assert_eq!(std::fs::read_to_string(&live).unwrap(), format!("{LIVE_LINE}\n{answer}\n"), "{}", said(&output));
+    // The hook entered the session in the registry.
+    assert!(no_save_registry(&scratch).join(UNSEEN_ID).exists(), "{}", said(&output));
+
+    // Later: a plain import of that transcript, with no no-save environment.
+    let logs = scratch.home.join("Assistants/continuum-logs");
+    let import = |transcript: &Path| {
+        scratch.command(continuum.to_str().unwrap()).args(["import", "-a", "claude-code", "-s"]).arg(transcript).output().unwrap()
+    };
+    let later = import(&live);
+    assert!(later.status.success(), "{}", said(&later));
+    assert!(String::from_utf8_lossy(&later.stderr).contains("marked no-save; not imported"), "{}", said(&later));
+    assert!(!logs.join("claude-code").exists(), "nothing of the session is in Continuum\n{}", said(&later));
+
+    // The control: the same transcript as another session, never no-save.
+    let other = project.join("zz99-other-session.jsonl");
+    std::fs::copy(&live, &other).unwrap();
+    let stored = import(&other);
+    assert!(stored.status.success(), "{}", said(&stored));
+    assert!(String::from_utf8_lossy(&stored.stdout).contains("Imported"), "{}", said(&stored));
+    let days: Vec<_> = std::fs::read_dir(logs.join("claude-code")).unwrap().flatten().map(|day| day.path()).collect();
+    assert!(days.iter().any(|day| day.join("zz99-other-session").is_dir()), "the other session is stored: {days:?}");
+    assert!(!days.iter().any(|day| day.join(UNSEEN_ID).exists()), "the no-save session is not: {days:?}");
+}
+
 /// The control in print mode: Claude Code printed a session event, and a
 /// signal then ended it. The request was delivered and is used up.
 #[test]
