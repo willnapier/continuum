@@ -84,6 +84,9 @@ fn main() -> Result<()> {
     let sessions_dir = std::path::PathBuf::from(&home).join(".codex/sessions");
 
     let before_session = find_latest_session_file(&sessions_dir);
+    // For a no-save start: every rollout that exists now. One that is not in
+    // this set afterwards was made after this point (see below).
+    let rollouts_before = skip_saving.then(|| rollout_files(&sessions_dir));
 
     // Spawn codex as a child process
     let mut command = launch.command();
@@ -108,14 +111,24 @@ fn main() -> Result<()> {
     // the newest session file, which may be another Codex's), so it passes
     // none. After a launcher code or a signal there is then nothing to import
     // or discard here: the newest session file below would be some other
-    // session's. A real Codex session that ended that way is recorded by its
-    // own hooks, which also register it as no-save when it was started so.
-    // If those hooks did not run (a hook that failed or is not trusted yet),
-    // the no-save backstop below does not run either, and the timer may later
-    // store a no-save session that ended this way. That is a known limit, not
-    // a guarantee of this wrapper.
+    // session's, and discarding it could delete a session that was meant to
+    // be kept.
+    //
+    // But a Codex may have run a no-save session before it ended that way,
+    // and its hooks may not have registered it (a hook that failed or is not
+    // trusted yet). The timer would then store it. So for a no-save start,
+    // every rollout made since the snapshot above is registered as no-save.
+    // Nothing is deleted, and no rollout that existed before is touched. The
+    // session of this start, if there was one, is among them, whichever it
+    // is. The cost: another Codex session that began between the snapshot and
+    // this child's end is registered too, and is not saved from then on. Not
+    // covered: a no-save `codex resume`, which writes on in a rollout that
+    // existed before; that still relies on its hooks.
     let after = nosave_request::settle_at_exit(nosave, status.code(), false);
     if !after.session_of_this_start {
+        if let Some(before) = &rollouts_before {
+            register_new_rollouts_as_no_save(&sessions_dir, before);
+        }
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -171,6 +184,45 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(status.code().unwrap_or(1))
+}
+
+/// Every Codex rollout under `sessions_dir` (`YYYY/MM/DD/rollout-*.jsonl`).
+fn rollout_files(sessions_dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut found = std::collections::HashSet::new();
+    let mut dirs = vec![sessions_dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_rollout = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+            if path.is_dir() {
+                dirs.push(path);
+            } else if is_rollout {
+                found.insert(path);
+            }
+        }
+    }
+    found
+}
+
+/// Register as no-save every rollout that is there now and was not in
+/// `before`: the backstop for a no-save start that ended without showing which
+/// session was its own. Stored copies and the rollouts themselves are left
+/// alone.
+fn register_new_rollouts_as_no_save(sessions_dir: &std::path::Path, before: &std::collections::HashSet<std::path::PathBuf>) {
+    let mut registered = 0;
+    for rollout in rollout_files(sessions_dir).difference(before) {
+        match register_only(rollout) {
+            Ok(_) => registered += 1,
+            Err(e) => eprintln!("⚠ Warning: could not mark {} no-save: {e}", rollout.display()),
+        }
+    }
+    if registered > 0 {
+        eprintln!("✗ Marked {registered} Codex session(s) begun during this no-save start as no-save");
+    }
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {
