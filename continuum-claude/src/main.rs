@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use color_eyre::{eyre::Context, Result};
 use continuum_core::masked_launch::{self, Launch};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 use continuum_core::{PlainTextWriter, NoiseFilter};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,8 +37,16 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// resurrection and other callers run `continuum-claude …` directly.
 ///
 /// An error means the launcher was not found. Claude Code is then not started
-/// at all: there is no direct start to fall back to. Call this before the
-/// no-save marker is consumed, so a refused start does not use it up.
+/// at all: there is no direct start to fall back to.
+///
+/// Finding the launcher does not mean Claude Code will start: the launcher
+/// may refuse (exit 113), or may not be runnable. A no-save request is
+/// therefore only reserved before the start (`NoSaveRequest::reserve`), never
+/// used up there. It is used up when Claude Code has run, and given back when
+/// the spawn fails or the child's exit code says nothing was started
+/// (`nosave_request::settle_at_exit`). A Claude Code that itself exits 113,
+/// 126 or 127 after a real session also gets its request back, so the next
+/// session is not saved either: the mistake is made in the safe direction.
 fn claude_launch(program: &str) -> Result<Launch> {
     masked_launch::harness_launch(program).map_err(|reason| color_eyre::eyre::eyre!(reason))
 }
@@ -81,14 +90,13 @@ async fn main() -> Result<()> {
 async fn run_with_logging(original_args: &[String]) -> Result<()> {
     let launch = claude_launch("claude")?;
 
-    // Check for no-save marker file
+    // Reserve the no-save request, if there is one. It is settled when the
+    // child has finished; an error return before then gives it back.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -135,9 +143,18 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     if let Some(ref prompt) = user_prompt {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.shutdown().await?;
+            // A child that has already gone has closed this pipe: a launcher
+            // that refused, for one. That is not this wrapper's error. Its
+            // stderr and exit code are passed on below and say why.
+            let sent = async {
+                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.shutdown().await
+            };
+            match sent.await {
+                Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => return Err(error.into()),
+                _ => {}
+            }
         }
     }
 
@@ -305,6 +322,10 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     // Wait for process to complete
     let status = child.wait().await?;
 
+    // Use the no-save request up, or give it back if nothing was started.
+    // Before the exit below, which runs no destructors.
+    nosave_request::settle_at_exit(nosave, status.code());
+
     // Session saved silently - no prompt needed
 
     std::process::exit(status.code().unwrap_or(1));
@@ -387,14 +408,13 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
 
     let launch = claude_launch(&real_claude)?;
 
-    // Check for no-save marker file
+    // Reserve the no-save request, if there is one. It is settled when the
+    // child has finished; an error return before then gives it back.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -442,6 +462,19 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = watch_handle.join();
     let watched_path = watched.lock().ok().and_then(|guard| guard.clone());
+
+    // Use the no-save request up, or give it back if nothing was started.
+    let started = nosave_request::settle_at_exit(nosave, status.code());
+    if !started && watched_path.is_none() {
+        // The launcher started nothing, and no transcript was seen open under
+        // this child: there is no session of this start to import, delete or
+        // log. Without this, `--resume <id>` or `--continue` would name an
+        // earlier session below, and a no-save start would delete its
+        // transcript although it never ran here. (If a transcript was seen,
+        // a Claude Code did run and then exited with one of the launcher's
+        // codes: the session is handled as usual.)
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     let after_session = resolve_wrapped_session(
         watched_path,

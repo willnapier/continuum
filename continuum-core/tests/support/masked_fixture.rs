@@ -83,13 +83,67 @@ impl Scratch {
         self.script(LAUNCHER, &body)
     }
 
+    /// A file with the launcher's name that cannot be run (no execute bit):
+    /// it is found, and the start then fails.
+    pub fn unrunnable_launcher(&self) -> PathBuf {
+        let path = self.stand_in_launcher();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        path
+    }
+
     /// A stand-in harness called `name` on the scratch `PATH`. It records its
     /// arguments, then two things the wrappers set in its environment, then
-    /// does `then` (sh).
+    /// (in a list of its own, see [`Self::nosave_seen`]) whether it was told
+    /// not to be saved, then does `then` (sh).
     pub fn harness(&self, name: &str, then: &str) -> PathBuf {
         let environment = "  printf '%s\\n' \"key:${ANTHROPIC_API_KEY-unset}\" \"depth:${CONTINUUM_CODEX_DEPTH-unset}\"\n";
-        let body = format!("{}\n{then}", self.record(&format!("harness:{name}"), environment));
+        let body = format!(
+            "{}\nprintf '%s\\n' \"nosave:${{CONTINUUM_NOSAVE-unset}}\" >> '{}'\n{then}",
+            self.record(&format!("harness:{name}"), environment),
+            self.seen().display()
+        );
         self.script(name, &body)
+    }
+
+    fn seen(&self) -> PathBuf {
+        self.root.join("nosave-seen.log")
+    }
+
+    /// One line per harness that ran: `nosave:1` when the wrapper told it the
+    /// session is not to be saved, `nosave:unset` otherwise. Empty when no
+    /// harness ran.
+    pub fn nosave_seen(&self) -> Vec<String> {
+        std::fs::read_to_string(self.seen())
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Put a no-save request in the scratch home, and beside it a reservation
+    /// that belongs to another wrapper process.
+    pub fn request_no_save(&self) {
+        std::fs::write(self.home.join(NOSAVE_MARKER), b"").unwrap();
+        self.leave_foreign_reservation();
+    }
+
+    /// A reservation held by another wrapper process (PID 1 is never the
+    /// wrapper under test). No wrapper may touch it.
+    pub fn leave_foreign_reservation(&self) {
+        std::fs::write(self.home.join(FOREIGN_RESERVATION), FOREIGN_CONTENT).unwrap();
+    }
+
+    /// The no-save files in the scratch home, sorted: the marker and any
+    /// reservation. Also checks the other wrapper's reservation is as left.
+    pub fn nosave_state(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(NOSAVE_MARKER))
+            .collect();
+        names.sort();
+        if let Ok(content) = std::fs::read(self.home.join(FOREIGN_RESERVATION)) {
+            assert_eq!(content, FOREIGN_CONTENT, "another wrapper's reservation was rewritten");
+        }
+        names
     }
 
     /// `exe` with nothing inherited: the scratch `PATH` and `HOME` only, and
@@ -140,6 +194,88 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// The no-save marker's name in the home folder.
+pub const NOSAVE_MARKER: &str = ".continuum-nosave";
+/// A reservation that belongs to another wrapper process.
+pub const FOREIGN_RESERVATION: &str = ".continuum-nosave.reserved-1";
+const FOREIGN_CONTENT: &[u8] = b"held by another wrapper";
+
+/// The no-save files after a start that reached no harness: the request is
+/// there again under the marker's name, and no reservation of the wrapper
+/// under test is left.
+pub const REQUEST_KEPT: [&str; 2] = [NOSAVE_MARKER, FOREIGN_RESERVATION];
+/// The no-save files after a start that reached a harness: the request is
+/// used up.
+pub const REQUEST_USED: [&str; 1] = [FOREIGN_RESERVATION];
+
+/// With a no-save request waiting, the launcher refuses (exit 113): the
+/// harness never runs, the wrapper exits 113, and the request is kept.
+pub fn a_refusing_launcher_keeps_the_request(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    args: &[&str],
+) {
+    scratch.refusing_launcher();
+    scratch.harness(harness, "exit 0");
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(113), "the launcher's refusal comes back\n{}", said(&output));
+    let log = scratch.log();
+    assert_eq!(log.first().map(String::as_str), Some("launcher-refused"), "{log:?}");
+    assert!(!log.iter().any(|line| line.starts_with("harness:")), "{harness} never ran: {log:?}");
+    assert_eq!(scratch.nosave_seen(), Vec::<String>::new());
+    assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must still be there\n{}", said(&output));
+}
+
+/// With a no-save request waiting, the launcher is found but cannot be run:
+/// the harness never runs, the wrapper fails, and the request is kept.
+pub fn an_unrunnable_launcher_keeps_the_request(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    args: &[&str],
+) {
+    scratch.unrunnable_launcher();
+    scratch.harness(harness, "exit 0");
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    assert!(!output.status.success(), "a launcher that cannot run is a failure\n{}", said(&output));
+    assert_eq!(scratch.log(), Vec::<String>::new(), "{harness} must not be started directly");
+    assert_eq!(scratch.nosave_seen(), Vec::<String>::new());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("through `ai-masked`"), "{}", said(&output));
+    assert_eq!(scratch.nosave_state(), REQUEST_KEPT, "the request must still be there\n{}", said(&output));
+}
+
+/// The control for the two cases above: with a no-save request waiting and a
+/// launcher that works, the harness runs, sees `seen` (`nosave:1` where the
+/// wrapper passes the request on in the environment), and the request is used
+/// up.
+pub fn a_started_session_uses_the_request_up(
+    scratch: &Scratch,
+    wrapper: &str,
+    harness: &str,
+    then: &str,
+    args: &[&str],
+    seen: &str,
+) {
+    scratch.stand_in_launcher();
+    scratch.harness(harness, then);
+    scratch.request_no_save();
+
+    let output = scratch.command(wrapper).args(args).output().unwrap();
+
+    let log = scratch.log();
+    assert_eq!(log.first().map(String::as_str), Some("launcher"), "{log:?}\n{}", said(&output));
+    assert!(log.iter().any(|line| line == &format!("harness:{harness}")), "{harness} ran: {log:?}");
+    assert_eq!(scratch.nosave_seen(), [seen], "{}", said(&output));
+    assert_eq!(scratch.nosave_state(), REQUEST_USED, "the request must be used up\n{}", said(&output));
 }
 
 /// stdout and stderr of a finished run, for assertion messages.

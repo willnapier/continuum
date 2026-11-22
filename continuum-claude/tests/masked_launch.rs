@@ -26,6 +26,86 @@ fn scratch(name: &str) -> Option<Scratch> {
     Some(scratch)
 }
 
+// The no-save request (`~/.continuum-nosave`) across a start that reaches no
+// Claude Code: it must still be there afterwards. Each mode has the two
+// failures and the control (a start that works uses the request up).
+
+const INTERACTIVE_ARGS: [&str; 2] = ["--resume", "ZZ99"];
+const PRINT_ARGS: [&str; 2] = ["--print", "hello ZZ99"];
+/// Print mode sends the prompt it read from stdin, so the stand-in reads it.
+const PRINT_REPLY: &str = "read -r line\nprintf '%s\\n' '{\"type\":\"other\"}'\nexit 0";
+
+#[test]
+fn interactive_a_refusing_launcher_keeps_the_no_save_request() {
+    let Some(scratch) = scratch("cc-nosave-refused-interactive") else { return };
+    masked_fixture::a_refusing_launcher_keeps_the_request(&scratch, WRAPPER, "claude", &INTERACTIVE_ARGS);
+}
+
+#[test]
+fn interactive_an_unrunnable_launcher_keeps_the_no_save_request() {
+    let Some(scratch) = scratch("cc-nosave-unrunnable-interactive") else { return };
+    masked_fixture::an_unrunnable_launcher_keeps_the_request(&scratch, WRAPPER, "claude", &INTERACTIVE_ARGS);
+}
+
+#[test]
+fn interactive_a_started_session_uses_the_no_save_request_up() {
+    let Some(scratch) = scratch("cc-nosave-started-interactive") else { return };
+    masked_fixture::a_started_session_uses_the_request_up(
+        &scratch, WRAPPER, "claude", "exit 0", &INTERACTIVE_ARGS, "nosave:1",
+    );
+}
+
+#[test]
+fn print_a_refusing_launcher_keeps_the_no_save_request() {
+    let Some(scratch) = scratch("cc-nosave-refused-print") else { return };
+    masked_fixture::a_refusing_launcher_keeps_the_request(&scratch, WRAPPER, "claude", &PRINT_ARGS);
+}
+
+#[test]
+fn print_an_unrunnable_launcher_keeps_the_no_save_request() {
+    let Some(scratch) = scratch("cc-nosave-unrunnable-print") else { return };
+    masked_fixture::an_unrunnable_launcher_keeps_the_request(&scratch, WRAPPER, "claude", &PRINT_ARGS);
+}
+
+#[test]
+fn print_a_started_session_uses_the_no_save_request_up() {
+    let Some(scratch) = scratch("cc-nosave-started-print") else { return };
+    masked_fixture::a_started_session_uses_the_request_up(
+        &scratch, WRAPPER, "claude", PRINT_REPLY, &PRINT_ARGS, "nosave:1",
+    );
+}
+
+#[test]
+fn another_wrappers_reservation_is_not_a_request_and_is_not_touched() {
+    let Some(scratch) = scratch("cc-nosave-foreign") else { return };
+    scratch.stand_in_launcher();
+    scratch.harness("claude", "exit 0");
+    // No marker: only a reservation that another wrapper process holds.
+    scratch.leave_foreign_reservation();
+
+    let output = scratch.command(WRAPPER).args(INTERACTIVE_ARGS).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", said(&output));
+    assert_eq!(scratch.nosave_seen(), ["nosave:unset"], "this session is an ordinary, saved one");
+    // Still there, with its content (checked inside `nosave_state`).
+    assert_eq!(scratch.nosave_state(), [masked_fixture::FOREIGN_RESERVATION]);
+}
+
+/// A no-save start deletes the transcript of the session it ran. With
+/// `--continue` that is the newest transcript there was. When the launcher
+/// refuses, nothing ran, so nothing may be deleted.
+#[test]
+fn a_refused_no_save_start_does_not_delete_an_earlier_transcript() {
+    let Some(scratch) = scratch("cc-nosave-refused-continue") else { return };
+    let earlier = scratch.home.join(".claude/projects/zz99-project/zz99-earlier-session.jsonl");
+    std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+    std::fs::write(&earlier, b"{}\n").unwrap();
+
+    masked_fixture::a_refusing_launcher_keeps_the_request(&scratch, WRAPPER, "claude", &["--continue"]);
+
+    assert!(earlier.exists(), "the earlier session's transcript must still be there");
+}
+
 #[test]
 fn interactive_mode_starts_claude_through_the_launcher() {
     let Some(scratch) = scratch("cc-interactive") else { return };

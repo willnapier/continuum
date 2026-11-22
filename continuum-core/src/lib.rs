@@ -7,6 +7,7 @@ pub mod compression;
 pub mod import;
 pub mod loop_detection;
 pub mod masked_launch;
+pub mod nosave_request;
 pub mod plaintext;
 pub mod types;
 

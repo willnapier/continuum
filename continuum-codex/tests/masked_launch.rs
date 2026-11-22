@@ -10,6 +10,31 @@ mod masked_fixture;
 use masked_fixture::{said, Scratch};
 
 const WRAPPER: &str = env!("CARGO_BIN_EXE_continuum-codex");
+const ARGS: [&str; 2] = ["resume", "ZZ99"];
+
+// The no-save request (`~/.continuum-nosave`) across a start that reaches no
+// Codex: it must still be there afterwards. The two failures, and the control
+// (a start that works uses the request up).
+
+#[test]
+fn a_refusing_launcher_keeps_the_no_save_request() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-nosave-refused");
+    masked_fixture::a_refusing_launcher_keeps_the_request(&scratch, WRAPPER, "codex", &ARGS);
+}
+
+#[test]
+fn an_unrunnable_launcher_keeps_the_no_save_request() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-nosave-unrunnable");
+    masked_fixture::an_unrunnable_launcher_keeps_the_request(&scratch, WRAPPER, "codex", &ARGS);
+}
+
+#[test]
+fn a_started_session_uses_the_no_save_request_up() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "codex-nosave-started");
+    masked_fixture::a_started_session_uses_the_request_up(
+        &scratch, WRAPPER, "codex", "exit 0", &ARGS, "nosave:1",
+    );
+}
 
 #[test]
 fn codex_starts_through_the_launcher_with_the_depth_guard_set() {

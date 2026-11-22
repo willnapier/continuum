@@ -17,7 +17,9 @@
 //!
 //! **It fails closed.** Where the mask applies and the launcher cannot be
 //! found, [`harness_launch`] returns an error and nothing is started. No
-//! caller may start the harness directly in its place.
+//! caller may start the harness directly in its place. A launcher that is
+//! found can still start nothing (it refuses, or cannot run the harness);
+//! [`launcher_started_nothing`] reads that from the child's exit code.
 //!
 //! macOS is unchanged until work order `ai-footing-mask-mac`:
 //! [`masked_on_this_system`] is the one place that says which systems are
@@ -39,6 +41,10 @@ pub const LAUNCHER: &str = "ai-masked";
 /// hide a folder, or its list is missing). It prints
 /// `ai-masked: refusing to start: …` on stderr first.
 pub const REFUSED_EXIT: i32 = 113;
+
+/// The launcher's exit codes when it could not become the harness: 127 (not
+/// found) and 126 (found, but it would not run).
+pub const EXEC_FAILED_EXITS: [i32; 2] = [126, 127];
 
 /// Said with every failure to start through the launcher.
 const ONLY_THROUGH: &str = "On this system assistants start only through `ai-masked`, which \
@@ -103,6 +109,26 @@ pub fn spawn_failure(what: &str) -> String {
     } else {
         format!("failed to start {what}")
     }
+}
+
+/// Whether a child's exit code says the launcher started no harness: its
+/// refusal ([`REFUSED_EXIT`]) or a failed exec ([`EXEC_FAILED_EXITS`]). Always
+/// false on a system without the mask, where the child is the harness itself.
+///
+/// [`harness_launch`] finding the launcher does not mean a harness started, so
+/// a wrapper asks this after its child has finished. The codes are not
+/// reserved: a harness that itself exits with one of them after a real session
+/// reads the same. A caller may therefore use the answer only where a wrong
+/// "nothing started" errs in the safe direction: giving a no-save request
+/// back (the next session is then not saved either), or skipping work that is
+/// done again elsewhere.
+pub fn launcher_started_nothing(exit_code: Option<i32>) -> bool {
+    started_nothing(masked_on_this_system(), exit_code)
+}
+
+fn started_nothing(masked: bool, exit_code: Option<i32>) -> bool {
+    masked
+        && exit_code.is_some_and(|code| code == REFUSED_EXIT || EXEC_FAILED_EXITS.contains(&code))
 }
 
 /// The rule itself, with the system and the launcher lookup passed in so that
@@ -229,6 +255,20 @@ mod tests {
         assert!(error.contains("only through `ai-masked`"), "{error}");
         assert!(error.contains("rust-redeploy --only ai-masked"), "{error}");
         assert!(error.contains("AI-FOOTING-MASK.md"), "{error}");
+    }
+
+    #[test]
+    fn only_the_launchers_own_codes_on_a_masked_system_mean_nothing_started() {
+        for code in [113, 126, 127] {
+            assert!(started_nothing(true, Some(code)), "{code}");
+            // Without the mask the child is the harness: it ran.
+            assert!(!started_nothing(false, Some(code)), "{code}");
+        }
+        // Any other exit, and a child ended by a signal, is a harness that ran.
+        for code in [Some(0), Some(1), Some(2), Some(130), Some(143), None] {
+            assert!(!started_nothing(true, code), "{code:?}");
+        }
+        assert_eq!(launcher_started_nothing(Some(113)), cfg!(target_os = "linux"));
     }
 
     #[test]

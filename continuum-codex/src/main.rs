@@ -7,6 +7,7 @@
 // itself forever. Resolution now skips our own executable by identity.
 
 use color_eyre::{eyre::Context, Result};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
@@ -55,21 +56,25 @@ fn main() -> Result<()> {
     // which hides the protected folders and then becomes Codex in the same
     // process; on macOS it starts directly, as before
     // (`continuum_core::masked_launch`, ~/Assistants/shared/AI-FOOTING-MASK.md).
-    // A missing launcher is an error here, before the no-save marker is
-    // consumed: there is no direct start to fall back to. The resolver above
-    // is unaffected: it has already chosen the real Codex by path, and the
-    // depth guard below still reaches Codex through the launcher.
+    // A missing launcher is an error here: there is no direct start to fall
+    // back to. The resolver above is unaffected: it has already chosen the
+    // real Codex by path, and the depth guard below still reaches Codex
+    // through the launcher.
     let launch = continuum_core::masked_launch::harness_launch(&real_codex)
         .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
 
-    // Check for no-save marker file
+    // Reserve the no-save request, if there is one; do not use it up yet. A
+    // launcher that is found may still refuse (exit 113) or not be runnable.
+    // The request is used up when Codex has run, and given back when the
+    // spawn fails or the exit code says nothing was started
+    // (`continuum_core::nosave_request`). A Codex that itself exits 113, 126
+    // or 127 after a real session gets its request back too, so the next
+    // session is not saved either: the mistake is made in the safe direction.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -94,6 +99,13 @@ fn main() -> Result<()> {
         .spawn()
         .with_context(|| continuum_core::masked_launch::spawn_failure("codex"))?;
     let status = child.wait()?;
+
+    // Use the no-save request up, or give it back if nothing was started. In
+    // that case there is no session of this start to import or discard, and
+    // the newest session file below would be some other session's.
+    if !nosave_request::settle_at_exit(nosave, status.code()) {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // After codex exits, find the session that was just modified
     let after_session = find_latest_session_file(&sessions_dir);
