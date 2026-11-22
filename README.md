@@ -182,7 +182,9 @@ continuum codex which
 
 Resolver precedence is: `CONTINUUM_CODEX_BIN` override, managed install, legacy user install, identity-filtered `PATH`, then system paths as a warned compatibility fallback. The wrapper sets a depth guard before launching the real CLI, turning a copied or misnamed wrapper into a clear error instead of recursive spawning. Codex's built-in updater targets the ambient npm installation rather than Continuum's off-PATH copy, so the deployed Codex configuration sets `check_for_update_on_startup = false`; use `continuum codex update` instead.
 
-On Linux, `continuum-claude`, `continuum-codex` and the usage probes that start a harness run it through the mask launcher, `ai-masked <harness> <arguments>`, which hides the protected folders from the harness. Without `ai-masked` they start nothing and say so; they never start the harness directly instead. Install it with `rust-redeploy --only ai-masked`. macOS is unchanged for now. See "Wrap" in [ARCHITECTURE.md](ARCHITECTURE.md) and `~/Assistants/shared/AI-FOOTING-MASK.md`.
+On Linux, `continuum-claude`, `continuum-codex`, `continuum-gemini`, `continuum-goose` and the usage probes that start a harness run it through the mask launcher, `ai-masked <harness> <arguments>`, which hides the protected folders from the harness. Without `ai-masked` they start nothing and say so; they never start the harness directly instead. Install it with `rust-redeploy --only ai-masked`. macOS is unchanged for now. See "Wrap" in [ARCHITECTURE.md](ARCHITECTURE.md) and `~/Assistants/shared/AI-FOOTING-MASK.md`.
+
+A no-save request (`nosave`, the marker `~/.continuum-nosave`) is used up only by a session that started. A wrapper reserves the marker, and gives it back when the launcher refuses (exit 113), cannot run the harness (126, 127) or cannot be run itself. A harness that itself exits with one of those codes after a real session also gets its request back, so the next session is not saved either: the mistake is made towards not saving.
 
 ### Import Web Conversations
 

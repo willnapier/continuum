@@ -104,8 +104,9 @@ does the same for Claude Code. Each wrapper:
 `continuum-claude` also queues a DayPage line (`daypage-append`) when a session
 with exchanges ended without writing one.
 
-**On Linux the harness starts through the mask launcher.** `continuum-claude`
-and `continuum-codex` run `ai-masked <real harness> <arguments>` in place of
+**On Linux the harness starts through the mask launcher.** `continuum-claude`,
+`continuum-codex`, `continuum-gemini` and `continuum-goose` run
+`ai-masked <real harness> <arguments>` in place of
 `<real harness> <arguments>`. `ai-masked` hides the protected folders (the
 clinical trees) from the harness, sets `AI_FOOTING=masked`, drops
 `ANTHROPIC_API_KEY`, and then becomes the harness in the same process, so the
@@ -119,9 +120,28 @@ When the launcher itself refuses, it prints its reason and the wrapper exits
 with the launcher's code, 113. The usage probes that start a harness follow the
 same rule (section 3). The rule is one file, `continuum-core/src/masked_launch.rs`,
 which `continuum-usage-core` also compiles. macOS launches are unchanged until
-the mask reaches the Mac. `continuum-gemini` and `continuum-goose` are not
-wired. What is hidden, and how to tell that a session is masked:
-`~/Assistants/shared/AI-FOOTING-MASK.md`.
+the mask reaches the Mac. What is hidden, and how to tell that a session is
+masked: `~/Assistants/shared/AI-FOOTING-MASK.md`.
+
+**A no-save request is used up only by a session that started.** A wrapper
+that finds `~/.continuum-nosave` does not delete it at once. It reserves it,
+by renaming it to `.continuum-nosave.reserved-<its own PID>`, so of two
+wrappers started together exactly one takes the request. When the harness has
+run, the wrapper removes the reservation: the request is used up. When nothing
+was started, the wrapper renames the reservation back to the marker, so the
+next start is still not saved. "Nothing was started" means the start failed
+(the launcher could not be run), or the child exited with one of the
+launcher's own codes: 113 (it refused) or 126 and 127 (it could not run the
+harness). In that case the wrapper also does no import, deletion or DayPage
+line, because there is no session of that start (`continuum-claude` still does
+them when it saw that child hold a transcript open, which shows that a session
+did run). Those codes are not reserved
+for the launcher. A harness that itself exits with one of them after a real
+session gets its request back too, and the next session is then not saved
+either. That mistake is made in the safe direction, towards not saving. A
+wrapper that is killed leaves its reservation file behind; nothing reads it,
+and no wrapper touches a reservation that is not its own
+(`continuum-core/src/nosave_request.rs`).
 
 **Continuum owns the real Codex CLI.** It installs Codex off `PATH`, under
 `~/.local/share/continuum/codex/`. `continuum codex update` updates that copy,

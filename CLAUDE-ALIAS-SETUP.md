@@ -33,6 +33,13 @@ Claude Code; it never starts it directly instead. Install the launcher with
 never started through the launcher. See `~/Assistants/shared/AI-FOOTING-MASK.md`
 and "Wrap" in `ARCHITECTURE.md`.
 
+A no-save request (`~/.continuum-nosave`) is used up only when Claude Code has
+started. If the launcher refuses (the wrapper then exits 113) or cannot be
+run, the request is kept for the next start. A Claude Code that itself exits
+113, 126 or 127 after a real session also gets its request back, so the next
+session is not saved either; that errs towards not saving. The details are
+under "Wrap" in `ARCHITECTURE.md`.
+
 ## Setup on Linux (Already Done)
 
 Your Linux system is already set up:
