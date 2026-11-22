@@ -104,6 +104,25 @@ does the same for Claude Code. Each wrapper:
 `continuum-claude` also queues a DayPage line (`daypage-append`) when a session
 with exchanges ended without writing one.
 
+**On Linux the harness starts through the mask launcher.** `continuum-claude`
+and `continuum-codex` run `ai-masked <real harness> <arguments>` in place of
+`<real harness> <arguments>`. `ai-masked` hides the protected folders (the
+clinical trees) from the harness, sets `AI_FOOTING=masked`, drops
+`ANTHROPIC_API_KEY`, and then becomes the harness in the same process, so the
+wrapper waits for it and reads its exit code as before. The Nushell functions
+start the wrappers through the launcher too, but Zellij's session resurrection
+and other callers run `continuum-claude …` directly, so the wrappers do it
+themselves. If `ai-masked` is not on `PATH` or in `~/.local/bin`, the wrapper
+reports that and exits without starting the harness: it never starts it
+directly instead (install the launcher with `rust-redeploy --only ai-masked`).
+When the launcher itself refuses, it prints its reason and the wrapper exits
+with the launcher's code, 113. The usage probes that start a harness follow the
+same rule (section 3). The rule is one file, `continuum-core/src/masked_launch.rs`,
+which `continuum-usage-core` also compiles. macOS launches are unchanged until
+the mask reaches the Mac. `continuum-gemini` and `continuum-goose` are not
+wired. What is hidden, and how to tell that a session is masked:
+`~/Assistants/shared/AI-FOOTING-MASK.md`.
+
 **Continuum owns the real Codex CLI.** It installs Codex off `PATH`, under
 `~/.local/share/continuum/codex/`. `continuum codex update` updates that copy,
 and `continuum codex which` reports which binary is selected. One resolver in
@@ -131,7 +150,8 @@ The wrapper does not alter SSH identity, Codex arguments or clipboard contents.
 Offline process controls: build `cargo build --locked -p continuum-codex`, then
 run `python3 continuum-codex/tests/clipboard_launch.py target/debug/continuum-codex`.
 These use a fake child in a private home and pseudo-terminals, with no provider
-calls or access to a real clipboard. Physical Mac/Ghostty/mosh delivery still
+calls or access to a real clipboard. On Linux they put a stand-in `ai-masked`
+first on `PATH`, so the real launcher is not run. Physical Mac/Ghostty/mosh delivery still
 needs a selection and paste check after reopening a client.
 
 Since the per-turn hooks arrived (October 2026), capture no longer depends on the
@@ -166,6 +186,13 @@ one JSON object. The core holds no vendor code and no credentials. Smoke probes
 (`*-smoke`) send one small real request each hour, to prove a request actually
 goes through. A timer (`usagewatch-monitor`) refreshes on a cadence and sends
 desktop notifications.
+
+Four probes start a harness: the three smoke probes, and `usage-probe-codex`,
+which runs `codex app-server` to read the rate limits. On Linux each starts it
+through `ai-masked`, by the same rule as the wrappers (section 2). Without the
+launcher the probe reports a failed reading that names `ai-masked`, and starts
+nothing. This matters most for `usage-probe-codex`: a `codex app-server` outside
+the mask makes the launcher refuse every other Codex start while it lives.
 
 usagewatch is advice only. It never changes a tier, model, effort level or
 route. The dispatcher may read its stored observations as advice; it doesn't

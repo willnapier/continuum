@@ -22,6 +22,17 @@ key is approved. Zellij's session resurrection, for one, re-runs
 it. The clinical path, `cc-clinical`, runs its own pinned binary and is not
 affected.
 
+On Linux, in both modes, it starts Claude Code through the mask launcher:
+`ai-masked <real claude> <arguments>`. The launcher hides the protected folders
+from Claude Code and then becomes it in the same process. The wrapper does this
+itself for the same reason as the key removal: Zellij's session resurrection
+runs `continuum-claude` without the Nushell function. If `ai-masked` is not on
+`PATH` or in `~/.local/bin`, the wrapper says so and exits without starting
+Claude Code; it never starts it directly instead. Install the launcher with
+`rust-redeploy --only ai-masked`. macOS is unchanged for now. `cc-clinical` is
+never started through the launcher. See `~/Assistants/shared/AI-FOOTING-MASK.md`
+and "Wrap" in `ARCHITECTURE.md`.
+
 ## Setup on Linux (Already Done)
 
 Your Linux system is already set up:

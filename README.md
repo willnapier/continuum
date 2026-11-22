@@ -182,6 +182,8 @@ continuum codex which
 
 Resolver precedence is: `CONTINUUM_CODEX_BIN` override, managed install, legacy user install, identity-filtered `PATH`, then system paths as a warned compatibility fallback. The wrapper sets a depth guard before launching the real CLI, turning a copied or misnamed wrapper into a clear error instead of recursive spawning. Codex's built-in updater targets the ambient npm installation rather than Continuum's off-PATH copy, so the deployed Codex configuration sets `check_for_update_on_startup = false`; use `continuum codex update` instead.
 
+On Linux, `continuum-claude`, `continuum-codex` and the usage probes that start a harness run it through the mask launcher, `ai-masked <harness> <arguments>`, which hides the protected folders from the harness. Without `ai-masked` they start nothing and say so; they never start the harness directly instead. Install it with `rust-redeploy --only ai-masked`. macOS is unchanged for now. See "Wrap" in [ARCHITECTURE.md](ARCHITECTURE.md) and `~/Assistants/shared/AI-FOOTING-MASK.md`.
+
 ### Import Web Conversations
 
 ```bash
