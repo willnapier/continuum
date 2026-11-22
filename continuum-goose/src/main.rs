@@ -1,8 +1,9 @@
 // Continuum-Goose: Transparent wrapper for Goose CLI
 // Automatically captures all conversations to plain-text JSONL files
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use color_eyre::{eyre::Context, Result};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 use rusqlite::Connection;
 
 fn main() -> Result<()> {
@@ -53,14 +54,26 @@ fn main() -> Result<()> {
         goose_path_str
     };
 
-    // Check for no-save marker file
+    // On Linux Goose starts through the mask launcher, `ai-masked <goose> …`,
+    // which hides the protected folders and then becomes Goose in the same
+    // process; on macOS it starts directly, as before
+    // (`continuum_core::masked_launch`, ~/Assistants/shared/AI-FOOTING-MASK.md).
+    // A missing launcher is an error here: there is no direct start to fall
+    // back to.
+    let launch = continuum_core::masked_launch::harness_launch(&real_goose)
+        .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
+
+    // Reserve the no-save request, if there is one; do not use it up yet. It
+    // is used up when Goose has run, and given back when the spawn fails or
+    // the exit code says the launcher started nothing
+    // (`continuum_core::nosave_request`). A Goose that itself exits 113, 126
+    // or 127 after a real session gets its request back too, so the next
+    // session is not saved either: the mistake is made in the safe direction.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -70,14 +83,22 @@ fn main() -> Result<()> {
     let before_session = find_latest_session_id(&db_path);
 
     // Spawn goose as a child process
-    let status = Command::new(&real_goose)
+    let status = launch
+        .command()
         .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn goose process")?
+        .with_context(|| continuum_core::masked_launch::spawn_failure("goose"))?
         .wait()?;
+
+    // Use the no-save request up, or give it back if nothing was started. In
+    // that case there is no session of this start to import, and the newest
+    // session below would be some other session.
+    if !nosave_request::settle_at_exit(nosave, status.code()) {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // After goose exits, find the latest session ID
     let after_session = find_latest_session_id(&db_path);
