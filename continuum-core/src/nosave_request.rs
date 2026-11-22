@@ -37,8 +37,9 @@
 //! One case is not covered. A wrapper that is itself killed between reserving
 //! and settling leaves its reservation file behind. If the harness had
 //! started, the request was delivered and nothing is lost. If it had not (the
-//! wrapper was killed in the moment before the launcher's exec), the request
-//! is lost, as it was when the marker was deleted first. No other wrapper
+//! wrapper was killed before the launcher's exec, an interval that includes
+//! the wrapper's own look at the existing sessions and the launcher's work),
+//! the request is lost, as it was when the marker was deleted first. No other wrapper
 //! touches a reservation that is not its own, because it cannot tell those
 //! two cases apart, and taking the request up again would leave a later
 //! session unsaved that was meant to be saved.

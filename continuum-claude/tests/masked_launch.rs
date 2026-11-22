@@ -173,30 +173,98 @@ fn a_signalled_start_does_not_import_an_earlier_session() {
     }
 }
 
-/// The control: Claude Code ran, this wrapper saw its transcript open, and a
-/// signal then ended it. The request was delivered and is used up, and the
-/// session is handled as a no-save session is: its transcript is deleted.
-/// (The transcript is "seen" through a stand-in `lsof`, the tool the wrapper
-/// asks which files its child holds open.)
-#[test]
-fn interactive_a_signalled_session_that_was_seen_uses_the_no_save_request_up() {
-    let Some(scratch) = scratch("cc-nosave-signalled-seen-interactive") else { return };
-    let live = scratch.home.join(".claude/projects/zz99-project/zz99-live-session.jsonl");
+// The controls: Claude Code ran a session, this wrapper saw which one, and a
+// signal then ended it. The request was delivered and is used up, and the
+// session is cleaned up as a no-save session is: it is entered in the no-save
+// registry, which every later import consults, and its transcript is deleted.
+
+const LIVE_ID: &str = "zz99-live-session";
+/// One transcript line the importer would store.
+const LIVE_LINE: &str = r#"{"type":"user","message":{"role":"user","content":"zz99 question"},"timestamp":"2026-10-06T21:00:00.000Z"}"#;
+
+/// Where the session's transcript will be, with Claude Code's folders made.
+fn live_transcript(scratch: &Scratch) -> std::path::PathBuf {
+    let live = scratch.home.join(format!(".claude/projects/zz99-project/{LIVE_ID}.jsonl"));
     std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-    std::fs::write(&live, b"{}\n").unwrap();
-    scratch.tool("lsof", &format!("printf '%s\\n' 'p1' 'n{}'", live.display()));
+    std::fs::create_dir_all(scratch.home.join(".claude/sessions")).unwrap();
+    live
+}
+
+/// sh: stay alive long enough for the wrapper to look, then end by a signal.
+fn linger_then_signal() -> String {
+    format!("/bin/sleep 1 2>/dev/null || /usr/bin/sleep 1\n{}", masked_fixture::SIGNAL_SELF)
+}
+
+fn no_save_registry(scratch: &Scratch) -> std::path::PathBuf {
+    scratch.home.join(".local/share/continuum/nosave-sessions")
+}
+
+/// What a no-save session that was seen and then signalled must leave.
+fn assert_cleaned_up(scratch: &Scratch, output: &std::process::Output, live: &Path) {
+    assert_eq!(output.status.code(), Some(1), "{}", said(output));
+    assert!(!scratch.bin.join("lsof").exists(), "no `lsof` is on the wrapper's PATH");
+    assert_eq!(scratch.nosave_seen(), ["nosave:1"], "{}", said(output));
+    assert_eq!(scratch.nosave_state(), masked_fixture::REQUEST_USED, "delivered: used up\n{}", said(output));
+    assert!(no_save_registry(scratch).join(LIVE_ID).exists(), "entered in the no-save registry\n{}", said(output));
+    assert!(!live.exists(), "the no-save session's own transcript is deleted\n{}", said(output));
+}
+
+/// The session is seen because the child holds its transcript open, read from
+/// `/proc/<pid>/fd`. There is no `lsof` here. (Red control: asking `lsof`, as
+/// before, finds nothing, and the session is not cleaned up.)
+#[test]
+fn a_signalled_no_save_session_seen_through_proc_is_cleaned_up() {
+    let Some(scratch) = scratch("cc-nosave-signalled-seen-proc") else { return };
+    let live = live_transcript(&scratch);
     scratch.stand_in_launcher();
-    // Long enough for the wrapper to look once, then ended by a signal.
-    let then = format!("/bin/sleep 1 2>/dev/null || /usr/bin/sleep 1\n{}", masked_fixture::SIGNAL_SELF);
+    let then = format!("exec 3>>'{}'\n{}", live.display(), linger_then_signal());
     scratch.harness("claude", &then);
     scratch.request_no_save();
 
     let output = scratch.command(WRAPPER).args(["--model", "zz99"]).output().unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "{}", said(&output));
-    assert_eq!(scratch.nosave_seen(), ["nosave:1"], "{}", said(&output));
-    assert_eq!(scratch.nosave_state(), masked_fixture::REQUEST_USED, "delivered: used up\n{}", said(&output));
-    assert!(!live.exists(), "the no-save session's own transcript is deleted\n{}", said(&output));
+    assert_cleaned_up(&scratch, &output, &live);
+}
+
+/// The session is seen as a real Claude Code's is: it writes its record,
+/// `~/.claude/sessions/<pid>.json`, appends to its transcript and closes it
+/// again, so nothing is held open. Then the later sync is exercised on a
+/// transcript of that session: it is refused, and nothing enters Continuum.
+#[test]
+fn a_signalled_no_save_session_is_cleaned_up_and_a_later_import_refuses_it() {
+    use continuum_core::import::{import_claude_code, Imported};
+
+    let Some(scratch) = scratch("cc-nosave-signalled-seen-record") else { return };
+    let live = live_transcript(&scratch);
+    scratch.stand_in_launcher();
+    let then = format!(
+        "printf '{{\"pid\":%s,\"sessionId\":\"{LIVE_ID}\"}}\\n' \"$$\" > '{sessions}'/\"$$\".json\nprintf '%s\\n' '{LIVE_LINE}' >> '{live}'\n{linger}",
+        sessions = scratch.home.join(".claude/sessions").display(),
+        live = live.display(),
+        linger = linger_then_signal(),
+    );
+    scratch.harness("claude", &then);
+    scratch.request_no_save();
+
+    let output = scratch.command(WRAPPER).args(["--model", "zz99"]).output().unwrap();
+
+    assert_cleaned_up(&scratch, &output, &live);
+
+    // The later sync (the same importer the 5-minute sync and the hooks use),
+    // on a transcript of that session as if one were there again.
+    let logs = scratch.home.join("Assistants/continuum-logs");
+    let writer = continuum_core::PlainTextWriter::with_base_dir(logs.clone()).with_nosave_dir(no_save_registry(&scratch));
+    let answer = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"zz99 answer"}]},"timestamp":"2026-10-06T21:00:01.000Z"}"#;
+    let transcript = format!("{LIVE_LINE}\n{answer}\n");
+    std::fs::write(&live, &transcript).unwrap();
+    assert!(matches!(import_claude_code(&writer, &live).unwrap(), Imported::NoSave), "refused by the registry");
+    assert!(!logs.join("claude-code").exists(), "nothing of the session is in Continuum");
+
+    // Known green: the same transcript under another session's name is stored.
+    let other = live.with_file_name("zz99-other-session.jsonl");
+    std::fs::write(&other, &transcript).unwrap();
+    assert!(matches!(import_claude_code(&writer, &other).unwrap(), Imported::Stored(_)));
+    assert!(logs.join("claude-code").exists());
 }
 
 /// The control in print mode: Claude Code printed a session event, and a

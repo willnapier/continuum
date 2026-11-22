@@ -102,11 +102,6 @@ impl Scratch {
         self.script(LAUNCHER, &body)
     }
 
-    /// Any other program on the scratch `PATH` (sh body).
-    pub fn tool(&self, name: &str, body: &str) -> PathBuf {
-        self.script(name, body)
-    }
-
     /// A file with the launcher's name that cannot be run (no execute bit):
     /// it is found, and the start then fails.
     pub fn unrunnable_launcher(&self) -> PathBuf {

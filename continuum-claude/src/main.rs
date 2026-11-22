@@ -444,6 +444,7 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     // make every wrapper auto-log the same file (identical DayPage twins).
     // The mask launcher becomes Claude Code by exec, so the child's PID is
     // still Claude Code's own.
+    let spawned_at = std::time::SystemTime::now();
     let mut child = claude_command(&launch, skip_saving)
         .args(args)
         .stdin(Stdio::inherit())
@@ -458,10 +459,11 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     let watch_handle = {
         let watched = watched.clone();
         let stop = stop.clone();
+        let home = PathBuf::from(&home);
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(pid) = child_pid {
-                    if let Some(path) = session_jsonl_for_pid_tree(pid) {
+                    if let Some(path) = session_jsonl_for_pid_tree(pid, &home, spawned_at) {
                         if let Ok(mut slot) = watched.lock() {
                             *slot = Some(path);
                         }
@@ -643,8 +645,68 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     pids
 }
 
-fn session_jsonl_for_pid_tree(root: u32) -> Option<PathBuf> {
+/// The transcript of the session that this child (or a process below it) is
+/// running: the wrapper's own evidence that the child ran a session, and
+/// which one. Two sources, both tied to the child's PID:
+///
+/// 1. Claude Code's record of itself, `~/.claude/sessions/<pid>.json`, which
+///    names the session it is running ([`session_of_claude_record`]). Claude
+///    Code appends to its transcript and closes it again, so this is what
+///    identifies a session in practice.
+/// 2. A transcript held open by the process ([`open_session_jsonl`]).
+fn session_jsonl_for_pid_tree(root: u32, home: &Path, spawned_at: std::time::SystemTime) -> Option<PathBuf> {
     let pids = descendant_pids(root);
+    session_of_claude_record(home, &pids, spawned_at).or_else(|| open_session_jsonl(&pids))
+}
+
+/// The transcript named by Claude Code's own record for one of `pids`:
+/// `~/.claude/sessions/<pid>.json` holds `{"pid": <pid>, "sessionId": "<id>", …}`
+/// while that process lives (seen in Claude Code 2.1.330). The record counts
+/// only if it was written after this wrapper started its child (a file left
+/// by an earlier process that had the same PID is older), names its own PID,
+/// and its session has a transcript. If Claude Code stops writing the record,
+/// nothing is found here and the wrapper has no evidence from it.
+fn session_of_claude_record(home: &Path, pids: &[u32], spawned_at: std::time::SystemTime) -> Option<PathBuf> {
+    // File times may be kept to the second: compare from the start of the
+    // second in which the child was spawned.
+    let since_epoch = spawned_at.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let spawned_second = std::time::UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs());
+    pids.iter().find_map(|pid| {
+        let record = home.join(format!(".claude/sessions/{pid}.json"));
+        if std::fs::metadata(&record).ok()?.modified().ok()? < spawned_second {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&record).ok()?).ok()?;
+        if value.get("pid")?.as_u64()? != u64::from(*pid) {
+            return None;
+        }
+        find_session_file(&home.join(".claude/projects"), value.get("sessionId")?.as_str()?)
+    })
+}
+
+/// A Claude Code transcript that one of `pids` holds open. On Linux this is
+/// read from `/proc/<pid>/fd`; where there is no `/proc` (macOS), `lsof` is
+/// asked, as before.
+fn open_session_jsonl(pids: &[u32]) -> Option<PathBuf> {
+    let proc_root = Path::new("/proc");
+    if proc_root.join("self/fd").exists() {
+        open_session_jsonl_in_proc(proc_root, pids)
+    } else {
+        open_session_jsonl_by_lsof(pids)
+    }
+}
+
+fn open_session_jsonl_in_proc(proc_root: &Path, pids: &[u32]) -> Option<PathBuf> {
+    pids.iter().find_map(|pid| {
+        std::fs::read_dir(proc_root.join(pid.to_string()).join("fd"))
+            .ok()?
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .find(|target| looks_like_claude_session_jsonl(target))
+    })
+}
+
+fn open_session_jsonl_by_lsof(pids: &[u32]) -> Option<PathBuf> {
     if pids.is_empty() {
         return None;
     }
@@ -1050,11 +1112,79 @@ enum Content {
 mod tests {
     use super::{
         claude_command, clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
-        session_id_is_safe, try_claim_autolog, Launch, API_KEY_ENV,
+        session_id_is_safe, session_of_claude_record, try_claim_autolog, Launch, API_KEY_ENV,
     };
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// Held by the tests that open a transcript in this process, so that the
+    /// test of open transcripts sees only its own.
+    static TRANSCRIPTS_IN_THIS_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Claude Code appends to its transcript and closes it, so what ties a
+    /// session to the wrapper's child is Claude Code's own record of itself.
+    #[test]
+    fn claudes_own_record_names_the_session_only_when_it_is_this_childs() {
+        let _alone = TRANSCRIPTS_IN_THIS_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile_dir("cc-session-record");
+        let projects = home.join(".claude/projects/zz99-project");
+        let sessions = home.join(".claude/sessions");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let transcript = projects.join("zz99-live-session.jsonl");
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        let record = |pid: u32, body: &str| std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap();
+        // The child was spawned a moment before its record was written.
+        let spawned = SystemTime::now() - Duration::from_secs(5);
+        let seen = |pid: u32| session_of_claude_record(&home, &[pid], spawned);
+
+        record(4242, r#"{"pid":4242,"sessionId":"zz99-live-session","cwd":"/"}"#);
+        assert_eq!(seen(4242), Some(transcript.clone()));
+        // Among the child's descendants too.
+        assert_eq!(session_of_claude_record(&home, &[1, 4242], spawned), Some(transcript.clone()));
+
+        // A record left by an earlier process that had the same PID was
+        // written before this child was spawned: it is not this child's.
+        let spawned_later = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(session_of_claude_record(&home, &[4242], spawned_later), None);
+
+        // A record that names another PID, a session with no transcript, an
+        // id that is not a file name, a file that is not a record, no record.
+        record(4343, r#"{"pid":4242,"sessionId":"zz99-live-session"}"#);
+        record(4444, r#"{"pid":4444,"sessionId":"zz99-no-transcript"}"#);
+        record(4545, r#"{"pid":4545,"sessionId":"../zz99-project/zz99-live-session"}"#);
+        record(4646, "not a record");
+        for pid in [4343, 4444, 4545, 4646, 4747] {
+            assert_eq!(seen(pid), None, "{pid}");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// On Linux a transcript the child holds open is read from `/proc`, with
+    /// no `lsof`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_transcript_held_open_is_found_through_proc() {
+        use super::open_session_jsonl_in_proc;
+        let _alone = TRANSCRIPTS_IN_THIS_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = tempfile_dir("cc-open-transcript");
+        let dir = base.join(".claude/projects/zz99-project");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zz99-open-session.jsonl");
+        let held = std::fs::File::create(&path).unwrap();
+        let this_process = [std::process::id()];
+        let proc_root = Path::new("/proc");
+
+        let found = open_session_jsonl_in_proc(proc_root, &this_process);
+        assert_eq!(found, Some(std::fs::canonicalize(&path).unwrap()));
+
+        drop(held);
+        assert_eq!(open_session_jsonl_in_proc(proc_root, &this_process), None, "closed: not held open");
+        assert_eq!(open_session_jsonl_in_proc(proc_root, &[u32::MAX]), None, "no such process");
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     const LAUNCHER: &str = "/opt/bin/ai-masked";
     const REAL_CLAUDE: &str = "/opt/real/claude";
