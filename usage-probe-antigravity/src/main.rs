@@ -20,23 +20,27 @@
 //! proportionally to the cost of the tokens"), so Gemini 4 Neon draws on the
 //! Gemini group with Carbon, Argon, Hydrogen, the Orchestrators and Flash.
 //!
-//! Two guards:
+//! A reading is all or nothing (review round 1, continuum#9):
 //!
-//! - **`/usage` must not reach the model.** If a later `agy` sent it as a
-//!   prompt instead, the reply would have no `command` block and the run would
-//!   have spent quota. That is reported as a malformed reading naming the
-//!   tokens spent, never parsed out of the model's prose.
-//! - **A fraction outside 0..=1 is refused**, not clamped: a scale change must
-//!   read as "not assessable", never as healthy.
+//! - **The run must be clean.** Exit 0, `status` `SUCCESS`, and the reply's own
+//!   accounting present and zero (`num_turns` 0, `usage.total_tokens` 0).
+//!   Missing accounting is refused, not assumed zero. This detects a model
+//!   turn *after* it happened; it cannot prevent the first one if a later
+//!   `agy` starts sending `/usage` to the model. That is a stated limit.
+//! - **Every bucket must read.** One unreadable bucket (a fraction outside
+//!   0..=1, a missing field, a bucket that is not an object) fails the whole
+//!   reading. Dropping it would hide exactly the limit it measures, and the
+//!   other rows would read as a complete, healthy account.
 //!
 //! On Linux `agy` starts through the mask launcher `ai-masked`
 //! (`continuum_usage_core::masked_launch`, `~/Assistants/shared/AI-FOOTING-MASK.md`),
-//! from an empty scratch folder, in plan mode. A missing launcher is a failed
-//! reading, never a direct start.
+//! in plan mode, from a new private (0700) folder made for that one run and
+//! removed after it. A missing launcher is a failed reading, never a direct
+//! start.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use continuum_usage_core::envelope::{
     Facets, FailureKind, KindHint, MeterScope, Observation, Outcome, Resource, SideEffect,
@@ -57,6 +61,9 @@ const DEADLINE: Duration = Duration::from_secs(40);
 /// The bucket the status header marks: the Gemini weekly limit is the one
 /// Neon's overnight work is bounded by.
 const REPRESENTATIVE_BUCKET: &str = "gemini-weekly";
+/// How close `reset_time` must be to "now + window" to be the synthetic reset
+/// of a window that has not started (see [`bucket_resource`]).
+const NOT_STARTED_SLACK_SECS: i64 = 120;
 
 fn main() -> ExitCode {
     let obs = probe();
@@ -81,6 +88,10 @@ fn with_raw(mut obs: Observation, raw: Value) -> Observation {
     obs
 }
 
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
 fn probe() -> Observation {
     let agy = match smoke::resolve_bin(BIN_OVERRIDE, "agy") {
         Ok(p) => p,
@@ -90,16 +101,39 @@ fn probe() -> Observation {
         Ok(run) => run,
         Err(e) => return fail(FailureKind::NetworkFailure, e),
     };
-    observe(&run)
+    observe(&run, now_unix())
 }
 
-/// `agy -p /usage` in plan mode, from an empty scratch folder, so nothing in
-/// the caller's folder is offered to it as a workspace.
+/// A folder made new for one run: `create_dir`, not `create_dir_all`, so an
+/// existing path (a folder left behind, or a link planted there) is an error
+/// rather than reused; mode 0700. Removed when dropped.
+struct RunDir(PathBuf);
+
+impl RunDir {
+    fn new() -> Result<Self, String> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!("usage-probe-antigravity-{}-{nanos:09}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path).map_err(|e| format!("run folder {}: {e}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `agy -p /usage` in plan mode, from its own empty folder, so nothing in the
+/// caller's folder or an earlier run's is offered to it as a workspace.
 fn run_agy(agy: &Path) -> Result<Run, String> {
-    let workdir = std::env::temp_dir().join("usage-probe-antigravity");
-    std::fs::create_dir_all(&workdir).map_err(|e| format!("scratch dir: {e}"))?;
+    let workdir = RunDir::new()?;
     let mut cmd = masked_launch::harness_command(agy)?;
-    cmd.current_dir(&workdir).args([
+    cmd.current_dir(&workdir.0).args([
         "-p",
         "/usage",
         "--mode",
@@ -112,8 +146,9 @@ fn run_agy(agy: &Path) -> Result<Run, String> {
     smoke::run_with_deadline(cmd, DEADLINE)
 }
 
-/// The whole reading from one finished run.
-fn observe(run: &Run) -> Observation {
+/// The whole reading from one finished run. `now` is the reading's clock, for
+/// telling a window that has not started from one that has.
+fn observe(run: &Run, now: i64) -> Observation {
     let reply = last_json_object(&run.stdout);
     let Some(reply) = reply else {
         let source = if run.stderr.trim().is_empty() { &run.stdout } else { &run.stderr };
@@ -125,17 +160,27 @@ fn observe(run: &Run) -> Observation {
     };
 
     let status = reply.get("status").and_then(Value::as_str).unwrap_or("");
-    if status != "SUCCESS" {
+    if status != "SUCCESS" || run.exit_code != Some(0) {
         let said = reply
             .get("response")
             .or_else(|| reply.get("error"))
             .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
             .unwrap_or_default();
-        let message = format!("agy /usage status {status:?}: {}", tail(said.trim(), 300));
+        let stderr = tail(run.stderr.trim(), 200);
+        let message = format!(
+            "agy /usage status {status:?}, exit {:?}: {}{}",
+            run.exit_code,
+            tail(said.trim(), 300),
+            if stderr.is_empty() { String::new() } else { format!(" (stderr: {stderr})") }
+        );
         return with_raw(fail(refusal_kind(&message), message), reply);
     }
 
-    match resources_from(&reply) {
+    if let Err(message) = no_model_activity(&reply) {
+        return with_raw(fail(FailureKind::MalformedResponse, message), reply);
+    }
+
+    match resources_from(&reply, now) {
         Ok(resources) => {
             let mut obs =
                 Observation::ok(PROBE, VERSION, PROVIDER, SideEffect::RequestConsuming, resources);
@@ -147,6 +192,28 @@ fn observe(run: &Run) -> Observation {
             with_raw(obs, reply.pointer("/command/data").cloned().unwrap_or(Value::Null))
         }
         Err(message) => with_raw(fail(FailureKind::MalformedResponse, message), reply),
+    }
+}
+
+/// The reply's own accounting must be present and show no model work. A
+/// positive count is confirmed model activity; a missing one is an unexpected
+/// reply, and neither is read as a quota reading.
+fn no_model_activity(reply: &Value) -> Result<(), String> {
+    let turns = reply.get("num_turns").and_then(Value::as_u64);
+    let tokens = reply.pointer("/usage/total_tokens").and_then(Value::as_u64);
+    match (turns, tokens) {
+        (Some(0), Some(0)) => Ok(()),
+        (Some(t), Some(k)) => Err(format!(
+            "agy ran a model turn for /usage ({t} turns, {k} tokens spent): it no longer answers \
+             the slash command itself, and each probe run spends quota. Check \
+             `agy -p /usage --output-format json` by hand."
+        )),
+        _ => Err(format!(
+            "agy /usage reply has no turn or token accounting (num_turns {}, usage.total_tokens {}), \
+             so it cannot be shown that no model turn ran",
+            turns.map_or("missing".into(), |n| n.to_string()),
+            tokens.map_or("missing".into(), |n| n.to_string()),
+        )),
     }
 }
 
@@ -178,16 +245,11 @@ fn refusal_kind(message: &str) -> FailureKind {
     }
 }
 
-/// One resource per bucket. Errors name what was wrong, for the envelope.
-fn resources_from(reply: &Value) -> Result<Vec<Resource>, String> {
+/// One resource per bucket, or an error naming every bucket that would not
+/// read. Partial readings are never returned.
+fn resources_from(reply: &Value, now: i64) -> Result<Vec<Resource>, String> {
     let Some(command) = reply.get("command") else {
-        let tokens = reply.pointer("/usage/total_tokens").and_then(Value::as_u64);
-        return Err(format!(
-            "agy answered /usage without its command block: the slash command reached the model \
-             ({} turns, {} tokens spent). Check `agy -p /usage --output-format json` by hand.",
-            reply.get("num_turns").and_then(Value::as_u64).map_or("?".into(), |n| n.to_string()),
-            tokens.map_or("?".into(), |n| n.to_string()),
-        ));
+        return Err("agy /usage reply has no command block: an unexpected reply, not a reading".into());
     };
     if command.get("name").and_then(Value::as_str) != Some("usage") {
         return Err(format!("agy answered another command: {}", command.get("name").unwrap_or(&Value::Null)));
@@ -195,62 +257,83 @@ fn resources_from(reply: &Value) -> Result<Vec<Resource>, String> {
     let groups = command
         .pointer("/data/groups")
         .and_then(Value::as_array)
-        .ok_or("agy /usage reply has no data.groups")?;
+        .ok_or("agy /usage reply has no data.groups list")?;
 
     let mut resources = vec![];
-    let mut skipped = vec![];
-    for group in groups {
-        let group_name = group.get("name").and_then(Value::as_str).unwrap_or("Unnamed group");
-        for bucket in group.get("buckets").and_then(Value::as_array).into_iter().flatten() {
-            match bucket_resource(group_name, bucket) {
-                Some(r) => resources.push(r),
-                None => skipped.push(bucket.get("id").and_then(Value::as_str).unwrap_or("?").to_string()),
+    let mut unreadable = vec![];
+    for (gi, group) in groups.iter().enumerate() {
+        let group_name = group.get("name").and_then(Value::as_str);
+        let buckets = group.get("buckets").and_then(Value::as_array);
+        let (Some(group_name), Some(buckets)) = (group_name, buckets) else {
+            unreadable.push(format!("group {gi} (no name or no buckets list)"));
+            continue;
+        };
+        for (bi, bucket) in buckets.iter().enumerate() {
+            match bucket_resource(group_name, bucket, now) {
+                Ok(r) => resources.push(r),
+                Err(why) => {
+                    let id = bucket.get("id").and_then(Value::as_str).map_or(format!("{group_name} #{bi}"), str::to_string);
+                    unreadable.push(format!("{id} ({why})"));
+                }
             }
         }
     }
+    if !unreadable.is_empty() {
+        return Err(format!("agy /usage reply has unreadable limits: {}", unreadable.join("; ")));
+    }
     if resources.is_empty() {
-        return Err(format!(
-            "agy /usage reply held no readable bucket (unreadable: {})",
-            if skipped.is_empty() { "none sent".to_string() } else { skipped.join(", ") }
-        ));
+        return Err("agy /usage reply holds no limit buckets".into());
     }
     Ok(resources)
 }
 
-fn bucket_resource(group_name: &str, bucket: &Value) -> Option<Resource> {
-    let id = bucket.get("id").and_then(Value::as_str)?;
-    let remaining = bucket.get("remaining_fraction").and_then(Value::as_f64)?;
-    // Refuse, do not clamp: a percentage arriving here would read 97.1 as
-    // "used −9610%" clamped to healthy.
+fn bucket_resource(group_name: &str, bucket: &Value, now: i64) -> Result<Resource, String> {
+    let id = bucket.get("id").and_then(Value::as_str).ok_or("no id")?;
+    let remaining = bucket.get("remaining_fraction").and_then(Value::as_f64).ok_or("no remaining_fraction")?;
+    // Refuse, do not clamp: a percentage arriving here (97.12) is a scale
+    // change, not a reading.
     if !remaining.is_finite() || !(0.0..=1.0).contains(&remaining) {
-        return None;
+        return Err(format!("remaining_fraction {remaining} outside 0..=1"));
     }
     let window = bucket.get("window").and_then(Value::as_str);
     let window_secs = window.and_then(window_secs);
-    let resets_at = bucket
-        .get("reset_time")
-        .and_then(Value::as_str)
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.timestamp());
-    Some(Resource {
+    let reset_time = bucket.get("reset_time").and_then(Value::as_str).ok_or("no reset_time")?;
+    let resets_at = chrono::DateTime::parse_from_rfc3339(reset_time)
+        .map_err(|e| format!("reset_time {reset_time:?}: {e}"))?
+        .timestamp();
+
+    // A window nobody has used has not started: `agy` reports its reset as
+    // "now + window", which moves with every read (23 Nov 2026). Nothing is
+    // counting down, so nothing can perish, and the moving time is not a
+    // deadline; core also matches windows on `resets_at`, so passing it on
+    // would start a new window at every read. Both signals are required: the
+    // full fraction and the synthetic time.
+    let not_started = remaining == 1.0
+        && window_secs.is_some_and(|w| (resets_at - (now + w)).abs() <= NOT_STARTED_SLACK_SECS);
+
+    Ok(Resource {
         id: format!("antigravity-{id}"),
         label: format!("{} ({})", short_group(group_name), window_label(window, window_secs)),
         kind_hint: KindHint::ResetWindow,
         facets: Facets {
             utilization: Some(1.0 - remaining),
-            resets_at,
+            resets_at: (!not_started).then_some(resets_at),
             window_secs,
-            // Plan allowance not spent before the reset is gone.
-            expires_unused: Some(true),
+            // A started window "will fully refresh" at its reset (the vendor's
+            // own bucket description): the fraction returns to 1, so what was
+            // not spent is not carried over. That is `USAGEWATCH.md`'s
+            // `Some(true)`, surplus lost at the reset. A window that has not
+            // started has nothing counting down: `Some(false)`.
+            expires_unused: Some(!not_started),
             ..Default::default()
         },
-        vendor_status: None,
+        vendor_status: not_started.then(|| "not started".to_string()),
         vendor_representative: id == REPRESENTATIVE_BUCKET,
     })
 }
 
-/// `weekly` and `5h` are the two `agy` sends; `<n>h` and `<n>d` are read
-/// generally, anything else is a window of unknown length.
+/// `weekly` and `5h` are the two `agy` sends; `<n>h`, `<n>d` and `<n>m` are
+/// read generally, anything else is a window of unknown length.
 fn window_secs(window: &str) -> Option<i64> {
     match window {
         "weekly" => Some(7 * 86_400),
@@ -296,11 +379,19 @@ fn short_group(name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A real reply, captured 23 Nov 2026 12:15 from agy 1.5.15.
+    /// A real reply, captured 23 Nov 2026 12:15:36 UTC from agy 1.5.15. The
+    /// Claude/GPT buckets were unused: their reset is that moment + window.
     const REAL: &str = include_str!("../tests/fixtures/usage-2026-11-23.json");
+    fn captured_at() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-11-23T12:15:36Z").unwrap().timestamp()
+    }
 
     fn run(stdout: &str, stderr: &str, exit_code: i32) -> Run {
         Run { stdout: stdout.into(), stderr: stderr.into(), exit_code: Some(exit_code) }
+    }
+
+    fn read(stdout: &str) -> Observation {
+        observe(&run(stdout, "", 0), captured_at())
     }
 
     fn resources(obs: &Observation) -> &[Resource] {
@@ -310,16 +401,16 @@ mod tests {
         }
     }
 
-    fn failure(obs: &Observation) -> (&FailureKind, &str) {
+    fn failure(obs: &Observation) -> (FailureKind, String) {
         match &obs.outcome {
-            Outcome::Failure { kind, message, .. } => (kind, message),
+            Outcome::Failure { kind, message, .. } => (kind.clone(), message.clone()),
             Outcome::Ok { .. } => panic!("expected a failure"),
         }
     }
 
     #[test]
     fn the_real_reply_gives_four_account_buckets() {
-        let obs = observe(&run(REAL, "", 0));
+        let obs = read(REAL);
         let rs = resources(&obs);
         let ids: Vec<_> = rs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
@@ -339,7 +430,6 @@ mod tests {
         assert_eq!(rs[1].facets.window_secs, Some(18_000));
         assert_eq!(week.facets.resets_at, Some(chrono::DateTime::parse_from_rfc3339("2026-11-29T22:27:03Z").unwrap().timestamp()));
         assert_eq!(week.facets.expires_unused, Some(true));
-        assert_eq!(rs[2].facets.utilization, Some(0.0));
 
         assert_eq!(obs.scope, MeterScope::Account);
         assert_eq!(obs.provider, "google");
@@ -353,56 +443,130 @@ mod tests {
         }
     }
 
+    /// The unused Claude/GPT buckets: no deadline, nothing perishes.
+    #[test]
+    fn a_window_that_has_not_started_has_no_reset_and_nothing_perishes() {
+        let obs = read(REAL);
+        for r in &resources(&obs)[2..] {
+            assert_eq!(r.facets.utilization, Some(0.0), "{}", r.id);
+            assert_eq!(r.facets.resets_at, None, "{}", r.id);
+            assert_eq!(r.facets.expires_unused, Some(false), "{}", r.id);
+            assert_eq!(r.vendor_status.as_deref(), Some("not started"), "{}", r.id);
+        }
+        // A full bucket whose reset is not "now + window" has started (it may
+        // round to 1): its reset stands.
+        let later = observe(&run(REAL, "", 0), captured_at() - 3_600);
+        let r = &resources(&later)[2];
+        assert!(r.facets.resets_at.is_some() && r.facets.expires_unused == Some(true), "{r:?}");
+    }
+
     #[test]
     fn a_banner_before_the_reply_is_skipped() {
         let stdout = format!("A new version of agy is available\n{}", REAL.trim());
-        assert_eq!(resources(&observe(&run(&stdout, "", 0))).len(), 4);
+        assert_eq!(resources(&read(&stdout)).len(), 4);
     }
 
-    /// Known red: `/usage` sent to the model as a prompt. No command block,
-    /// tokens spent: never read the model's prose as a reading.
+    /// Known red: `/usage` sent to the model as a prompt, with or without a
+    /// command block. Never a reading.
     #[test]
-    fn a_usage_that_reached_the_model_is_refused() {
-        let stdout = r#"{"status":"SUCCESS","response":"Gemini Models Weekly 98%","num_turns":1,"usage":{"total_tokens":4211}}"#;
-        let obs = observe(&run(stdout, "", 0));
-        let (kind, message) = failure(&obs);
-        assert_eq!(*kind, FailureKind::MalformedResponse);
-        assert!(message.contains("reached the model") && message.contains("4211 tokens"), "{message}");
+    fn model_activity_is_refused_in_any_shape() {
+        let prose = r#"{"status":"SUCCESS","response":"Gemini Models Weekly 98%","num_turns":1,"usage":{"total_tokens":4211}}"#;
+        let (kind, message) = failure(&read(prose));
+        assert_eq!(kind, FailureKind::MalformedResponse);
+        assert!(message.contains("1 turns, 4211 tokens"), "{message}");
+
+        let with_block = REAL.replace(r#""num_turns":0"#, r#""num_turns":1"#);
+        assert_ne!(with_block, REAL);
+        let (kind, message) = failure(&read(&with_block));
+        assert_eq!(kind, FailureKind::MalformedResponse);
+        assert!(message.contains("model turn"), "{message}");
+
+        let tokens_only = REAL.replace(r#""total_tokens":0"#, r#""total_tokens":12"#);
+        assert_ne!(tokens_only, REAL);
+        assert!(failure(&read(&tokens_only)).1.contains("12 tokens"));
     }
 
     #[test]
-    fn a_percentage_where_a_fraction_belongs_is_not_read() {
-        let stdout = REAL.replace("0.9712302684783936", "97.12");
-        let obs = observe(&run(&stdout, "", 0));
-        let ids: Vec<_> = resources(&obs).iter().map(|r| r.id.clone()).collect();
-        assert!(!ids.contains(&"antigravity-gemini-weekly".to_string()), "{ids:?}");
-        assert_eq!(ids.len(), 3);
+    fn missing_accounting_is_refused_not_assumed_zero() {
+        let mut reply: Value = serde_json::from_str(REAL).unwrap();
+        reply.as_object_mut().unwrap().remove("num_turns");
+        let (kind, message) = failure(&read(&reply.to_string()));
+        assert_eq!(kind, FailureKind::MalformedResponse);
+        assert!(message.contains("num_turns missing"), "{message}");
+
+        let mut reply: Value = serde_json::from_str(REAL).unwrap();
+        reply.as_object_mut().unwrap().remove("usage");
+        assert!(failure(&read(&reply.to_string())).1.contains("usage.total_tokens missing"));
     }
 
     #[test]
-    fn no_readable_bucket_is_malformed() {
-        let stdout = r#"{"status":"SUCCESS","num_turns":0,"command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly"}]}]}}}"#;
-        let obs = observe(&run(stdout, "", 0));
-        let (kind, message) = failure(&obs);
-        assert_eq!(*kind, FailureKind::MalformedResponse);
-        assert!(message.contains("gemini-weekly"), "{message}");
+    fn a_reply_without_its_command_block_is_unexpected_not_proof_of_a_turn() {
+        let mut reply: Value = serde_json::from_str(REAL).unwrap();
+        reply.as_object_mut().unwrap().remove("command");
+        let (kind, message) = failure(&read(&reply.to_string()));
+        assert_eq!(kind, FailureKind::MalformedResponse);
+        assert!(message.contains("no command block") && !message.contains("model turn"), "{message}");
+    }
+
+    #[test]
+    fn a_nonzero_exit_with_success_shaped_json_is_not_a_reading() {
+        let obs = observe(&run(REAL, "panic: something", 2), captured_at());
+        let (_, message) = failure(&obs);
+        assert!(message.contains("exit Some(2)") && message.contains("panic: something"), "{message}");
+    }
+
+    /// Known red for the range check, and the reason a reading is all or
+    /// nothing: the bucket that bounds Neon's overnight work must not vanish
+    /// while the rest read as a healthy account.
+    #[test]
+    fn one_unreadable_bucket_fails_the_whole_reading() {
+        let percentage = REAL.replace("0.9712302684783936", "97.12");
+        assert_ne!(percentage, REAL);
+        let (kind, message) = failure(&read(&percentage));
+        assert_eq!(kind, FailureKind::MalformedResponse);
+        assert!(message.contains("gemini-weekly (remaining_fraction 97.12 outside 0..=1)"), "{message}");
+
+        let no_reset = REAL.replace(r#""reset_time":"2026-11-23T15:28:53Z""#, r#""reset_time":"soon""#);
+        assert_ne!(no_reset, REAL);
+        assert!(failure(&read(&no_reset)).1.contains("gemini-5h (reset_time"));
+
+        let not_object = REAL.replacen(r#"{"id":"3p-5h""#, r#""junk",{"id":"3p-5h""#, 1);
+        assert_ne!(not_object, REAL);
+        assert!(failure(&read(&not_object)).1.contains("Claude and GPT models #1 (no id)"));
+
+        let no_buckets = REAL.replacen(r#""buckets":["#, r#""bucketz":["#, 1);
+        assert!(failure(&read(&no_buckets)).1.contains("group 0 (no name or no buckets list)"));
     }
 
     #[test]
     fn a_lost_sign_in_is_credentials() {
         let stdout = r#"{"status":"ERROR","response":"error getting token source: You are not logged into Antigravity."}"#;
-        assert_eq!(*failure(&observe(&run(stdout, "", 1))).0, FailureKind::InvalidCredentials);
+        assert_eq!(failure(&observe(&run(stdout, "", 1), captured_at())).0, FailureKind::InvalidCredentials);
         let stderr = "Eligibility check failed: Verify your account to continue.";
-        assert_eq!(*failure(&observe(&run("", stderr, 1))).0, FailureKind::InvalidCredentials);
+        assert_eq!(failure(&observe(&run("", stderr, 1), captured_at())).0, FailureKind::InvalidCredentials);
     }
 
     #[test]
     fn a_launcher_refusal_is_reported_with_its_words() {
         let stderr = "ai-masked: refusing to start: a folder could not be hidden";
-        let obs = observe(&run("", stderr, masked_launch::REFUSED_EXIT));
+        let obs = observe(&run("", stderr, masked_launch::REFUSED_EXIT), captured_at());
         let (_, message) = failure(&obs);
         assert!(message.contains("ai-masked: refusing to start"), "{message}");
         assert_eq!(obs.scope, MeterScope::Account);
+    }
+
+    #[test]
+    fn each_run_folder_is_new_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = RunDir::new().unwrap();
+        let b = RunDir::new().unwrap();
+        assert_ne!(a.0, b.0);
+        assert_eq!(std::fs::read_dir(&a.0).unwrap().count(), 0);
+        assert_eq!(std::fs::metadata(&a.0).unwrap().permissions().mode() & 0o777, 0o700);
+        let path = a.0.clone();
+        std::fs::write(path.join("left-by-agy"), b"x").unwrap();
+        drop(a);
+        assert!(!path.exists(), "removed with what agy left in it");
     }
 
     #[test]

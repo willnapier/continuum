@@ -39,6 +39,35 @@ fn the_read_starts_agy_through_the_launcher() {
     assert!(envelope.contains("antigravity-gemini-weekly"), "{envelope}");
 }
 
+/// agy runs from a folder made new for that run, under `TMPDIR`, empty, and
+/// gone afterwards; two runs never share one.
+#[test]
+fn each_run_starts_agy_in_a_new_empty_folder_that_is_removed() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "antigravity-cwd");
+    scratch.stand_in_launcher();
+    let seen = scratch.root.join("cwd.log");
+    let record = format!(
+        "printf 'cwd:%s\\n' \"$PWD\" >> '{s}'\nfor f in * .[!.]*; do [ -e \"$f\" ] && printf 'entry:%s\\n' \"$f\" >> '{s}'; done\n: > left-behind\n",
+        s = seen.display()
+    );
+    scratch.harness("agy", &format!("{record}{}", reply()));
+
+    for _ in 0..2 {
+        let output = scratch.command(PROBE).output().unwrap();
+        assert!(output.status.success(), "{}", said(&output));
+    }
+
+    let lines: Vec<String> = std::fs::read_to_string(&seen).unwrap().lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 2, "two cwd lines and no entries: {lines:?}");
+    let tmp = scratch.root.join("tmp");
+    let dirs: Vec<&str> = lines.iter().map(|l| l.strip_prefix("cwd:").expect("only cwd lines")).collect();
+    assert_ne!(dirs[0], dirs[1], "each run has its own folder");
+    for dir in dirs {
+        assert!(std::path::Path::new(dir).starts_with(&tmp), "{dir} under TMPDIR");
+        assert!(!std::path::Path::new(dir).exists(), "{dir} removed after the run");
+    }
+}
+
 #[test]
 fn without_the_launcher_agy_is_not_started() {
     let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "antigravity-refuse");
