@@ -1380,6 +1380,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "usage-probe-antigravity"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "continuum-usage-core",
+ "serde_json",
+]
+
+[[package]]
 name = "usage-probe-claude"
 version = "0.1.0"
 dependencies = [
