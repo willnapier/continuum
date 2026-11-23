@@ -7,6 +7,7 @@
 // itself forever. Resolution now skips our own executable by identity.
 
 use color_eyre::{eyre::Context, Result};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
@@ -51,14 +52,31 @@ fn main() -> Result<()> {
     }
     let real_codex = resolution.path.to_string_lossy().into_owned();
 
-    // Check for no-save marker file
+    // On Linux Codex starts through the mask launcher, `ai-masked <codex> …`,
+    // which hides the protected folders and then becomes Codex in the same
+    // process; on macOS it starts directly, as before
+    // (`continuum_core::masked_launch`, ~/Assistants/shared/AI-FOOTING-MASK.md).
+    // A missing launcher is an error here: there is no direct start to fall
+    // back to. The resolver above is unaffected: it has already chosen the
+    // real Codex by path, and the depth guard below still reaches Codex
+    // through the launcher.
+    let launch = continuum_core::masked_launch::harness_launch(&real_codex)
+        .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
+
+    // Reserve the no-save request, if there is one; do not use it up yet. A
+    // launcher that is found may still refuse (exit 113), not be runnable, or
+    // be ended by a signal before its exec. The request is used up only when
+    // the child exited with a status that is not one of the launcher's own,
+    // which shows that Codex ran. It is given back when the spawn fails, when
+    // the child exits 113, 126 or 127, and when a signal ends the child
+    // (`continuum_core::nosave_request`). A Codex that itself ends in one of
+    // those ways after a real session gets its request back too, so the next
+    // session is not saved either: the mistake is made in the safe direction.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -66,9 +84,12 @@ fn main() -> Result<()> {
     let sessions_dir = std::path::PathBuf::from(&home).join(".codex/sessions");
 
     let before_session = find_latest_session_file(&sessions_dir);
+    // For a no-save start: every rollout that exists now. One that is not in
+    // this set afterwards was made after this point (see below).
+    let rollouts_before = skip_saving.then(|| rollout_files(&sessions_dir));
 
     // Spawn codex as a child process
-    let mut command = Command::new(&real_codex);
+    let mut command = launch.command();
     configure_clipboard(&mut command);
     if skip_saving {
         // Seen by the per-turn Stop hook through codex's environment.
@@ -81,8 +102,35 @@ fn main() -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn codex process")?;
+        .with_context(|| continuum_core::masked_launch::spawn_failure("codex"))?;
     let status = child.wait()?;
+
+    // Settle the no-save request and decide whether there is a session of
+    // this start to work on (`nosave_request::AfterChild`). This wrapper has
+    // no evidence of its own that ties a session to its child (it only knows
+    // the newest session file, which may be another Codex's), so it passes
+    // none. After a launcher code or a signal there is then nothing to import
+    // or discard here: the newest session file below would be some other
+    // session's, and discarding it could delete a session that was meant to
+    // be kept.
+    //
+    // But a Codex may have run a no-save session before it ended that way,
+    // and its hooks may not have registered it (a hook that failed or is not
+    // trusted yet). The timer would then store it. So for a no-save start,
+    // every rollout made since the snapshot above is registered as no-save.
+    // Nothing is deleted, and no rollout that existed before is touched. The
+    // session of this start, if there was one, is among them, whichever it
+    // is. The cost: another Codex session that began between the snapshot and
+    // this child's end is registered too, and is not saved from then on. Not
+    // covered: a no-save `codex resume`, which writes on in a rollout that
+    // existed before; that still relies on its hooks.
+    let after = nosave_request::settle_at_exit(nosave, status.code(), false);
+    if !after.session_of_this_start {
+        if let Some(before) = &rollouts_before {
+            register_new_rollouts_as_no_save(&sessions_dir, before);
+        }
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // After codex exits, find the session that was just modified
     let after_session = find_latest_session_file(&sessions_dir);
@@ -136,6 +184,45 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(status.code().unwrap_or(1))
+}
+
+/// Every Codex rollout under `sessions_dir` (`YYYY/MM/DD/rollout-*.jsonl`).
+fn rollout_files(sessions_dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut found = std::collections::HashSet::new();
+    let mut dirs = vec![sessions_dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_rollout = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+            if path.is_dir() {
+                dirs.push(path);
+            } else if is_rollout {
+                found.insert(path);
+            }
+        }
+    }
+    found
+}
+
+/// Register as no-save every rollout that is there now and was not in
+/// `before`: the backstop for a no-save start that ended without showing which
+/// session was its own. Stored copies and the rollouts themselves are left
+/// alone.
+fn register_new_rollouts_as_no_save(sessions_dir: &std::path::Path, before: &std::collections::HashSet<std::path::PathBuf>) {
+    let mut registered = 0;
+    for rollout in rollout_files(sessions_dir).difference(before) {
+        match register_only(rollout) {
+            Ok(_) => registered += 1,
+            Err(e) => eprintln!("⚠ Warning: could not mark {} no-save: {e}", rollout.display()),
+        }
+    }
+    if registered > 0 {
+        eprintln!("✗ Marked {registered} Codex session(s) begun during this no-save start as no-save");
+    }
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {

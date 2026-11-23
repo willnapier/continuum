@@ -22,10 +22,11 @@
 //! is only what is Codex's own.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use continuum_usage_core::envelope::{FailureKind, Observation, Outcome};
+use continuum_usage_core::masked_launch;
 use continuum_usage_core::smoke::{
     self, kind_for, tail, Run, SmokeProbe, Verdict, PROMPT, REQUEST_TIMEOUT,
 };
@@ -84,7 +85,9 @@ fn probe() -> Observation {
 fn run_codex(codex: &Path) -> Result<Run, String> {
     let workdir = std::env::temp_dir().join("usage-probe-codex-smoke");
     std::fs::create_dir_all(&workdir).map_err(|e| format!("scratch dir: {e}"))?;
-    let mut cmd = Command::new(codex);
+    // Through the mask launcher on Linux (`ai-masked <codex> …`), directly
+    // elsewhere; a missing launcher is the error, never a direct start.
+    let mut cmd = masked_launch::harness_command(codex)?;
     cmd.args([
         "exec",
         "--skip-git-repo-check",

@@ -104,6 +104,100 @@ does the same for Claude Code. Each wrapper:
 `continuum-claude` also queues a DayPage line (`daypage-append`) when a session
 with exchanges ended without writing one.
 
+**On Linux the harness starts through the mask launcher.** `continuum-claude`,
+`continuum-codex`, `continuum-gemini` and `continuum-goose` run
+`ai-masked <real harness> <arguments>` in place of
+`<real harness> <arguments>`. `ai-masked` hides the protected folders (the
+clinical trees) from the harness, sets `AI_FOOTING=masked`, drops
+`ANTHROPIC_API_KEY`, and then becomes the harness in the same process, so the
+wrapper waits for it and reads its exit code as before. The Nushell functions
+start the wrappers through the launcher too, but Zellij's session resurrection
+and other callers run `continuum-claude …` directly, so the wrappers do it
+themselves. If `ai-masked` is not on `PATH` or in `~/.local/bin`, the wrapper
+reports that and exits without starting the harness: it never starts it
+directly instead (install the launcher with `rust-redeploy --only ai-masked`).
+When the launcher itself refuses, it prints its reason and the wrapper exits
+with the launcher's code, 113. The usage probes that start a harness follow the
+same rule (section 3). The rule is one file, `continuum-core/src/masked_launch.rs`,
+which `continuum-usage-core` also compiles. On macOS the harness is still
+started directly, until the mask reaches the Mac. What is hidden, and how to
+tell that a session is masked: `~/Assistants/shared/AI-FOOTING-MASK.md`.
+
+**A no-save request is used up only by a session that started.** A wrapper
+that finds `~/.continuum-nosave` does not delete it at once. It reserves it,
+by renaming it to `.continuum-nosave.reserved-<its own PID>`, so of two
+wrappers started together exactly one takes the request. This part is the same
+on macOS. The request is then settled when the child has ended
+(`continuum-core/src/nosave_request.rs`):
+
+| How the child ended | The no-save request | Import, deletion, DayPage line |
+|---|---|---|
+| The start itself failed (the launcher could not be run) | given back | none |
+| Exit with a status that is not one of the launcher's | used up | as usual |
+| Exit 113 (the launcher refused), 126 or 127 (it could not run the harness) | given back | only if the wrapper saw a session |
+| A signal | used up only if the wrapper saw a session; otherwise given back | only if the wrapper saw a session |
+
+"Given back" means the reservation is renamed to the marker again, so the next
+start is still not saved. Only an exit with a status that is not the
+launcher's own shows that a harness ran. A signal does not: the child is the
+launcher until its exec, and a signal may have ended it before that. Without
+this rule a no-save `continuum-claude --continue` whose launcher refused or
+was killed would have deleted the newest earlier transcript, which that start
+never ran.
+
+"The wrapper saw a session" is evidence of the wrapper's own, tied to its
+child's PID. In interactive mode `continuum-claude` looks while the child
+runs, in two places. The first is Claude Code's record of itself,
+`~/.claude/sessions/<pid>.json`, which names the session that process is
+running; it counts only if it was written after the child was spawned and
+names that PID. Claude Code appends to its transcript and closes it again, so
+this record is what identifies a session in practice. The second is a
+transcript the child holds open, read from `/proc/<pid>/fd` on Linux (`lsof` is
+asked only where there is no `/proc`). In print mode the evidence is a session
+event on the child's output. `continuum-codex`, `continuum-gemini` and
+`continuum-goose` have none: they only know the newest session, which may be
+another start's.
+
+**What keeps a no-save session out of Continuum when the wrapper did not see
+it.** Every importer, the timers included, consults the no-save registry
+(`~/.local/share/continuum/nosave-sessions/`) before it reads a transcript
+(`continuum-core/src/import.rs`). Who enters the session there differs:
+
+- **Claude Code.** The wrapper starts it with `CONTINUUM_NOSAVE=1`, and its
+  SessionStart and Stop hooks (`continuum import --hook`) enter the session's
+  id. So a no-save session that a signal ended, and that the wrapper did not
+  see, is refused by the later sync; what the wrapper leaves undone is
+  deleting Claude Code's own transcript. When the wrapper did see the session,
+  it enters it itself and deletes the transcript, as at any no-save exit.
+- **Codex.** Its hooks do the same, but Codex runs a hook only once it is
+  trusted on that machine, and `continuum-codex` cannot tell which session was
+  its own. So when a no-save start ends by a signal or with one of the
+  launcher's codes, the wrapper enters every rollout made since it started.
+  It deletes nothing and leaves alone every rollout that was there before.
+  The cost: another Codex session that began in that time is entered too and
+  is not saved from then on. Not covered: a no-save `codex resume`, which
+  writes on in a rollout that was there before, and so still relies on its
+  hooks.
+- **Gemini and Goose.** No hook or timer imports their sessions: only their
+  own wrapper does, at exit. So a session the wrapper does not import is not
+  put in Continuum later, and there is no importer for a registry entry to
+  stop. (`continuum import -a goose`, run by hand, imports the newest Goose
+  session and does not consult the registry.)
+
+Two consequences are accepted, both towards not saving. The launcher's codes
+are not reserved, and a signal can end a real harness: a harness that ends in
+one of those ways after a real session the wrapper did not see gets its
+request back, and the next session is then not saved either. The wrapper also
+does no import at exit for that session. A Claude Code or Codex session that
+was not no-save is still recorded by its hooks and the timers; a Gemini or
+Goose session that a signal ended is not imported.
+
+One case is not covered. A wrapper that is itself killed between reserving
+and settling leaves its reservation file behind. If the harness had started,
+the request was delivered. If it had not (the wrapper was killed before the
+launcher's exec), the request is lost, as it was when the marker was deleted
+first. No wrapper touches a reservation that is not its own.
+
 **Continuum owns the real Codex CLI.** It installs Codex off `PATH`, under
 `~/.local/share/continuum/codex/`. `continuum codex update` updates that copy,
 and `continuum codex which` reports which binary is selected. One resolver in
@@ -131,7 +225,8 @@ The wrapper does not alter SSH identity, Codex arguments or clipboard contents.
 Offline process controls: build `cargo build --locked -p continuum-codex`, then
 run `python3 continuum-codex/tests/clipboard_launch.py target/debug/continuum-codex`.
 These use a fake child in a private home and pseudo-terminals, with no provider
-calls or access to a real clipboard. Physical Mac/Ghostty/mosh delivery still
+calls or access to a real clipboard. On Linux they put a stand-in `ai-masked`
+first on `PATH`, so the real launcher is not run. Physical Mac/Ghostty/mosh delivery still
 needs a selection and paste check after reopening a client.
 
 Since the per-turn hooks arrived (October 2026), capture no longer depends on the
@@ -166,6 +261,13 @@ one JSON object. The core holds no vendor code and no credentials. Smoke probes
 (`*-smoke`) send one small real request each hour, to prove a request actually
 goes through. A timer (`usagewatch-monitor`) refreshes on a cadence and sends
 desktop notifications.
+
+Four probes start a harness: the three smoke probes, and `usage-probe-codex`,
+which runs `codex app-server` to read the rate limits. On Linux each starts it
+through `ai-masked`, by the same rule as the wrappers (section 2). Without the
+launcher the probe reports a failed reading that names `ai-masked`, and starts
+nothing. This matters most for `usage-probe-codex`: a `codex app-server` outside
+the mask makes the launcher refuse every other Codex start while it lives.
 
 usagewatch is advice only. It never changes a tier, model, effort level or
 route. The dispatcher may read its stored observations as advice; it doesn't

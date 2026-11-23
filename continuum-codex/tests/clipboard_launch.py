@@ -33,6 +33,16 @@ class ClipboardLaunch(unittest.TestCase):
             env.update(HOME=directory, CONTINUUM_CODEX_BIN=str(child),
                        DISPLAY=":clipboard-fixture", WAYLAND_DISPLAY="wayland-fixture",
                        WAYLAND_SOCKET="12345")
+            if sys.platform == "linux":
+                # On Linux the wrapper starts Codex through `ai-masked`
+                # (~/Assistants/shared/AI-FOOTING-MASK.md). A stand-in first on
+                # PATH becomes its arguments, as the real launcher does, so
+                # these controls never run the real one against a scratch HOME.
+                launcher = root / "bin" / "ai-masked"
+                launcher.parent.mkdir()
+                launcher.write_text('#!/bin/sh\nexec "$@"\n')
+                launcher.chmod(0o700)
+                env["PATH"] = f"{launcher.parent}{os.pathsep}{env.get('PATH', '')}"
             if zellij is not None:
                 env["ZELLIJ"] = zellij
             if native is not None:

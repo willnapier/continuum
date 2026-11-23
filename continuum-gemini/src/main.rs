@@ -1,8 +1,9 @@
 // Continuum-Gemini: Transparent wrapper for Gemini CLI
 // Automatically captures all conversations to plain-text JSONL files
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use color_eyre::{eyre::Context, Result};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -48,13 +49,28 @@ fn main() -> Result<()> {
         gemini_path_str
     };
 
-    // Check for no-save marker file
+    // On Linux Gemini starts through the mask launcher, `ai-masked <gemini> …`,
+    // which hides the protected folders and then becomes Gemini in the same
+    // process; on macOS it starts directly, as before
+    // (`continuum_core::masked_launch`, ~/Assistants/shared/AI-FOOTING-MASK.md).
+    // A missing launcher is an error here: there is no direct start to fall
+    // back to.
+    let launch = continuum_core::masked_launch::harness_launch(&real_gemini)
+        .map_err(|reason| color_eyre::eyre::eyre!(reason))?;
+
+    // Reserve the no-save request, if there is one; do not use it up yet. It
+    // is used up only when the child exited with a status that is not one of
+    // the launcher's own, which shows that Gemini ran. It is given back when
+    // the spawn fails, when the child exits 113, 126 or 127, and when a signal
+    // ends the child, perhaps before the launcher's exec
+    // (`continuum_core::nosave_request`). A Gemini that itself ends in one of
+    // those ways after a real session gets its request back too, so the next
+    // session is not saved either: the mistake is made in the safe direction.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("\u{26a0} This conversation will NOT be saved to continuum logs");
     }
 
@@ -63,14 +79,25 @@ fn main() -> Result<()> {
     let before_sessions = snapshot_session_files(&gemini_tmp);
 
     // Spawn gemini as a child process
-    let status = Command::new(&real_gemini)
+    let status = launch
+        .command()
         .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn gemini process")?
+        .with_context(|| continuum_core::masked_launch::spawn_failure("gemini"))?
         .wait()?;
+
+    // Settle the no-save request and decide whether there is a session of
+    // this start to work on (`nosave_request::AfterChild`). This wrapper has
+    // no evidence of its own that ties a session to its child, so it passes
+    // none: after a launcher code or a signal it imports nothing. (A real
+    // Gemini session that a signal ended is then not imported at exit.)
+    let after = nosave_request::settle_at_exit(nosave, status.code(), false);
+    if !after.session_of_this_start {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     // After gemini exits, find new or modified session files
     if !skip_saving {

@@ -26,8 +26,13 @@ claude        # Start Claude Code - won't be saved
 2. When you start any assistant (claude/codex/goose), it:
    - Detects the marker
    - Shows: `⚠ This conversation will NOT be saved to continuum logs`
-   - Deletes the marker immediately
+   - Takes the marker for itself (it is renamed to
+     `~/.continuum-nosave.reserved-<PID>` while the assistant runs, and removed
+     when it exits)
    - Runs normally but doesn't save to `~/continuum-logs/`
+   - If the assistant could not be started, or ended in a way that does not
+     show it ran (a signal, with no session seen), puts the marker back, so
+     the next start is still not saved (see "Wrap" in `ARCHITECTURE.md`)
 
 ### Use Cases
 
@@ -50,7 +55,8 @@ The `nosave` command creates a single file: `~/.continuum-nosave`
 
 When **any assistant starts in any terminal**, it:
 1. Checks for `~/.continuum-nosave`
-2. If found: Deletes it and skips saving
+2. If found: takes it (by renaming it) and skips saving; if the assistant then
+   cannot be started, the marker is put back
 3. If not found: Saves normally
 
 **This means:**
@@ -232,7 +238,8 @@ Use review mode (`r`) when:
 - **Location**: `~/.continuum-nosave`
 - **Created by**: `nosave` command
 - **Consumed by**: First assistant that starts after marker is created
-- **Deleted**: Immediately when detected (single-use)
+- **Taken**: when detected, by renaming it to `~/.continuum-nosave.reserved-<PID>` (single-use)
+- **Removed**: when that assistant exits; **put back** if it could not be started, or ended without showing that it ran
 
 ### Session Directory Structure
 

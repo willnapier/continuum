@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use color_eyre::{eyre::Context, Result};
+use continuum_core::masked_launch::{self, Launch};
+use continuum_core::nosave_request::{self, NoSaveRequest};
 use continuum_core::{PlainTextWriter, NoiseFilter};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -21,12 +23,43 @@ use tokio::process::Command;
 /// in its own environment (13 Nov 2026: twelve sessions came back on the key).
 /// The same happens with `zellij action new-tab -- continuum-claude` and with
 /// the bash alias. cc-clinical runs its pinned binary, not this wrapper, so no
-/// launch through here needs the key.
+/// launch through here needs the key. On Linux the mask launcher drops it as
+/// well; it is still removed here, so macOS and a launcher that changes later
+/// are covered.
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-/// The command that runs Claude Code, for both modes.
-fn claude_command(program: &str, skip_saving: bool) -> Command {
-    let mut command = Command::new(program);
+/// How Claude Code is started, for both modes: on Linux through the mask
+/// launcher, `ai-masked <program> …`, which hides the protected folders and
+/// then becomes Claude Code in the same process; on macOS directly, as before.
+/// The rule and its reasons are in `continuum_core::masked_launch` and
+/// `~/Assistants/shared/AI-FOOTING-MASK.md`. The Nushell `claude` function
+/// starts this wrapper through the launcher too, but Zellij's session
+/// resurrection and other callers run `continuum-claude …` directly.
+///
+/// An error means the launcher was not found. Claude Code is then not started
+/// at all: there is no direct start to fall back to.
+///
+/// Finding the launcher does not mean Claude Code will start: the launcher
+/// may refuse (exit 113), may not be runnable, or may be ended by a signal
+/// before its exec. A no-save request is therefore only reserved before the
+/// start (`NoSaveRequest::reserve`), never used up there. It is used up when
+/// the child exited with a status that is not one of the launcher's own, which
+/// shows that Claude Code ran. It is given back when the spawn fails, when
+/// the child exits with one of the launcher's codes (113, 126, 127), and when
+/// a signal ends the child and this wrapper saw no session of it
+/// (`nosave_request::settle_at_exit`). A Claude Code that itself exits with
+/// one of those codes, or is ended by a signal unseen, after a real session
+/// also gets its request back, so the next session is not saved either: the
+/// mistake is made in the safe direction.
+fn claude_launch(program: &str) -> Result<Launch> {
+    masked_launch::harness_launch(program).map_err(|reason| color_eyre::eyre::eyre!(reason))
+}
+
+/// The command that runs Claude Code, for both modes. The caller adds the
+/// user's arguments.
+fn claude_command(launch: &Launch, skip_saving: bool) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.args(&launch.lead_args);
     command.env_remove(API_KEY_ENV);
     if skip_saving {
         // CONTINUUM_NOSAVE reaches the per-turn Stop hook (`continuum import
@@ -59,14 +92,15 @@ async fn main() -> Result<()> {
 }
 
 async fn run_with_logging(original_args: &[String]) -> Result<()> {
-    // Check for no-save marker file
+    let launch = claude_launch("claude")?;
+
+    // Reserve the no-save request, if there is one. It is settled when the
+    // child has finished; an error return before then gives it back.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -97,7 +131,7 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     };
 
     // Spawn claude process.
-    let mut child = claude_command("claude", skip_saving)
+    let mut child = claude_command(&launch, skip_saving)
         .args(&args)
         .stdin(if user_prompt.is_some() {
             Stdio::piped()
@@ -107,15 +141,24 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn claude process")?;
+        .with_context(|| masked_launch::spawn_failure("claude"))?;
 
     // If we captured stdin, write it to claude's stdin
     if let Some(ref prompt) = user_prompt {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.shutdown().await?;
+            // A child that has already gone has closed this pipe: a launcher
+            // that refused, for one. That is not this wrapper's error. Its
+            // stderr and exit code are passed on below and say why.
+            let sent = async {
+                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.shutdown().await
+            };
+            match sent.await {
+                Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => return Err(error.into()),
+                _ => {}
+            }
         }
     }
 
@@ -133,6 +176,10 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     let mut session_id: Option<String> = None;
     let mut session_start_time: Option<String> = None;
     let mut message_count: usize = 0;
+    // Whether this child printed a session event of Claude Code's. The mask
+    // launcher prints nothing on stdout, so one such event is evidence that
+    // Claude Code itself ran (used when the child's end does not show it).
+    let mut session_seen = false;
 
     // Process stdout line by line
     let mut reader = BufReader::new(stdout).lines();
@@ -143,6 +190,9 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
 
         // Try to parse as JSON and log to plain-text
         if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
+            if !matches!(event, ClaudeEvent::Other) {
+                session_seen = true;
+            }
             match event {
                 ClaudeEvent::System { session_id: sid, .. } => {
                     let start_time = chrono::Utc::now().to_rfc3339();
@@ -283,6 +333,13 @@ async fn run_with_logging(original_args: &[String]) -> Result<()> {
     // Wait for process to complete
     let status = child.wait().await?;
 
+    // Use the no-save request up, or give it back: it is used up only when
+    // Claude Code exited with a status of its own, or was ended by a signal
+    // after it had printed a session event. A launcher code, or a signal with
+    // no event seen, gives it back (`nosave_request::AfterChild`). Before the
+    // exit below, which runs no destructors.
+    nosave_request::settle_at_exit(nosave, status.code(), session_seen);
+
     // Session saved silently - no prompt needed
 
     std::process::exit(status.code().unwrap_or(1));
@@ -363,14 +420,15 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
         claude_path_str
     };
 
-    // Check for no-save marker file
+    let launch = claude_launch(&real_claude)?;
+
+    // Reserve the no-save request, if there is one. It is settled when the
+    // child has finished; an error return before then gives it back.
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let marker_path = std::path::Path::new(&home).join(".continuum-nosave");
-    let skip_saving = marker_path.exists();
+    let nosave = NoSaveRequest::reserve(Path::new(&home));
+    let skip_saving = nosave.is_some();
 
     if skip_saving {
-        // Delete marker file immediately
-        let _ = std::fs::remove_file(&marker_path);
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
@@ -384,13 +442,16 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     // Identify *this* child's session while it runs (open jsonl / --resume id).
     // Do not use "newest jsonl after exit": two Claudes dying together used to
     // make every wrapper auto-log the same file (identical DayPage twins).
-    let mut child = claude_command(&real_claude, skip_saving)
+    // The mask launcher becomes Claude Code by exec, so the child's PID is
+    // still Claude Code's own.
+    let spawned_at = std::time::SystemTime::now();
+    let mut child = claude_command(&launch, skip_saving)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn claude process")?;
+        .with_context(|| masked_launch::spawn_failure("claude"))?;
 
     let child_pid = child.id();
     let watched = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
@@ -398,10 +459,11 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     let watch_handle = {
         let watched = watched.clone();
         let stop = stop.clone();
+        let home = PathBuf::from(&home);
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(pid) = child_pid {
-                    if let Some(path) = session_jsonl_for_pid_tree(pid) {
+                    if let Some(path) = session_jsonl_for_pid_tree(pid, &home, spawned_at) {
                         if let Ok(mut slot) = watched.lock() {
                             *slot = Some(path);
                         }
@@ -416,6 +478,21 @@ async fn run_interactive_mode(args: &[String]) -> Result<()> {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = watch_handle.join();
     let watched_path = watched.lock().ok().and_then(|guard| guard.clone());
+
+    // Settle the no-save request and decide whether there is a session of
+    // this start to work on (`nosave_request::AfterChild`). The evidence this
+    // wrapper has of its own is a transcript seen open under the child.
+    let after = nosave_request::settle_at_exit(nosave, status.code(), watched_path.is_some());
+    if !after.session_of_this_start {
+        // The child did not exit with a status of Claude Code's own (it gave
+        // one of the launcher's codes, or a signal ended it, perhaps before
+        // the launcher's exec), and no transcript was seen open under it.
+        // Nothing shows a session of this start, so none is imported, deleted
+        // or logged. Without this, `--resume <id>` or `--continue` would name
+        // an earlier session below, and a no-save start would delete its
+        // transcript although it never ran here.
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     let after_session = resolve_wrapped_session(
         watched_path,
@@ -568,8 +645,68 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     pids
 }
 
-fn session_jsonl_for_pid_tree(root: u32) -> Option<PathBuf> {
+/// The transcript of the session that this child (or a process below it) is
+/// running: the wrapper's own evidence that the child ran a session, and
+/// which one. Two sources, both tied to the child's PID:
+///
+/// 1. Claude Code's record of itself, `~/.claude/sessions/<pid>.json`, which
+///    names the session it is running ([`session_of_claude_record`]). Claude
+///    Code appends to its transcript and closes it again, so this is what
+///    identifies a session in practice.
+/// 2. A transcript held open by the process ([`open_session_jsonl`]).
+fn session_jsonl_for_pid_tree(root: u32, home: &Path, spawned_at: std::time::SystemTime) -> Option<PathBuf> {
     let pids = descendant_pids(root);
+    session_of_claude_record(home, &pids, spawned_at).or_else(|| open_session_jsonl(&pids))
+}
+
+/// The transcript named by Claude Code's own record for one of `pids`:
+/// `~/.claude/sessions/<pid>.json` holds `{"pid": <pid>, "sessionId": "<id>", …}`
+/// while that process lives (seen in Claude Code 2.1.330). The record counts
+/// only if it was written after this wrapper started its child (a file left
+/// by an earlier process that had the same PID is older), names its own PID,
+/// and its session has a transcript. If Claude Code stops writing the record,
+/// nothing is found here and the wrapper has no evidence from it.
+fn session_of_claude_record(home: &Path, pids: &[u32], spawned_at: std::time::SystemTime) -> Option<PathBuf> {
+    // File times may be kept to the second: compare from the start of the
+    // second in which the child was spawned.
+    let since_epoch = spawned_at.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let spawned_second = std::time::UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs());
+    pids.iter().find_map(|pid| {
+        let record = home.join(format!(".claude/sessions/{pid}.json"));
+        if std::fs::metadata(&record).ok()?.modified().ok()? < spawned_second {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&record).ok()?).ok()?;
+        if value.get("pid")?.as_u64()? != u64::from(*pid) {
+            return None;
+        }
+        find_session_file(&home.join(".claude/projects"), value.get("sessionId")?.as_str()?)
+    })
+}
+
+/// A Claude Code transcript that one of `pids` holds open. On Linux this is
+/// read from `/proc/<pid>/fd`; where there is no `/proc` (macOS), `lsof` is
+/// asked, as before.
+fn open_session_jsonl(pids: &[u32]) -> Option<PathBuf> {
+    let proc_root = Path::new("/proc");
+    if proc_root.join("self/fd").exists() {
+        open_session_jsonl_in_proc(proc_root, pids)
+    } else {
+        open_session_jsonl_by_lsof(pids)
+    }
+}
+
+fn open_session_jsonl_in_proc(proc_root: &Path, pids: &[u32]) -> Option<PathBuf> {
+    pids.iter().find_map(|pid| {
+        std::fs::read_dir(proc_root.join(pid.to_string()).join("fd"))
+            .ok()?
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .find(|target| looks_like_claude_session_jsonl(target))
+    })
+}
+
+fn open_session_jsonl_by_lsof(pids: &[u32]) -> Option<PathBuf> {
     if pids.is_empty() {
         return None;
     }
@@ -975,11 +1112,117 @@ enum Content {
 mod tests {
     use super::{
         claude_command, clinical_refusal, resolve_wrapped_session, resume_session_id_from_args,
-        session_id_is_safe, try_claim_autolog, API_KEY_ENV,
+        session_id_is_safe, session_of_claude_record, try_claim_autolog, Launch, API_KEY_ENV,
     };
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// Held by the tests that open a transcript in this process, so that the
+    /// test of open transcripts sees only its own.
+    static TRANSCRIPTS_IN_THIS_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Claude Code appends to its transcript and closes it, so what ties a
+    /// session to the wrapper's child is Claude Code's own record of itself.
+    #[test]
+    fn claudes_own_record_names_the_session_only_when_it_is_this_childs() {
+        let _alone = TRANSCRIPTS_IN_THIS_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile_dir("cc-session-record");
+        let projects = home.join(".claude/projects/zz99-project");
+        let sessions = home.join(".claude/sessions");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let transcript = projects.join("zz99-live-session.jsonl");
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        let record = |pid: u32, body: &str| std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap();
+        // The child was spawned a moment before its record was written.
+        let spawned = SystemTime::now() - Duration::from_secs(5);
+        let seen = |pid: u32| session_of_claude_record(&home, &[pid], spawned);
+
+        record(4242, r#"{"pid":4242,"sessionId":"zz99-live-session","cwd":"/"}"#);
+        assert_eq!(seen(4242), Some(transcript.clone()));
+        // Among the child's descendants too.
+        assert_eq!(session_of_claude_record(&home, &[1, 4242], spawned), Some(transcript.clone()));
+
+        // A record left by an earlier process that had the same PID was
+        // written before this child was spawned: it is not this child's.
+        let spawned_later = SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(session_of_claude_record(&home, &[4242], spawned_later), None);
+
+        // A record that names another PID, a session with no transcript, an
+        // id that is not a file name, a file that is not a record, no record.
+        record(4343, r#"{"pid":4242,"sessionId":"zz99-live-session"}"#);
+        record(4444, r#"{"pid":4444,"sessionId":"zz99-no-transcript"}"#);
+        record(4545, r#"{"pid":4545,"sessionId":"../zz99-project/zz99-live-session"}"#);
+        record(4646, "not a record");
+        for pid in [4343, 4444, 4545, 4646, 4747] {
+            assert_eq!(seen(pid), None, "{pid}");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// On Linux a transcript the child holds open is read from `/proc`, with
+    /// no `lsof`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_transcript_held_open_is_found_through_proc() {
+        use super::open_session_jsonl_in_proc;
+        let _alone = TRANSCRIPTS_IN_THIS_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = tempfile_dir("cc-open-transcript");
+        let dir = base.join(".claude/projects/zz99-project");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zz99-open-session.jsonl");
+        let held = std::fs::File::create(&path).unwrap();
+        let this_process = [std::process::id()];
+        let proc_root = Path::new("/proc");
+
+        let found = open_session_jsonl_in_proc(proc_root, &this_process);
+        assert_eq!(found, Some(std::fs::canonicalize(&path).unwrap()));
+
+        drop(held);
+        assert_eq!(open_session_jsonl_in_proc(proc_root, &this_process), None, "closed: not held open");
+        assert_eq!(open_session_jsonl_in_proc(proc_root, &[u32::MAX]), None, "no such process");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    const LAUNCHER: &str = "/opt/bin/ai-masked";
+    const REAL_CLAUDE: &str = "/opt/real/claude";
+
+    /// The start on Linux, and the start elsewhere (and everywhere before the
+    /// mask).
+    fn masked() -> Launch {
+        Launch::through(Path::new(LAUNCHER), OsStr::new(REAL_CLAUDE))
+    }
+    fn direct() -> Launch {
+        Launch::direct(OsStr::new(REAL_CLAUDE))
+    }
+
+    /// Program then arguments, as the command would be run.
+    fn command_line(command: &tokio::process::Command) -> Vec<String> {
+        let std = command.as_std();
+        std::iter::once(std.get_program())
+            .chain(std.get_args())
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn on_linux_claude_starts_through_the_launcher_with_the_arguments_unchanged() {
+        let user_args = ["--resume", "ZZ99 session", "--model", "x"];
+        let masked_line = [LAUNCHER, REAL_CLAUDE, "--resume", "ZZ99 session", "--model", "x"];
+
+        let mut command = claude_command(&masked(), false);
+        command.args(user_args);
+        assert_eq!(command_line(&command), masked_line);
+
+        // Red control: the start as it was before the mask is not that line.
+        let mut old = claude_command(&direct(), false);
+        old.args(user_args);
+        assert_ne!(command_line(&old), masked_line);
+        // It is the unchanged direct start, which macOS keeps.
+        assert_eq!(command_line(&old), [REAL_CLAUDE, "--resume", "ZZ99 session", "--model", "x"]);
+    }
 
     /// What the command does with `key`: None if it leaves it inherited,
     /// Some(None) if it removes it, Some(Some(v)) if it sets it to v.
@@ -993,21 +1236,26 @@ mod tests {
 
     #[test]
     fn api_key_never_reaches_claude() {
-        for skip_saving in [false, true] {
-            let command = claude_command("claude", skip_saving);
-            assert_eq!(
-                env_action(&command, API_KEY_ENV),
-                Some(None),
-                "the API key must be removed from claude's environment (skip_saving={skip_saving})"
-            );
+        for launch in [masked(), direct()] {
+            for skip_saving in [false, true] {
+                let command = claude_command(&launch, skip_saving);
+                assert_eq!(
+                    env_action(&command, API_KEY_ENV),
+                    Some(None),
+                    "the API key must be removed from claude's environment \
+                     (skip_saving={skip_saving}, {launch:?})"
+                );
+            }
         }
     }
 
     #[test]
     fn nosave_marker_still_reaches_claude() {
         let nosave = continuum_core::import::NOSAVE_ENV;
-        assert_eq!(env_action(&claude_command("claude", true), nosave), Some(Some("1".into())));
-        assert_eq!(env_action(&claude_command("claude", false), nosave), None);
+        for launch in [masked(), direct()] {
+            assert_eq!(env_action(&claude_command(&launch, true), nosave), Some(Some("1".into())));
+            assert_eq!(env_action(&claude_command(&launch, false), nosave), None);
+        }
     }
 
     #[test]
