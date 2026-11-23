@@ -62,7 +62,7 @@ const DEADLINE: Duration = Duration::from_secs(40);
 /// Neon's overnight work is bounded by.
 const REPRESENTATIVE_BUCKET: &str = "gemini-weekly";
 /// How close `reset_time` must be to "now + window" to be the synthetic reset
-/// of a window that has not started (see [`bucket_resource`]).
+/// that marks the reset uncertain (see [`bucket_resource`]).
 const NOT_STARTED_SLACK_SECS: i64 = 120;
 
 fn main() -> ExitCode {
@@ -147,7 +147,7 @@ fn run_agy(agy: &Path) -> Result<Run, String> {
 }
 
 /// The whole reading from one finished run. `now` is the reading's clock, for
-/// telling a window that has not started from one that has.
+/// telling a vendor reset from the moving "now + window" one.
 fn observe(run: &Run, now: i64) -> Observation {
     let reply = last_json_object(&run.stdout);
     let Some(reply) = reply else {
@@ -302,13 +302,14 @@ fn bucket_resource(group_name: &str, bucket: &Value, now: i64) -> Result<Resourc
         .map_err(|e| format!("reset_time {reset_time:?}: {e}"))?
         .timestamp();
 
-    // A window nobody has used has not started: `agy` reports its reset as
-    // "now + window", which moves with every read (23 Nov 2026). Nothing is
-    // counting down, so nothing can perish, and the moving time is not a
-    // deadline; core also matches windows on `resets_at`, so passing it on
-    // would start a new window at every read. Both signals are required: the
-    // full fraction and the synthetic time.
-    let not_started = remaining == 1.0
+    // A window nobody has used reports its reset as "now + window", which
+    // moves with every read (23 Nov 2026). The same reading also fits a window
+    // that started moments ago and whose fraction rounds to 1, so it does not
+    // show the window is unused (review round 2, continuum#9). The reset is
+    // therefore uncertain: it is not passed on (core matches windows on
+    // `resets_at`, so a moving one would start a new window at every read, and
+    // it may not be a deadline), and whether surplus perishes is left unknown.
+    let reset_uncertain = remaining == 1.0
         && window_secs.is_some_and(|w| (resets_at - (now + w)).abs() <= NOT_STARTED_SLACK_SECS);
 
     Ok(Resource {
@@ -317,17 +318,17 @@ fn bucket_resource(group_name: &str, bucket: &Value, now: i64) -> Result<Resourc
         kind_hint: KindHint::ResetWindow,
         facets: Facets {
             utilization: Some(1.0 - remaining),
-            resets_at: (!not_started).then_some(resets_at),
+            resets_at: (!reset_uncertain).then_some(resets_at),
             window_secs,
             // A started window "will fully refresh" at its reset (the vendor's
             // own bucket description): the fraction returns to 1, so what was
             // not spent is not carried over. That is `USAGEWATCH.md`'s
-            // `Some(true)`, surplus lost at the reset. A window that has not
-            // started has nothing counting down: `Some(false)`.
-            expires_unused: Some(!not_started),
+            // `Some(true)`, surplus lost at the reset. With the reset
+            // uncertain, it is unknown: `None`, rendered "?".
+            expires_unused: (!reset_uncertain).then_some(true),
             ..Default::default()
         },
-        vendor_status: not_started.then(|| "not started".to_string()),
+        vendor_status: reset_uncertain.then(|| "reset uncertain".to_string()),
         vendor_representative: id == REPRESENTATIVE_BUCKET,
     })
 }
@@ -443,16 +444,33 @@ mod tests {
         }
     }
 
-    /// The unused Claude/GPT buckets: no deadline, nothing perishes.
+    /// The unused Claude/GPT buckets: the reset is "now + window", so it is
+    /// uncertain, not passed on, and perishability is unknown, never asserted
+    /// either way.
     #[test]
-    fn a_window_that_has_not_started_has_no_reset_and_nothing_perishes() {
+    fn a_full_bucket_resetting_at_now_plus_window_has_an_uncertain_reset() {
         let obs = read(REAL);
         for r in &resources(&obs)[2..] {
             assert_eq!(r.facets.utilization, Some(0.0), "{}", r.id);
             assert_eq!(r.facets.resets_at, None, "{}", r.id);
-            assert_eq!(r.facets.expires_unused, Some(false), "{}", r.id);
-            assert_eq!(r.vendor_status.as_deref(), Some("not started"), "{}", r.id);
+            assert_eq!(r.facets.expires_unused, None, "{}", r.id);
+            assert_eq!(r.vendor_status.as_deref(), Some("reset uncertain"), "{}", r.id);
         }
+        // Codex's round-2 case: a 5-hour window that started a minute ago and
+        // rounds to full (reset at now + 18000 − 60). It must not be called
+        // non-expiring.
+        let now = captured_at();
+        let fresh = (bucket_resource(
+            "Gemini Models",
+            &json!({"id": "gemini-5h", "window": "5h", "remaining_fraction": 1.0,
+                    "reset_time": chrono::DateTime::from_timestamp(now + 18_000 - 60, 0).unwrap().to_rfc3339()}),
+            now,
+        )
+        .unwrap());
+        assert_eq!(fresh.facets.resets_at, None, "{fresh:?}");
+        assert_eq!(fresh.facets.expires_unused, None, "{fresh:?}");
+        assert_ne!(fresh.facets.expires_unused, Some(false), "{fresh:?}");
+        assert_eq!(fresh.vendor_status.as_deref(), Some("reset uncertain"));
         // A full bucket whose reset is not "now + window" has started (it may
         // round to 1): its reset stands.
         let later = observe(&run(REAL, "", 0), captured_at() - 3_600);
