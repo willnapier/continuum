@@ -10,6 +10,7 @@ members = [
     "usage-probe-claude-smoke",
     "usage-probe-grok-smoke",
     "usage-probe-grok",
+    "usage-probe-antigravity",
     "continuum-cli",
     "continuum-claude",
     "continuum-codex",
