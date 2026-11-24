@@ -170,14 +170,33 @@ it.** Every importer, the timers included, consults the no-save registry
   deleting Claude Code's own transcript. When the wrapper did see the session,
   it enters it itself and deletes the transcript, as at any no-save exit.
 - **Codex.** Its hooks do the same, but Codex runs a hook only once it is
-  trusted on that machine, and `continuum-codex` cannot tell which session was
-  its own. So when a no-save start ends by a signal or with one of the
-  launcher's codes, the wrapper enters every rollout made since it started.
-  It deletes nothing and leaves alone every rollout that was there before.
-  The cost: another Codex session that began in that time is entered too and
-  is not saved from then on. Not covered: a no-save `codex resume`, which
-  writes on in a rollout that was there before, and so still relies on its
-  hooks.
+  trusted on that machine, and `continuum-codex` cannot tell which rollout is
+  its own. So a no-save Codex start does not rely on its hooks
+  (`continuum-core/src/codex_nosave_start.rs`):
+  - **Before Codex runs.** A no-save `codex resume <id>` (also `codex exec
+    resume <id>`) enters that thread id, and the file stem of every rollout of
+    that thread, so the turns it appends are never stored; the turns stored
+    before the resume are kept. A no-save resume that names no thread id
+    (`--last`, the picker, a thread name) is refused, with the request kept,
+    because the rollout it would write on cannot be known. Then the start is
+    recorded in `~/.local/share/continuum/codex-nosave-starts/`: the rollouts
+    that are there now, and a lock the wrapper holds while it lives.
+  - **While it is open.** Every Codex import (the timer, the hooks, another
+    wrapper's exit) stores no rollout that is not on that list, answering
+    "held". A start is open while the wrapper holds its lock or the Codex
+    child it recorded is alive, so a wrapper killed with its terminal tab
+    leaves the start open until Codex has ended too.
+  - **When it closes.** However Codex ended, the wrapper enters every rollout
+    made since the start and removes any stored copy of one. A start whose
+    wrapper was killed is closed in the same way by the first import after
+    its Codex has ended. Rollouts that were there before are not touched.
+
+  The cost, towards not saving: another Codex session that begins while a
+  no-save Codex start is open is not stored while it is open, and is entered
+  as no-save when it closes. A Codex session that was already running is
+  stored as usual. Not covered: a wrapper killed by SIGKILL in the instant
+  between starting Codex and recording it (other signals are held back for
+  that instant); the start is then taken as closed once the wrapper is gone.
 - **Gemini and Goose.** No hook or timer imports their sessions: only their
   own wrapper does, at exit. So a session the wrapper does not import is not
   put in Continuum later, and there is no importer for a registry entry to

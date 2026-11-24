@@ -48,6 +48,12 @@ claude        # Start Claude Code - won't be saved
 - ✅ Consumed by **whichever assistant starts next**, regardless of terminal
 - ✅ Single-use: Only affects the **first** assistant started after `nosave`
 - ⚠️ If you run `nosave` then start multiple assistants, only the **first one** won't be saved
+- ⚠️ Codex: a no-save `codex resume` must name the session (`codex resume <uuid>`);
+  `codex resume --last` and the picker are refused, and the marker is kept
+- ⚠️ Codex: while a no-save Codex session is open, any other Codex session that
+  *begins* meanwhile is not saved either (Continuum cannot tell which rollout is
+  the no-save one). Codex sessions already running are saved as usual. See
+  "What keeps a no-save session out of Continuum" in `ARCHITECTURE.md`
 
 ### How the Marker Works
 

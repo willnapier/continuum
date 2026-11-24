@@ -70,6 +70,13 @@ impl PlainTextWriter {
         self.nosave_dir.as_deref()
     }
 
+    /// Where open no-save Codex starts are recorded
+    /// (`codex_nosave_start`): `codex-nosave-starts` beside the no-save
+    /// registry. None when there is no registry.
+    pub fn codex_starts_dir(&self) -> Option<PathBuf> {
+        self.nosave_dir.as_deref().and_then(Path::parent).map(|parent| parent.join("codex-nosave-starts"))
+    }
+
     /// As if HOME were unknown.
     #[cfg(test)]
     pub(crate) fn clear_nosave_dir_for_test(&mut self) {

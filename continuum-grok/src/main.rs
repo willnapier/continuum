@@ -109,7 +109,8 @@ fn import_targets(writer: &PlainTextWriter, targets: &[PathBuf]) -> Result<()> {
                 imported += 1;
                 eprintln!("✓ {} ({} messages)", session_id_of(chat), n);
             }
-            Ok(Imported::NoSave) => {
+            // Held is Codex's only.
+            Ok(Imported::NoSave | Imported::Held) => {
                 eprintln!("= {} marked no-save; not imported", session_id_of(chat))
             }
             Ok(Imported::Empty) => eprintln!("= {} has no messages", session_id_of(chat)),

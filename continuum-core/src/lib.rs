@@ -3,6 +3,7 @@
 
 pub mod adapters;
 pub mod codex_cli;
+pub mod codex_nosave_start;
 pub mod compression;
 pub mod import;
 pub mod loop_detection;

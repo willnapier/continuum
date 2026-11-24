@@ -254,6 +254,13 @@ fn import_codex_session(
             eprintln!("= Codex session is marked no-save; not imported: {}", session_path.display());
             return Ok(());
         }
+        Imported::Held => {
+            eprintln!(
+                "= Codex session began during an open no-save Codex start; not imported: {}",
+                session_path.display()
+            );
+            return Ok(());
+        }
     };
 
     if !detections.is_empty() {
@@ -391,7 +398,10 @@ fn import_claude_code_session(
     match import::import_claude_code(writer, &session_path)? {
         Imported::Stored(outcome) => report("Claude Code", &outcome),
         Imported::Empty => eprintln!("⚠ No messages found in Claude Code session: {}", session_path.display()),
-        Imported::NoSave => eprintln!("= Claude Code session is marked no-save; not imported: {}", session_path.display()),
+        // Held is Codex's only.
+        Imported::NoSave | Imported::Held => {
+            eprintln!("= Claude Code session is marked no-save; not imported: {}", session_path.display())
+        }
     }
     Ok(())
 }
@@ -503,7 +513,7 @@ fn run_hook(
             Ok(match import::import_claude_code(writer, &path)? {
                 Imported::Stored(o) => HookResult::Imported(describe(&o)),
                 Imported::Empty => HookResult::Skipped("no messages yet".into()),
-                Imported::NoSave => HookResult::Skipped("no-save session, not imported".into()),
+                Imported::NoSave | Imported::Held => HookResult::Skipped("no-save session, not imported".into()),
             })
         }
         "codex" => {
@@ -522,6 +532,7 @@ fn run_hook(
                 Imported::Stored((o, _)) => HookResult::Imported(describe(&o)),
                 Imported::Empty => HookResult::Skipped("no messages yet".into()),
                 Imported::NoSave => HookResult::Skipped("no-save session, not imported".into()),
+                Imported::Held => HookResult::Skipped("began during an open no-save Codex start, not imported".into()),
             })
         }
         _ => unreachable!("assistant checked above"),

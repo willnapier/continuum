@@ -186,6 +186,8 @@ On Linux, `continuum-claude`, `continuum-codex`, `continuum-gemini`, `continuum-
 
 A no-save request (`nosave`, the marker `~/.continuum-nosave`) is used up only by a session that started (on macOS too). A wrapper reserves the marker, and gives it back when the launcher cannot be run, refuses (exit 113) or cannot run the harness (126, 127), and when a signal ends its child without the wrapper having seen a session, because a signal may have ended the launcher before the harness started. In those cases the wrapper does no import or deletion either. A harness that itself ends in one of those ways after a real session the wrapper did not see also gets its request back, so the next session is not saved either: the mistake is made towards not saving. The table is under "Wrap" in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+A no-save Codex session stays out of Continuum even when its hooks do not run. A no-save `codex resume` must name the session's id (`codex resume <uuid>`), which is marked no-save before Codex starts; without an id it is refused and the request kept. While a no-save Codex start is open, no Codex rollout begun after it is stored, by the timer or anything else, and when it closes those rollouts are marked no-save and any stored copy removed. So another Codex session begun while a no-save Codex session is open is not saved either. See "What keeps a no-save session out of Continuum" in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ### Import Web Conversations
 
 ```bash

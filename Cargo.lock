@@ -302,6 +302,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "color-eyre",
+ "libc",
  "regex",
  "rusqlite",
  "serde",
