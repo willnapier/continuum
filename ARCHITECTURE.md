@@ -201,8 +201,9 @@ it.** Every importer, the timers included, consults the no-save registry
 
   The cost, towards not saving: another Codex session that begins while a
   no-save Codex start is open is not stored while it is open, and is entered
-  as no-save when it closes, its stored copy removed, forum Codex rounds
-  included. When the wrapper closes the start, that is when its Codex ends.
+  as no-save when it closes, its stored copy removed: any Codex session that
+  writes a rollout. Forum rounds are not affected: they run `codex exec
+  --ephemeral`, which writes no rollout. When the wrapper closes the start, that is when its Codex ends.
   When the wrapper was killed, it is the first close that succeeds after its
   Codex ended: normally the next timer import (every five minutes), later if
   imports fail or do not run. A session begun before that close is entered
@@ -219,6 +220,33 @@ it.** Every importer, the timers included, consults the no-save registry
   the start is open and stored afterwards. On macOS a recorded Codex is
   checked by its process id alone, so a reused id keeps the start open,
   towards not saving.
+
+  What a close did is recorded. Each close, by the wrapper or by an import,
+  appends one JSON line to `~/.local/share/continuum/codex-nosave-closes.jsonl`
+  beside the registry (per machine, never in the synced archive): `time`,
+  `closer` (`wrapper` or `import`), `start` (the record's file name),
+  `marked` (rollout stems), `removed` (stored copies, by path) and `failed`
+  (the step that failed, or null). A failed close is logged with what it did
+  before the failure, and the start stays for the next import. Names and
+  paths only, never content. The close comes first: if the log cannot be
+  written the rollouts are still marked and their copies removed; the wrapper
+  then prints a warning, and an import fails, so the timer's alert fires
+  (the start is already gone, so the next import is not held back). An
+  import that closes a start prints `= Closed no-save Codex start <record>
+  (its wrapper had ended): marked N Codex session(s) no-save, removed M stored
+  copy(ies)` on stderr, which the timer keeps in `auto-import.log`, also when
+  it marked nothing.
+
+  A start has no time limit, so one left open too long (a no-save Codex left
+  in a tab, a killed wrapper whose child's process id was reused) is
+  reported, not closed: `continuum codex nosave-starts [--older-than-hours N]`
+  (6 by default) reads the record names and file times only, prints the
+  count and ages of those older (`old: <hours> h` each) and exits 0 (none),
+  1 (some) or 3 (could not check). `system-health-check` runs it on nimbini
+  and makes one finding of it. To undo one removal: delete the session's
+  marker in `~/.local/share/continuum/nosave-sessions/` (by rollout stem, and
+  by thread id if one is there), then `continuum import -a codex -s <rollout
+  file>`.
 - **Gemini and Goose.** No hook or timer imports their sessions: only their
   own wrapper does, at exit. So a session the wrapper does not import is not
   put in Continuum later, and there is no importer for a registry entry to
