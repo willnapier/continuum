@@ -320,7 +320,16 @@ fn control_without_a_no_save_request_the_appended_turns_are_stored() {
 /// Codex is not started, and the request is kept. The control: naming it.
 #[test]
 fn a_no_save_resume_that_names_no_session_is_refused() {
-    for args in [&["resume", "--last"][..], &["resume"][..], &["resume", "ZZ99"][..]] {
+    for args in [
+        &["resume", "--last"][..],
+        &["resume"][..],
+        &["resume", "ZZ99"][..],
+        // A thread name with an unrelated thread id as its prompt.
+        &["resume", "zz99-thread-name", OTHER_THREAD][..],
+        // An option before the selector, which may take a value.
+        &["resume", "--all", EARLIER_THREAD][..],
+        &["resume", EARLIER_THREAD, OTHER_THREAD][..],
+    ] {
         let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "nohooks-resume-unnamed");
         scratch.stand_in_launcher();
         scratch.harness("codex", "exit 0");

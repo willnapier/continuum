@@ -30,12 +30,25 @@
 //! first import after its child has also ended closes the start in the same
 //! way. Between the spawn and the child record the wrapper blocks SIGHUP,
 //! SIGINT, SIGTERM and SIGQUIT, so only SIGKILL in that instant can leave a
-//! start with no child recorded, which is then taken as closed.
+//! start with no child recorded, which is then taken as closed. A child that
+//! was spawned but could not be recorded is ended, and its start is closed
+//! (or left for an import to close), never dropped.
+//!
+//! The rollouts are listed under every place this Codex may write them: the
+//! `CODEX_HOME` it was started with, and `~/.codex`. A rollout elsewhere is
+//! held while the start is open and imported as usual afterwards.
 //!
 //! The cost, which errs towards not saving: another Codex session that begins
 //! while a no-save start is open is not stored while it is open, and is
-//! registered as no-save when it closes. A session that was already running
-//! keeps being stored.
+//! registered as no-save when it closes. When the wrapper closes the start,
+//! that is when Codex ends. When the wrapper was killed, it is the first
+//! import after Codex ended (the timer runs every five minutes), so a session
+//! begun in between is registered too: nothing records when Codex ended. A
+//! session that was already running keeps being stored.
+//!
+//! Not covered: a no-save Codex that goes on in an existing rollout other
+//! than by `resume <uuid>` on its command line (a session chosen inside a
+//! running Codex), which still relies on its hooks.
 
 use crate::import::{self, discard_session, register_nosave};
 use crate::PlainTextWriter;
@@ -50,12 +63,23 @@ use std::process::{Child, Command};
 const START_SUFFIX: &str = ".start";
 const CHILD_SUFFIX: &str = ".child";
 
-/// What a start's `.start` file holds: where its Codex writes rollouts, and
-/// the rollouts (by file stem) that were there before it ran.
+/// What a start's `.start` file holds: where its Codex may write rollouts
+/// (absolute paths), and the rollouts (by file stem) that were there before
+/// it ran, in any of them.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Record {
-    sessions_dir: PathBuf,
+    sessions_dirs: Vec<PathBuf>,
     before: BTreeSet<String>,
+}
+
+impl Record {
+    fn rollouts_now(&self) -> Result<BTreeSet<String>> {
+        let mut now = BTreeSet::new();
+        for dir in &self.sessions_dirs {
+            now.extend(rollout_stems(dir)?);
+        }
+        Ok(now)
+    }
 }
 
 /// What a start's `.child` file holds. `start_token` tells a reused process id
@@ -74,7 +98,9 @@ pub struct CodexNoSaveStart {
     start: PathBuf,
     child: PathBuf,
     record: Record,
-    child_recorded: bool,
+    /// A child was spawned, recorded or not: the start may no longer be
+    /// dropped, only closed.
+    child_spawned: bool,
     closed: bool,
 }
 
@@ -88,15 +114,23 @@ pub struct Closed {
 }
 
 impl CodexNoSaveStart {
-    /// Record a no-save start for Codex writing under `sessions_dir`. An error
-    /// means no start is recorded, and Codex must not be started.
-    pub fn open(writer: &PlainTextWriter, sessions_dir: &Path) -> Result<Self> {
+    /// Record a no-save start for Codex writing under any of `sessions_dirs`.
+    /// An error means no start is recorded, and Codex must not be started.
+    pub fn open(writer: &PlainTextWriter, sessions_dirs: &[PathBuf]) -> Result<Self> {
         let dir = starts_dir(writer)?;
         create_private_dir(&dir)?;
-        let record = Record {
-            sessions_dir: sessions_dir.to_path_buf(),
-            before: rollout_stems(sessions_dir)?,
-        };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for sessions_dir in sessions_dirs {
+            // Absolute, so that an import run from another folder lists the
+            // same place.
+            let absolute = std::path::absolute(sessions_dir)
+                .with_context(|| format!("cannot resolve {}", sessions_dir.display()))?;
+            if !dirs.contains(&absolute) {
+                dirs.push(absolute);
+            }
+        }
+        let mut record = Record { sessions_dirs: dirs, before: BTreeSet::new() };
+        record.before = record.rollouts_now()?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -118,13 +152,21 @@ impl CodexNoSaveStart {
         let lock = lock.inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })?;
-        Ok(Self { _lock: lock, start, child, record, child_recorded: false, closed: false })
+        Ok(Self { _lock: lock, start, child, record, child_spawned: false, closed: false })
+    }
+
+    /// Whether a child was spawned. After an error from [`Self::spawn_child`]
+    /// with a child spawned, the start must be closed ([`Self::finish`]).
+    pub fn child_spawned(&self) -> bool {
+        self.child_spawned
     }
 
     /// Start Codex with `command` and record the child. Signals that would
     /// end the wrapper are held back until the child is on record (the child
-    /// starts with none held back); a child that cannot be recorded is ended
-    /// again, and that is an error. `spawn_failure` describes a failed start.
+    /// starts with none held back). A child that cannot be recorded is ended
+    /// again, and that is an error; it may have written a rollout, so the
+    /// start is then kept for [`Self::finish`] or a later import to close.
+    /// `spawn_failure` describes a failed start.
     pub fn spawn_child(&mut self, command: &mut Command, spawn_failure: impl FnOnce() -> String) -> Result<Child> {
         let _held = SignalsHeld::new();
         // SAFETY: the closure only clears the signal mask, which is
@@ -138,6 +180,7 @@ impl CodexNoSaveStart {
             });
         }
         let mut child = command.spawn().with_context(spawn_failure)?;
+        self.child_spawned = true;
         if let Err(error) = self.record_child(child.id()) {
             let _ = child.kill();
             let _ = child.wait();
@@ -159,9 +202,7 @@ impl CodexNoSaveStart {
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
-        result?;
-        self.child_recorded = true;
-        Ok(())
+        result
     }
 
     /// Codex has ended, however it ended: close the start. On an error the
@@ -175,10 +216,10 @@ impl CodexNoSaveStart {
 }
 
 impl Drop for CodexNoSaveStart {
-    /// Not finished. With no child on record nothing ran, and the start goes.
+    /// Not finished. With no child spawned nothing ran, and the start goes.
     /// With one, it stays for an import to close once the child has ended.
     fn drop(&mut self) {
-        if !self.closed && !self.child_recorded {
+        if !self.closed && !self.child_spawned {
             let _ = remove_files(&self.start, &self.child);
         }
     }
@@ -214,36 +255,65 @@ fn open_starts(writer: &PlainTextWriter, close_closed: bool) -> Result<Vec<Recor
         if name.starts_with('.') || !name.ends_with(START_SUFFIX) {
             continue;
         }
-        let mut file = match File::open(&start) {
+        let file = match File::open(&start) {
             Ok(file) => file,
             // Closed since the listing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(eyre!("Refusing Codex import: cannot open {}: {e}", start.display())),
         };
-        let child = start.with_extension(&CHILD_SUFFIX[1..]);
-        let unlocked = match file.try_lock() {
-            Ok(()) => true,
-            Err(fs::TryLockError::WouldBlock) => false,
-            Err(fs::TryLockError::Error(e)) => {
-                return Err(eyre!("Refusing Codex import: cannot check {}: {e}", start.display()))
-            }
-        };
-        let record = read_record(&mut file, &start)?;
-        if unlocked && !child_alive(&child)? && close_closed {
-            // Its wrapper and its child are gone; still locked by us here,
-            // so no other import closes it at the same time.
-            close(writer, &record)?;
-            remove_files(&start, &child)?;
-            continue;
+        if let Some(record) = check_start(writer, &start, file, close_closed)? {
+            open.push(record);
         }
-        open.push(record);
     }
     Ok(open)
 }
 
+/// One start, opened as `file` from `start`: its record when it is open (or
+/// found closed with `close_closed` false), None when it is closed now.
+fn check_start(writer: &PlainTextWriter, start: &Path, mut file: File, close_closed: bool) -> Result<Option<Record>> {
+    let child = start.with_extension(&CHILD_SUFFIX[1..]);
+    let unlocked = match file.try_lock() {
+        Ok(()) => true,
+        Err(fs::TryLockError::WouldBlock) => false,
+        Err(fs::TryLockError::Error(e)) => {
+            return Err(eyre!("Refusing Codex import: cannot check {}: {e}", start.display()))
+        }
+    };
+    let record = read_record(&mut file, start)?;
+    if !unlocked {
+        return Ok(Some(record));
+    }
+    // A start is closed, and its files removed, under its lock. So a lock
+    // taken on a file that is no longer the one at `start` was taken after
+    // another import closed it; closing it again would sweep up rollouts
+    // made since. Only the file still published there may be closed.
+    if !still_published(&file, start)? {
+        return Ok(None);
+    }
+    if child_alive(&child)? || !close_closed {
+        return Ok(Some(record));
+    }
+    // Its wrapper and its child are gone; locked by us here, so no other
+    // import closes it at the same time.
+    close(writer, &record)?;
+    remove_files(start, &child)?;
+    Ok(None)
+}
+
+/// Whether `file` is still the file at `path` (same device and inode).
+fn still_published(file: &File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata().with_context(|| format!("Refusing Codex import: cannot check {}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(now) => Ok(now.dev() == held.dev() && now.ino() == held.ino()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(eyre!("Refusing Codex import: cannot check {}: {e}", path.display())),
+    }
+}
+
 /// Register every rollout made since the start, and remove its stored copies.
 fn close(writer: &PlainTextWriter, record: &Record) -> Result<Closed> {
-    let now = rollout_stems(&record.sessions_dir)?;
+    let now = record.rollouts_now()?;
     let mut closed = Closed { registered: 0, removed: 0 };
     for stem in now.difference(&record.before) {
         closed.removed += discard_session(writer, "codex", stem)?;
@@ -252,27 +322,49 @@ fn close(writer: &PlainTextWriter, record: &Record) -> Result<Closed> {
     Ok(closed)
 }
 
-/// A no-save `codex resume`: the thread ids it names, or None when the
-/// arguments are not a resume. `Some(empty)` is a resume that names no thread
-/// id (`--last`, the picker, a thread name), whose rollout cannot be known
-/// before Codex runs.
-pub fn resume_thread_ids(args: &[String]) -> Option<Vec<String>> {
-    let options = || args.iter().take_while(|arg| *arg != "--");
-    let at = options().position(|arg| arg == "resume")?;
-    Some(options().skip(at + 1).filter(|arg| import::is_codex_thread_id(arg)).cloned().collect())
+/// What a no-save start's arguments say about a resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resume {
+    /// Not a resume.
+    No,
+    /// `resume <uuid> …`: the thread id, in lower case.
+    Of(String),
+    /// A resume whose session cannot be known from its arguments for certain:
+    /// none named (`--last`, the picker, a thread name), an option before the
+    /// selector, or another thread id among the arguments.
+    Unclear,
+}
+
+/// Read a no-save start's arguments for a resume (`codex resume …`, `codex
+/// exec resume …`). Only one form names its session for certain: `resume`
+/// followed at once by a thread id, with no other thread id after it. Codex
+/// takes the first argument after `resume` that is not an option as the
+/// session, so an option before it, which may take a value, makes it unclear,
+/// and so does a second thread id (a prompt or an option's value). Arguments
+/// after `--` are a prompt.
+pub fn resume_of(args: &[String]) -> Resume {
+    let options: Vec<&String> = args.iter().take_while(|arg| *arg != "--").collect();
+    let Some(at) = options.iter().position(|arg| *arg == "resume") else { return Resume::No };
+    let rest = &options[at + 1..];
+    let ids = rest.iter().filter(|arg| import::is_codex_thread_id(arg)).count();
+    match rest.first() {
+        Some(selector) if import::is_codex_thread_id(selector) && ids == 1 => Resume::Of(selector.to_ascii_lowercase()),
+        _ => Resume::Unclear,
+    }
 }
 
 /// Register a resumed session as no-save before Codex runs, so the turns it
 /// appends to an existing rollout are never stored: by its thread id, and by
-/// the stem of every rollout file of that thread under `sessions_dir`.
-/// Stored copies of earlier turns are kept: they were saved deliberately.
-/// Returns how many rollout files were found.
-pub fn register_resumed(writer: &PlainTextWriter, sessions_dir: &Path, thread_ids: &[String]) -> Result<usize> {
+/// the stem of every rollout file of that thread under any of
+/// `sessions_dirs`. Stored copies of earlier turns are kept: they were saved
+/// deliberately. Returns how many rollout files were found.
+pub fn register_resumed(writer: &PlainTextWriter, sessions_dirs: &[PathBuf], thread_id: &str) -> Result<usize> {
+    let id = thread_id.to_ascii_lowercase();
+    register_nosave(writer, &id)?;
+    let suffix = format!("-{id}");
     let mut found = 0;
-    for id in thread_ids {
-        register_nosave(writer, id)?;
-        let suffix = format!("-{id}");
-        for stem in rollout_stems(sessions_dir)?.iter().filter(|stem| stem.ends_with(&suffix)) {
+    for dir in sessions_dirs {
+        for stem in rollout_stems(dir)?.iter().filter(|stem| stem.to_ascii_lowercase().ends_with(&suffix)) {
             register_nosave(writer, stem)?;
             found += 1;
         }
@@ -462,14 +554,23 @@ mod tests {
         _root: tempfile::TempDir,
         sessions: PathBuf,
         writer: PlainTextWriter,
+        /// Last, so it is dropped last.
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
+    /// One fixture at a time. A child forked by another test thread holds a
+    /// copy of every descriptor until its exec, a start's lock among them, so
+    /// in parallel a start can look locked just after its wrapper let go. (The
+    /// wrapper and the timer each run one thread.)
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn fixture() -> Fixture {
+        let serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let writer = PlainTextWriter::with_base_dir(root.path().join("logs"))
             .with_nosave_dir(root.path().join("state/nosave-sessions"));
-        Fixture { sessions, writer, _root: root }
+        Fixture { sessions, writer, _root: root, _serial: serial }
     }
 
     fn rollout(f: &Fixture, stem: &str) -> PathBuf {
@@ -500,7 +601,7 @@ mod tests {
     fn an_open_start_holds_new_rollouts_and_its_close_registers_them() {
         let f = fixture();
         let earlier = rollout(&f, EARLIER);
-        let start = CodexNoSaveStart::open(&f.writer, &f.sessions).unwrap();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
         let new = rollout(&f, NEW);
 
         assert!(matches!(import_codex(&f.writer, &new).unwrap(), Imported::Held), "held while open");
@@ -524,7 +625,7 @@ mod tests {
     #[test]
     fn closing_removes_a_stored_copy_of_a_new_rollout() {
         let f = fixture();
-        let start = CodexNoSaveStart::open(&f.writer, &f.sessions).unwrap();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
         rollout(&f, NEW);
         // A copy stored by something that did not honour the start.
         let copy = f.writer.base_dir().join("codex/2026-10-07").join(NEW);
@@ -541,7 +642,7 @@ mod tests {
     #[test]
     fn a_start_whose_wrapper_and_child_are_gone_is_closed_by_the_next_import() {
         let f = fixture();
-        let mut start = CodexNoSaveStart::open(&f.writer, &f.sessions).unwrap();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
         let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
         child.wait().unwrap();
         // The wrapper "dies" unfinished: its lock goes, its files stay.
@@ -556,7 +657,7 @@ mod tests {
     #[test]
     fn a_start_whose_child_lives_on_stays_open_after_its_wrapper() {
         let f = fixture();
-        let mut start = CodexNoSaveStart::open(&f.writer, &f.sessions).unwrap();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
         let mut child = start.spawn_child(Command::new("sleep").arg("30"), String::new).unwrap();
         drop(start);
         let new = rollout(&f, NEW);
@@ -570,7 +671,7 @@ mod tests {
     #[test]
     fn a_start_that_never_ran_a_child_leaves_nothing() {
         let f = fixture();
-        let start = CodexNoSaveStart::open(&f.writer, &f.sessions).unwrap();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
         assert_eq!(starts(&f).len(), 1);
         drop(start);
         assert_eq!(starts(&f), Vec::<String>::new());
@@ -591,16 +692,85 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_is_recognised_by_its_thread_id() {
+    fn only_resume_followed_at_once_by_one_thread_id_names_its_session() {
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let id = "019a0000-0000-7000-8000-0000000000a1";
-        assert_eq!(resume_thread_ids(&args(&["resume", id])), Some(vec![id.to_string()]));
-        assert_eq!(resume_thread_ids(&args(&["-m", "o3", "exec", "resume", "--all", id, "go"])), Some(vec![id.to_string()]));
-        assert_eq!(resume_thread_ids(&args(&["resume", "--last"])), Some(vec![]));
-        assert_eq!(resume_thread_ids(&args(&["resume", "ZZ99"])), Some(vec![]));
-        assert_eq!(resume_thread_ids(&args(&["exec", "ZZ99"])), None);
-        assert_eq!(resume_thread_ids(&args(&["fork", id])), None, "a fork writes a new rollout");
-        assert_eq!(resume_thread_ids(&args(&["exec", "--", "resume", id])), None, "a prompt word");
+        let other = "019a0000-0000-7000-8000-0000000000c3";
+        let of = |id: &str| Resume::Of(id.to_string());
+        assert_eq!(resume_of(&args(&["resume", id])), of(id));
+        assert_eq!(resume_of(&args(&["-m", "o3", "exec", "resume", id, "go on"])), of(id));
+        assert_eq!(resume_of(&args(&["resume", &id.to_ascii_uppercase()])), of(id), "folded to lower case");
+        assert_eq!(resume_of(&args(&["resume", id, "--", other])), of(id), "after -- is a prompt");
+        // Unclear: nothing named, a name, an option first, or a second id.
+        for unclear in [
+            &["resume"][..],
+            &["resume", "--last"][..],
+            &["resume", "ZZ99"][..],
+            &["resume", "zz99-thread-name", other][..],
+            &["resume", "--all", id][..],
+            &["resume", "-m", id][..],
+            &["resume", id, other][..],
+            &["resume", id, "-c", other][..],
+        ] {
+            assert_eq!(resume_of(&args(unclear)), Resume::Unclear, "{unclear:?}");
+        }
+        assert_eq!(resume_of(&args(&["exec", "ZZ99"])), Resume::No);
+        assert_eq!(resume_of(&args(&["fork", id])), Resume::No, "a fork writes a new rollout");
+        assert_eq!(resume_of(&args(&["exec", "--", "resume", id])), Resume::No, "a prompt word");
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_recorded_leaves_its_start_to_be_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        // What the child wrote before its record failed.
+        let new = rollout(&f, NEW);
+        let dir = f.writer.codex_starts_dir().unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let spawned = start.spawn_child(Command::new("sleep").arg("30"), String::new);
+        let was_spawned = start.child_spawned();
+        // Writable again before the wrapper lets go, so that its drop could
+        // remove the start if it were wrong to.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(start);
+
+        assert!(spawned.is_err() && was_spawned, "spawned, then the record failed");
+        assert_eq!(starts(&f).len(), 1, "the start is kept: {:?}", starts(&f));
+        let later = import_codex(&f.writer, &new).unwrap();
+        assert!(matches!(later, Imported::NoSave), "closed, then refused: {later:?}");
+    }
+
+    #[test]
+    fn a_start_another_import_has_closed_is_not_closed_again() {
+        let f = fixture();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let path = start.start.clone();
+        // A slow import has opened the start file and not yet locked it.
+        let slow = File::open(&path).unwrap();
+        drop(start); // no child: the start goes, as one closed by another import
+        assert_eq!(starts(&f), Vec::<String>::new());
+        // An ordinary session begins after that.
+        let later = rollout(&f, NEW);
+
+        let found = check_start(&f.writer, &path, slow, true).unwrap();
+        assert!(found.is_none(), "a closed start is neither open nor closed again");
+        assert!(stored(&f, &later), "and the later session is not registered");
+    }
+
+    #[test]
+    fn rollouts_under_every_recorded_root_are_closed() {
+        let f = fixture();
+        let other_root = f._root.path().join("codex-home/sessions");
+        let mut start = CodexNoSaveStart::open(&f.writer, &[f.sessions.clone(), other_root.clone()]).unwrap();
+        let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
+        child.wait().unwrap();
+        let day = other_root.join("2026/10/07");
+        fs::create_dir_all(&day).unwrap();
+        let elsewhere = day.join(format!("{NEW}.jsonl"));
+        fs::write(&elsewhere, format!("{LINE}\n")).unwrap();
+        assert_eq!(start.finish(&f.writer).unwrap(), Closed { registered: 1, removed: 0 });
+        assert!(matches!(import_codex(&f.writer, &elsewhere).unwrap(), Imported::NoSave));
     }
 
     #[test]
@@ -609,7 +779,7 @@ mod tests {
         let earlier = rollout(&f, EARLIER);
         assert!(stored(&f, &earlier), "saved before the resume");
         let copy = f.writer.base_dir().join("codex/2026-10-07").join(EARLIER);
-        let found = register_resumed(&f.writer, &f.sessions, &["019a0000-0000-7000-8000-0000000000a1".into()]).unwrap();
+        let found = register_resumed(&f.writer, std::slice::from_ref(&f.sessions), "019A0000-0000-7000-8000-0000000000A1").unwrap();
         assert_eq!(found, 1);
         let registry = f.writer.nosave_dir().unwrap();
         assert!(registry.join(EARLIER).exists() && registry.join("019a0000-0000-7000-8000-0000000000a1").exists());

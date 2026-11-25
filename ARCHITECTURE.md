@@ -173,14 +173,17 @@ it.** Every importer, the timers included, consults the no-save registry
   trusted on that machine, and `continuum-codex` cannot tell which rollout is
   its own. So a no-save Codex start does not rely on its hooks
   (`continuum-core/src/codex_nosave_start.rs`):
-  - **Before Codex runs.** A no-save `codex resume <id>` (also `codex exec
-    resume <id>`) enters that thread id, and the file stem of every rollout of
+  - **Before Codex runs.** A no-save `codex resume <uuid>` (also `codex exec
+    resume <uuid>`) enters that thread id, and the file stem of every rollout of
     that thread, so the turns it appends are never stored; the turns stored
-    before the resume are kept. A no-save resume that names no thread id
-    (`--last`, the picker, a thread name) is refused, with the request kept,
-    because the rollout it would write on cannot be known. Then the start is
-    recorded in `~/.local/share/continuum/codex-nosave-starts/`: the rollouts
-    that are there now, and a lock the wrapper holds while it lives.
+    before the resume are kept. Only that form counts: the thread id right
+    after `resume`, and no other thread id before `--`. Any other no-save resume
+    (`--last`, the picker, a thread name, an option before the id, a second
+    id) is refused, with the request kept, because the rollout it would write
+    on cannot be known. Then the start is recorded in
+    `~/.local/share/continuum/codex-nosave-starts/`: the rollouts that are
+    there now under the `CODEX_HOME` Codex is started with and under
+    `~/.codex`, and a lock the wrapper holds while it lives.
   - **While it is open.** Every Codex import (the timer, the hooks, another
     wrapper's exit) stores no rollout that is not on that list, answering
     "held". A start is open while the wrapper holds its lock or the Codex
@@ -193,10 +196,22 @@ it.** Every importer, the timers included, consults the no-save registry
 
   The cost, towards not saving: another Codex session that begins while a
   no-save Codex start is open is not stored while it is open, and is entered
-  as no-save when it closes. A Codex session that was already running is
-  stored as usual. Not covered: a wrapper killed by SIGKILL in the instant
-  between starting Codex and recording it (other signals are held back for
-  that instant); the start is then taken as closed once the wrapper is gone.
+  as no-save when it closes, forum Codex rounds included. When the wrapper
+  closes the start, that is when its Codex ends. When the wrapper was killed,
+  it is the first Codex import after its Codex ended (the timer runs every
+  five minutes), and a session begun in between is entered too, because
+  nothing records when Codex ended. A Codex session that was already running
+  is stored as usual.
+
+  Not covered: a no-save Codex that goes on in an existing rollout other than
+  by `resume <uuid>` on its command line (a session chosen inside a running
+  Codex), which still relies on its hooks; a rollout written outside the two
+  folders above, which is held while the start is open and stored afterwards;
+  and a wrapper killed by SIGKILL in the instant between starting Codex and
+  recording it (other signals are held back for that instant), after which
+  the start is taken as closed once the wrapper is gone. On macOS a recorded
+  Codex is checked by its process id alone, so a reused id keeps the start
+  open, towards not saving.
 - **Gemini and Goose.** No hook or timer imports their sessions: only their
   own wrapper does, at exit. So a session the wrapper does not import is not
   put in Continuum later, and there is no importer for a registry entry to

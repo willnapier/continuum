@@ -94,7 +94,15 @@ fn main() -> Result<()> {
     // kept.
     let mut nosave_start = None;
     if skip_saving {
-        match open_no_save_start(&args, &sessions_dir) {
+        // Every place this Codex may write a rollout: the sessions folder it
+        // is started with, and ~/.codex's when CODEX_HOME points elsewhere
+        // (an app-server already running may have been started without it).
+        let mut sessions_dirs = vec![sessions_dir.clone()];
+        let default_dir = std::path::PathBuf::from(&home).join(".codex/sessions");
+        if default_dir != sessions_dir {
+            sessions_dirs.push(default_dir);
+        }
+        match open_no_save_start(&args, &sessions_dirs) {
             Ok(start) => nosave_start = Some(start),
             Err(refusal) => {
                 nosave_request::settle(nosave, false);
@@ -124,7 +132,20 @@ fn main() -> Result<()> {
         .stderr(Stdio::inherit());
     let spawn_failure = || continuum_core::masked_launch::spawn_failure("codex");
     let mut child = match nosave_start.as_mut() {
-        Some(start) => start.spawn_child(&mut command, spawn_failure)?,
+        Some(start) => match start.spawn_child(&mut command, spawn_failure) {
+            Ok(child) => child,
+            Err(error) => {
+                // A Codex that was spawned and then ended again, because it
+                // could not be recorded, may have written a rollout: close the
+                // start (or leave it for an import to close) before failing.
+                if let Some(start) = nosave_start.take().filter(|start| start.child_spawned()) {
+                    if let Err(close) = continuum_core::PlainTextWriter::new().and_then(|writer| start.finish(&writer)) {
+                        eprintln!("⚠ Warning: could not close this no-save start; the next import will: {close:#}");
+                    }
+                }
+                return Err(error);
+            }
+        },
         None => command.spawn().with_context(spawn_failure)?,
     };
     let status = child.wait()?;
@@ -193,25 +214,27 @@ fn main() -> Result<()> {
 }
 
 /// Before a no-save Codex runs: register a resumed session, then record the
-/// start (`continuum_core::codex_nosave_start`). A resume that names no
-/// thread id is refused: the rollout it would write on cannot be known.
+/// start (`continuum_core::codex_nosave_start`). A resume whose session its
+/// arguments do not name for certain is refused: the rollout it would write
+/// on cannot be known.
 fn open_no_save_start(
     args: &[String],
-    sessions_dir: &std::path::Path,
+    sessions_dirs: &[std::path::PathBuf],
 ) -> Result<continuum_core::codex_nosave_start::CodexNoSaveStart> {
-    use continuum_core::codex_nosave_start::{self as start, CodexNoSaveStart};
+    use continuum_core::codex_nosave_start::{self as start, CodexNoSaveStart, Resume};
     let writer = continuum_core::PlainTextWriter::new()?;
-    if let Some(threads) = start::resume_thread_ids(args) {
-        if threads.is_empty() {
-            color_eyre::eyre::bail!(
-                "a no-save `codex resume` must name the session's id (codex resume <uuid>); \
-                 without it the session to keep out of Continuum cannot be known"
-            );
+    match start::resume_of(args) {
+        Resume::No => {}
+        Resume::Of(thread) => {
+            start::register_resumed(&writer, sessions_dirs, &thread)
+                .context("the resumed session could not be marked no-save")?;
         }
-        start::register_resumed(&writer, sessions_dir, &threads)
-            .context("the resumed session could not be marked no-save")?;
+        Resume::Unclear => color_eyre::eyre::bail!(
+            "a no-save `codex resume` must name the session's id right after `resume`, and no other id \
+             (codex resume <uuid> [prompt]); otherwise the session to keep out of Continuum cannot be known"
+        ),
     }
-    CodexNoSaveStart::open(&writer, sessions_dir).context("the no-save start could not be recorded")
+    CodexNoSaveStart::open(&writer, sessions_dirs).context("the no-save start could not be recorded")
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {
