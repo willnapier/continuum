@@ -329,6 +329,9 @@ fn a_no_save_resume_that_names_no_session_is_refused() {
         // An option before the selector, which may take a value.
         &["resume", "--all", EARLIER_THREAD][..],
         &["resume", EARLIER_THREAD, OTHER_THREAD][..],
+        // An option after the id, which may choose another session.
+        &["resume", EARLIER_THREAD, "--last"][..],
+        &["exec", "resume", EARLIER_THREAD, "--last"][..],
     ] {
         let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "nohooks-resume-unnamed");
         scratch.stand_in_launcher();

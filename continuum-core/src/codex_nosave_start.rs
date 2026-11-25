@@ -28,11 +28,11 @@
 //! ([`CodexNoSaveStart::finish`]), however it ended. A wrapper that is itself
 //! killed (a closed terminal tab sends it SIGHUP) leaves the files behind; the
 //! first import after its child has also ended closes the start in the same
-//! way. Between the spawn and the child record the wrapper blocks SIGHUP,
-//! SIGINT, SIGTERM and SIGQUIT, so only SIGKILL in that instant can leave a
-//! start with no child recorded, which is then taken as closed. A child that
-//! was spawned but could not be recorded is ended, and its start is closed
-//! (or left for an import to close), never dropped.
+//! way. The child records itself between its fork and its exec, holding a
+//! copy of the start's lock until then, so Codex never runs unrecorded, even
+//! when the wrapper is killed by SIGKILL at once. A child whose fuller record
+//! (written by the wrapper) fails is ended, and its start is closed (or left
+//! for an import to close), never dropped.
 //!
 //! The rollouts are listed under every place this Codex may write them: the
 //! `CODEX_HOME` it was started with, and `~/.codex`. A rollout elsewhere is
@@ -42,13 +42,17 @@
 //! while a no-save start is open is not stored while it is open, and is
 //! registered as no-save when it closes. When the wrapper closes the start,
 //! that is when Codex ends. When the wrapper was killed, it is the first
-//! import after Codex ended (the timer runs every five minutes), so a session
-//! begun in between is registered too: nothing records when Codex ended. A
-//! session that was already running keeps being stored.
+//! close that succeeds after Codex ended: normally the next timer import
+//! (every five minutes), later if that import fails or does not run. A
+//! session begun before that close is registered too: nothing records when
+//! Codex ended. A session that was already running, under the recorded
+//! folders, keeps being stored.
 //!
 //! Not covered: a no-save Codex that goes on in an existing rollout other
 //! than by `resume <uuid>` on its command line (a session chosen inside a
-//! running Codex), which still relies on its hooks.
+//! running Codex), which still relies on its hooks; and a rollout of the
+//! session that a Codex app-server creates only after the Codex process has
+//! ended.
 
 use crate::import::{self, discard_session, register_nosave};
 use crate::PlainTextWriter;
@@ -161,23 +165,23 @@ impl CodexNoSaveStart {
         self.child_spawned
     }
 
-    /// Start Codex with `command` and record the child. Signals that would
-    /// end the wrapper are held back until the child is on record (the child
-    /// starts with none held back). A child that cannot be recorded is ended
-    /// again, and that is an error; it may have written a rollout, so the
-    /// start is then kept for [`Self::finish`] or a later import to close.
-    /// `spawn_failure` describes a failed start.
+    /// Start Codex with `command` and record the child.
+    ///
+    /// The child records itself, between its fork and its exec, so that no
+    /// moment exists in which Codex runs unrecorded, whatever happens to the
+    /// wrapper. Until its exec the child also holds a copy of the start's
+    /// lock, and `spawn` returns only after the exec. A child that cannot
+    /// record itself does not exec: the start fails and nothing ran. The
+    /// wrapper then writes the full record (with the start token) in its
+    /// place. If that fails, the child is ended again and that is an error; it
+    /// may have written a rollout, so the start is kept for [`Self::finish`]
+    /// or a later import to close. `spawn_failure` describes a failed start.
     pub fn spawn_child(&mut self, command: &mut Command, spawn_failure: impl FnOnce() -> String) -> Result<Child> {
-        let _held = SignalsHeld::new();
-        // SAFETY: the closure only clears the signal mask, which is
-        // async-signal-safe.
+        let early = SelfRecord::new(&self.child)?;
+        // SAFETY: the closure makes only async-signal-safe calls (getpid,
+        // open, write, close, rename) on buffers prepared before the fork.
         unsafe {
-            command.pre_exec(|| {
-                let mut none: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut none);
-                libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
-                Ok(())
-            });
+            command.pre_exec(move || early.write());
         }
         let mut child = command.spawn().with_context(spawn_failure)?;
         self.child_spawned = true;
@@ -336,19 +340,23 @@ pub enum Resume {
 }
 
 /// Read a no-save start's arguments for a resume (`codex resume …`, `codex
-/// exec resume …`). Only one form names its session for certain: `resume`
-/// followed at once by a thread id, with no other thread id after it. Codex
-/// takes the first argument after `resume` that is not an option as the
-/// session, so an option before it, which may take a value, makes it unclear,
-/// and so does a second thread id (a prompt or an option's value). Arguments
-/// after `--` are a prompt.
+/// exec resume …`). Only one form names its session for certain: `resume`,
+/// then a thread id, then nothing but prompt words: no option and no other
+/// thread id until `--`. An option anywhere after `resume` makes it unclear,
+/// whatever it is: one may choose another session (`--last`), and one before
+/// the id may take it as its value. A second thread id may be a prompt or an
+/// option's value. Arguments after `--` are a prompt. Options before `resume`
+/// (`codex -m <model> resume …`) are Codex's own and choose no session.
 pub fn resume_of(args: &[String]) -> Resume {
     let options: Vec<&String> = args.iter().take_while(|arg| *arg != "--").collect();
     let Some(at) = options.iter().position(|arg| *arg == "resume") else { return Resume::No };
     let rest = &options[at + 1..];
     let ids = rest.iter().filter(|arg| import::is_codex_thread_id(arg)).count();
+    let an_option = rest.iter().any(|arg| arg.starts_with('-'));
     match rest.first() {
-        Some(selector) if import::is_codex_thread_id(selector) && ids == 1 => Resume::Of(selector.to_ascii_lowercase()),
+        Some(selector) if import::is_codex_thread_id(selector) && ids == 1 && !an_option => {
+            Resume::Of(selector.to_ascii_lowercase())
+        }
         _ => Resume::Unclear,
     }
 }
@@ -474,6 +482,9 @@ pub fn rollout_stems(sessions_dir: &Path) -> Result<BTreeSet<String>> {
 }
 
 fn remove_files(start: &Path, child: &Path) -> Result<()> {
+    // Temporary files left by a child record that was cut short go too.
+    let _ = fs::remove_file(self_record_tmp(child));
+    let _ = fs::remove_file(child.with_extension("child.tmp"));
     for path in [child, start] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -505,40 +516,75 @@ fn private_file(path: &Path) -> Result<File> {
     options.open(path).with_context(|| format!("Failed to create {}", path.display()))
 }
 
-/// SIGHUP, SIGINT, SIGTERM and SIGQUIT held back on this thread until drop;
-/// a signal that came meanwhile is delivered then. A child would inherit the
-/// mask (Rust's process spawning keeps it), so `spawn_child` clears it in
-/// the child before its exec.
-struct SignalsHeld(Option<libc::sigset_t>);
+/// The record a child writes of itself between its fork and its exec
+/// (`{"pid":<n>,"start_token":null}`), by way of a temporary file and a
+/// rename. Everything that allocates is done before the fork: the child only
+/// makes async-signal-safe calls.
+struct SelfRecord {
+    tmp: std::ffi::CString,
+    path: std::ffi::CString,
+}
 
-impl SignalsHeld {
-    fn new() -> Self {
-        // SAFETY: plain sigset manipulation on stack values.
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            let mut old: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
-                libc::sigaddset(&mut set, signal);
-            }
-            if libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0 {
-                Self(Some(old))
-            } else {
-                Self(None)
+impl SelfRecord {
+    fn new(child: &Path) -> Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| eyre!("unusable path for the child record: {}", path.display()))
+        };
+        Ok(Self { tmp: c(&self_record_tmp(child))?, path: c(child)? })
+    }
+
+    /// In the child, before its exec. An error stops the exec.
+    fn write(&self) -> std::io::Result<()> {
+        let mut text = [0u8; 64];
+        let mut n = 0;
+        let mut put = |bytes: &[u8]| {
+            text[n..n + bytes.len()].copy_from_slice(bytes);
+            n += bytes.len();
+        };
+        put(b"{\"pid\":");
+        // SAFETY: getpid is async-signal-safe and cannot fail.
+        let mut pid = unsafe { libc::getpid() } as u32;
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (pid % 10) as u8;
+            count += 1;
+            pid /= 10;
+            if pid == 0 {
+                break;
             }
         }
+        digits[..count].reverse();
+        put(&digits[..count]);
+        put(b",\"start_token\":null}");
+        // SAFETY: async-signal-safe calls on NUL-terminated paths and a stack
+        // buffer that outlive them.
+        unsafe {
+            let fd = libc::open(
+                self.tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            );
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let written = libc::write(fd, text.as_ptr().cast(), n);
+            libc::close(fd);
+            if written != n as isize {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            if libc::rename(self.tmp.as_ptr(), self.path.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 }
 
-impl Drop for SignalsHeld {
-    fn drop(&mut self) {
-        if let Some(old) = self.0.take() {
-            // SAFETY: restores the mask saved in `new`.
-            unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-            }
-        }
-    }
+fn self_record_tmp(child: &Path) -> PathBuf {
+    child.with_extension("child.self.tmp")
 }
 
 #[cfg(test)]
@@ -711,6 +757,11 @@ mod tests {
             &["resume", "-m", id][..],
             &["resume", id, other][..],
             &["resume", id, "-c", other][..],
+            // An option after the id: it may choose another session.
+            &["resume", id, "--last"][..],
+            &["exec", "resume", id, "--last"][..],
+            &["resume", id, "--last=true"][..],
+            &["resume", id, "-m", "o3"][..],
         ] {
             assert_eq!(resume_of(&args(unclear)), Resume::Unclear, "{unclear:?}");
         }
@@ -720,25 +771,79 @@ mod tests {
     }
 
     #[test]
-    fn a_child_that_cannot_be_recorded_leaves_its_start_to_be_closed() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_child_whose_full_record_fails_leaves_its_start_to_be_closed() {
         let f = fixture();
         let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
-        // What the child wrote before its record failed.
+        // What the child wrote before the wrapper's record failed.
         let new = rollout(&f, NEW);
-        let dir = f.writer.codex_starts_dir().unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // The wrapper's record cannot be written: its temporary name is taken.
+        fs::write(start.child.with_extension("child.tmp"), b"taken").unwrap();
         let spawned = start.spawn_child(Command::new("sleep").arg("30"), String::new);
         let was_spawned = start.child_spawned();
-        // Writable again before the wrapper lets go, so that its drop could
-        // remove the start if it were wrong to.
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // The wrapper wrote no record, so this one is the child's own,
+        // written before its exec.
+        let own: ChildRecord = serde_json::from_str(&fs::read_to_string(&start.child).unwrap()).unwrap();
         drop(start);
 
         assert!(spawned.is_err() && was_spawned, "spawned, then the record failed");
-        assert_eq!(starts(&f).len(), 1, "the start is kept: {:?}", starts(&f));
+        assert!(own.pid > 0 && own.start_token.is_none(), "{own:?}");
+        assert!(starts(&f).iter().any(|n| n.ends_with(".start")), "the start is kept: {:?}", starts(&f));
         let later = import_codex(&f.writer, &new).unwrap();
         assert!(matches!(later, Imported::NoSave), "closed, then refused: {later:?}");
+    }
+
+    #[test]
+    fn a_child_that_cannot_record_itself_never_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let ran = f._root.path().join("ran");
+        let dir = f.writer.codex_starts_dir().unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let spawned = start.spawn_child(
+            Command::new("/bin/sh").arg("-c").arg(format!(": > '{}'", ran.display())),
+            String::new,
+        );
+        let was_spawned = start.child_spawned();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(start);
+
+        assert!(spawned.is_err() && !was_spawned, "the start fails: {spawned:?}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!ran.exists(), "the child never ran its program");
+        assert_eq!(starts(&f), Vec::<String>::new(), "nothing ran, so the start goes");
+    }
+
+
+    /// The cost after a killed wrapper lasts until a close succeeds, not until
+    /// a set time: a close that fails is tried again by the next import, which
+    /// also takes in a session begun meanwhile.
+    #[test]
+    fn a_failed_close_is_retried_and_takes_in_sessions_begun_meanwhile() {
+        let f = fixture();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
+        child.wait().unwrap();
+        drop(start); // the wrapper is killed; its Codex has ended
+        let new = rollout(&f, NEW);
+        // The registry cannot be written: a file where its folder should be.
+        let registry = f.writer.nosave_dir().unwrap().to_path_buf();
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(&registry, b"not a folder").unwrap();
+        let failed = import_codex(&f.writer, &new);
+        fs::remove_file(&registry).unwrap();
+        assert!(failed.is_err(), "the close fails, and nothing is stored: {failed:?}");
+        assert_eq!(starts(&f).len(), 2, "the start is still there");
+
+        // An ordinary session begun after the failed close.
+        let later_day = f.sessions.join("2026/10/08");
+        fs::create_dir_all(&later_day).unwrap();
+        let later = later_day.join("rollout-2026-10-08T08-00-00-019a0000-0000-7000-8000-0000000000d4.jsonl");
+        fs::write(&later, format!("{LINE}\n")).unwrap();
+
+        assert!(matches!(import_codex(&f.writer, &later).unwrap(), Imported::NoSave), "taken in by the retried close");
+        assert!(matches!(import_codex(&f.writer, &new).unwrap(), Imported::NoSave));
+        assert_eq!(starts(&f), Vec::<String>::new());
     }
 
     #[test]
