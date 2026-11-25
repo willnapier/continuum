@@ -69,10 +69,24 @@ enum CodexCommand {
     Which,
     /// Install or update the Continuum-managed Codex CLI
     Update,
+    /// Report no-save Codex starts on record for longer than a set age, by
+    /// count and age only; no record is closed, changed or removed. Exits 0
+    /// when none is older, 1 when one is (an `old:` line each), and 3 when the
+    /// starts cannot be checked. system-health-check calls it.
+    NosaveStarts {
+        /// The age past which a start is reported, in hours.
+        #[arg(long, default_value_t = 6)]
+        older_than_hours: u64,
+    },
 }
 
 fn handle_codex(args: &CodexArgs) -> Result<()> {
     match args.command {
+        CodexCommand::NosaveStarts { older_than_hours } => {
+            let (code, report) = report_old_starts(PlainTextWriter::new(), older_than_hours);
+            println!("{report}");
+            std::process::exit(code);
+        }
         CodexCommand::Which => {
             let resolution = continuum_core::codex_cli::resolve_codex(None)?;
             println!("path: {}", resolution.path.display());
@@ -86,6 +100,32 @@ fn handle_codex(args: &CodexArgs) -> Result<()> {
         CodexCommand::Update => update_managed_codex()?,
     }
     Ok(())
+}
+
+/// `continuum codex nosave-starts`: the exit code and what to print.
+fn report_old_starts(writer: Result<PlainTextWriter>, older_than_hours: u64) -> (i32, String) {
+    let limit = std::time::Duration::from_secs(older_than_hours.saturating_mul(3600));
+    let ages = match writer.and_then(|writer| continuum_core::codex_nosave_start::start_ages(&writer)) {
+        Ok(ages) => ages,
+        Err(e) => return (3, format!("cannot check the no-save Codex starts: {e:#}")),
+    };
+    // Hours and minutes, so a start just past the limit does not read as
+    // equal to it.
+    let hours = |age: &std::time::Duration| format!("{} h {} min", age.as_secs() / 3600, age.as_secs() % 3600 / 60);
+    let old: Vec<_> = ages.iter().filter(|age| **age > limit).collect();
+    if old.is_empty() {
+        return (0, format!("no no-save Codex start older than {older_than_hours} h ({} on record)", ages.len()));
+    }
+    let mut report = format!(
+        "{} of {} no-save Codex start(s) on record for more than {older_than_hours} h; the oldest for {}",
+        old.len(),
+        ages.len(),
+        hours(old[0])
+    );
+    for age in &old {
+        report.push_str(&format!("\nold: {}", hours(age)));
+    }
+    (1, report)
 }
 
 fn update_managed_codex() -> Result<()> {

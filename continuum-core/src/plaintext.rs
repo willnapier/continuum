@@ -77,6 +77,13 @@ impl PlainTextWriter {
         self.nosave_dir.as_deref().and_then(Path::parent).map(|parent| parent.join("codex-nosave-starts"))
     }
 
+    /// The log of every close of a no-save Codex start
+    /// (`codex_nosave_start`): `codex-nosave-closes.jsonl` beside the no-save
+    /// registry, per machine. None when there is no registry.
+    pub fn codex_close_log(&self) -> Option<PathBuf> {
+        self.nosave_dir.as_deref().and_then(Path::parent).map(|parent| parent.join("codex-nosave-closes.jsonl"))
+    }
+
     /// As if HOME were unknown.
     #[cfg(test)]
     pub(crate) fn clear_nosave_dir_for_test(&mut self) {

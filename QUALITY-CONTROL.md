@@ -54,12 +54,26 @@ claude        # Start Claude Code - won't be saved
   is kept. Choosing another session from inside a running no-save Codex is not
   covered (it relies on Codex's hooks)
 - ⚠️ Codex: while a no-save Codex session is open, any other Codex session that
-  *begins* meanwhile is not saved either, forum Codex rounds included
-  (Continuum cannot tell which rollout is the no-save one). If the wrapper was
+  *begins* meanwhile and writes a rollout is not saved either (Continuum
+  cannot tell which rollout is the no-save one). Forum rounds are not
+  affected: they run `codex exec --ephemeral`, which writes no rollout. If the wrapper was
   killed (its tab closed), that lasts until a close succeeds after Codex ended:
   normally the next five-minute timer import, later if imports fail. Codex
   sessions already running are saved as usual. See "What keeps a no-save
   session out of Continuum" in `ARCHITECTURE.md`
+- ⚠️ Codex: every close of a no-save start is logged in
+  `~/.local/share/continuum/codex-nosave-closes.jsonl` (the closer, the start
+  record, the rollouts marked by stem, the stored copies removed by path, any
+  failed step; no content), and an import that closes one prints a line with
+  the counts in `auto-import.log`. A start on record for more than six hours
+  is a `system-health-check` finding (`continuum codex nosave-starts`). To
+  undo one removal: delete the session's markers in
+  `~/.local/share/continuum/nosave-sessions/` (its rollout stem, and its
+  thread id if that is there too), then
+  `continuum import -a codex -s <rollout file>`. The log is best effort: a
+  wrapper whose terminal is gone reports a failed write to nobody, and a
+  closer killed between removing the start and writing its line leaves no
+  line
 
 ### How the Marker Works
 
