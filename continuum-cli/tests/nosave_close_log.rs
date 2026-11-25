@@ -237,9 +237,12 @@ fn an_old_start_is_reported_by_count_and_age_and_left_alone() {
     let output = report(&scratch);
     let context = said(&output);
     assert_eq!(output.status.code(), Some(1), "{context}");
-    assert!(stdout(&output).starts_with("1 of 2 no-save Codex start(s) on record for more than 6 h; the oldest for 7 h"), "{context}");
+    assert!(
+        stdout(&output).starts_with("1 of 2 no-save Codex start(s) on record for more than 6 h; the oldest for 7 h 1 min"),
+        "{context}"
+    );
     let old_lines: Vec<String> = stdout(&output).lines().filter(|l| l.starts_with("old: ")).map(str::to_string).collect();
-    assert_eq!(old_lines, ["old: 7 h"], "{context}");
+    assert_eq!(old_lines, ["old: 7 h 1 min"], "{context}");
     let after = (starts(&scratch), std::fs::read(&old).unwrap(), std::fs::metadata(&old).unwrap().modified().unwrap());
     assert_eq!(before, after, "nothing closed, changed or removed");
     assert!(!close_log_path(&scratch).exists(), "and nothing closed");

@@ -231,7 +231,14 @@ it.** Every importer, the timers included, consults the no-save registry
   paths only, never content. The close comes first: if the log cannot be
   written the rollouts are still marked and their copies removed; the wrapper
   then prints a warning, and an import fails, so the timer's alert fires
-  (the start is already gone, so the next import is not held back). An
+  (the start is already gone, so the next import is not held back). The log
+  is therefore best effort: a wrapper whose terminal is gone reports a failed
+  write to nobody, and a closer killed between removing the start and
+  writing its line leaves a finished close with no line and no start to
+  close again. Closers of different starts append under an exclusive lock on
+  the log; a line cut short by a killed closer is ended by the next entry,
+  and a reader skips a line that is not JSON. A failed close lists each stem
+  whose marker was written and each copy removed before the failure. An
   import that closes a start prints `= Closed no-save Codex start <record>
   (its wrapper had ended): marked N Codex session(s) no-save, removed M stored
   copy(ies)` on stderr, which the timer keeps in `auto-import.log`, also when

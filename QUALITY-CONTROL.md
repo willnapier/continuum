@@ -67,9 +67,13 @@ claude        # Start Claude Code - won't be saved
   failed step; no content), and an import that closes one prints a line with
   the counts in `auto-import.log`. A start on record for more than six hours
   is a `system-health-check` finding (`continuum codex nosave-starts`). To
-  undo one removal: delete the session's marker in
-  `~/.local/share/continuum/nosave-sessions/`, then
-  `continuum import -a codex -s <rollout file>`
+  undo one removal: delete the session's markers in
+  `~/.local/share/continuum/nosave-sessions/` (its rollout stem, and its
+  thread id if that is there too), then
+  `continuum import -a codex -s <rollout file>`. The log is best effort: a
+  wrapper whose terminal is gone reports a failed write to nobody, and a
+  closer killed between removing the start and writing its line leaves no
+  line
 
 ### How the Marker Works
 

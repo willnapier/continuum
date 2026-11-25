@@ -48,16 +48,22 @@
 //! Codex ended. A session that was already running, under the recorded
 //! folders, keeps being stored.
 //!
-//! Every close is logged, whichever closer did it (the wrapper, or an import
-//! after a killed wrapper): one JSON line in `codex-nosave-closes.jsonl`
+//! Every close is logged, as far as the log can be written, whichever closer
+//! did it (the wrapper, or an import after a killed wrapper): one JSON line in
+//! `codex-nosave-closes.jsonl`
 //! beside the registry, per machine and outside the synced archive, with the
 //! time, the closer, the start record's file name, each rollout marked
 //! no-save (by file stem), each stored copy removed (by path), and the step
 //! that failed, if one did. It holds names and paths only, never a session's
 //! content. The close comes first: a log that cannot be written stops neither
 //! the marking nor the removal, and is reported (by the wrapper on its
-//! terminal; by an import as an error, so the timer raises its alert). An
-//! import that closes a start also prints one line with the counts.
+//! terminal; by an import as an error, so the timer raises its alert). So
+//! the log is best effort: a wrapper whose terminal is gone reports a failed
+//! write to nobody, and a closer killed between removing the start and
+//! writing its line leaves a finished close with no line (and no start to
+//! close again). Appends are made under a lock on the log, and a line cut
+//! short is ended by the next one. An import that closes a start also prints
+//! one line with the counts.
 //!
 //! A start has no time limit. [`start_ages`] reports how long each record
 //! has been there, without touching any, so that a start left open too long
@@ -70,7 +76,7 @@
 //! session that a Codex app-server creates only after the Codex process has
 //! ended.
 
-use crate::import::{self, discard_session_copies, register_nosave};
+use crate::import::{self, register_nosave, remove_stored_copies};
 use crate::PlainTextWriter;
 use color_eyre::{eyre::eyre, eyre::Context, Result};
 use std::collections::BTreeSet;
@@ -396,13 +402,16 @@ fn close_start(writer: &PlainTextWriter, record: &Record, start: &Path, child: &
     }
 }
 
-/// Register every rollout made since the start, and remove its stored copies,
-/// noting each in `closed` as it is done.
+/// Register every rollout made since the start, and remove its stored copies
+/// (registered first, as `import::discard_session` does), noting each in
+/// `closed` as soon as it is done: a stem once its marker is written, a copy
+/// once it is gone.
 fn close(writer: &PlainTextWriter, record: &Record, closed: &mut Closed) -> Result<()> {
     let now = record.rollouts_now()?;
     for stem in now.difference(&record.before) {
-        discard_session_copies(writer, "codex", stem, &mut closed.removed)?;
+        register_nosave(writer, stem)?;
         closed.marked.push(stem.clone());
+        remove_stored_copies(writer, "codex", stem, &mut closed.removed)?;
     }
     Ok(())
 }
@@ -423,17 +432,36 @@ fn log_close(writer: &PlainTextWriter, closer: Closer, closed: &Closed, failed: 
     let mut line = serde_json::to_vec(&entry)?;
     line.push(b'\n');
     let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // One write of one line: appends from two closers do not interleave.
     let mut file = options.open(&path).with_context(|| format!("cannot open {}", path.display()))?;
+    // Closers of different starts may log at once: each appends its whole
+    // line under an exclusive lock on the log, released when `file` closes.
+    file.lock().with_context(|| format!("cannot lock {}", path.display()))?;
+    // A line cut short (a closer killed mid-write) is ended here, so it
+    // spoils only itself; a reader skips a line that is not JSON.
+    if !ends_with_newline_or_empty(&mut file)? {
+        line.insert(0, b'\n');
+    }
     file.write_all(&line).with_context(|| format!("cannot write {}", path.display()))?;
     file.sync_data().with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
+}
+
+fn ends_with_newline_or_empty(file: &mut File) -> Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 /// How long each no-save Codex start on record has been there, open or
@@ -1072,16 +1100,94 @@ mod tests {
         let seven_hours_ago = SystemTime::now() - Duration::from_secs(7 * 3600);
         let nanos = seven_hours_ago.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
         fs::write(dir.join(format!("4242-{nanos}.start")), b"{}").unwrap();
-        // Not records: a temporary file, a child record, and a name with no time.
+        // A record whose name has no time: aged by its modification time.
+        let untimed = dir.join("made-by-hand.start");
+        fs::write(&untimed, b"{}").unwrap();
+        File::options()
+            .write(true)
+            .open(&untimed)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(9 * 3600))
+            .unwrap();
+        // Not records: a temporary file and a child record.
         fs::write(dir.join(format!(".4242-{nanos}.tmp")), b"").unwrap();
         fs::write(dir.join(format!("4242-{nanos}.child")), b"").unwrap();
         let before = starts(&f);
+        let untimed_mtime = fs::metadata(&untimed).unwrap().modified().unwrap();
 
         let ages = start_ages(&f.writer).unwrap();
-        assert_eq!(ages.len(), 2, "{ages:?}");
-        assert!(ages[0] >= Duration::from_secs(7 * 3600 - 5) && ages[0] < Duration::from_secs(7 * 3600 + 60));
-        assert!(ages[1] < Duration::from_secs(60), "the fresh one: {ages:?}");
+        assert_eq!(ages.len(), 3, "{ages:?}");
+        let near = |age: Duration, hours: u64| age >= Duration::from_secs(hours * 3600 - 5) && age < Duration::from_secs(hours * 3600 + 60);
+        assert!(near(ages[0], 9), "the untimed one, by its mtime: {ages:?}");
+        assert!(near(ages[1], 7), "by its name: {ages:?}");
+        assert!(ages[2] < Duration::from_secs(60), "the fresh one: {ages:?}");
         assert_eq!(starts(&f), before, "nothing changed");
+        assert_eq!(fs::metadata(&untimed).unwrap().modified().unwrap(), untimed_mtime);
         drop(start);
+    }
+
+    /// A close that fails after a marker is written, while removing a stored
+    /// copy: the failed entry lists the stem, and the copies already gone;
+    /// the start stays, and the retry closes it.
+    #[test]
+    fn a_close_that_fails_after_marking_logs_the_stem_and_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
+        child.wait().unwrap();
+        drop(start);
+        let new = rollout(&f, NEW);
+        // Two stored copies; the one under a read-only day cannot be removed.
+        let copy = |day: &str| {
+            let copy = f.writer.base_dir().join("codex").join(day).join(NEW);
+            fs::create_dir_all(&copy).unwrap();
+            copy
+        };
+        let (free, stuck) = (copy("2026-10-07"), copy("2026-10-08"));
+        let stuck_day = stuck.parent().unwrap().to_path_buf();
+        fs::set_permissions(&stuck_day, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = import_codex(&f.writer, &new);
+        fs::set_permissions(&stuck_day, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(f.writer.nosave_dir().unwrap().join(NEW).exists(), "the marker was written");
+        assert!(stuck.exists());
+        let log = close_log(&f);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0]["marked"], serde_json::json!([NEW]), "the stem, though the close failed: {log:?}");
+        let removed: Vec<PathBuf> = serde_json::from_value(log[0]["removed"].clone()).unwrap();
+        assert_eq!(removed, if free.exists() { vec![] } else { vec![free.clone()] }, "exactly the copies gone");
+        assert!(log[0]["failed"].as_str().is_some_and(|e| e.contains("Failed to remove")), "{log:?}");
+        assert_eq!(starts(&f).len(), 2, "the start stays for the retry");
+
+        assert!(matches!(import_codex(&f.writer, &new).unwrap(), Imported::NoSave), "the retry closes it");
+        assert_eq!(starts(&f), Vec::<String>::new());
+        assert!(!free.exists() && !stuck.exists());
+        let log = close_log(&f);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[1]["failed"].is_null(), "{log:?}");
+    }
+
+    /// A line cut short by a closer killed mid-write spoils only itself.
+    #[test]
+    fn a_line_cut_short_is_ended_by_the_next_entry() {
+        let f = fixture();
+        let path = f.writer.codex_close_log().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"time":"2026-11-25T10:00:00+00:00","closer":"wra"#).unwrap();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let mut start = start;
+        let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
+        child.wait().unwrap();
+        start.finish(&f.writer).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(serde_json::from_str::<serde_json::Value>(lines[0]).is_err(), "the cut line stays as it was");
+        let entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(entry["closer"], "wrapper");
+        assert!(text.ends_with('\n'));
     }
 }

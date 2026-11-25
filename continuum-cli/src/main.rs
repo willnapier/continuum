@@ -109,19 +109,21 @@ fn report_old_starts(writer: Result<PlainTextWriter>, older_than_hours: u64) -> 
         Ok(ages) => ages,
         Err(e) => return (3, format!("cannot check the no-save Codex starts: {e:#}")),
     };
-    let hours = |age: &std::time::Duration| age.as_secs() / 3600;
+    // Hours and minutes, so a start just past the limit does not read as
+    // equal to it.
+    let hours = |age: &std::time::Duration| format!("{} h {} min", age.as_secs() / 3600, age.as_secs() % 3600 / 60);
     let old: Vec<_> = ages.iter().filter(|age| **age > limit).collect();
     if old.is_empty() {
         return (0, format!("no no-save Codex start older than {older_than_hours} h ({} on record)", ages.len()));
     }
     let mut report = format!(
-        "{} of {} no-save Codex start(s) on record for more than {older_than_hours} h; the oldest for {} h",
+        "{} of {} no-save Codex start(s) on record for more than {older_than_hours} h; the oldest for {}",
         old.len(),
         ages.len(),
         hours(old[0])
     );
     for age in &old {
-        report.push_str(&format!("\nold: {} h", hours(age)));
+        report.push_str(&format!("\nold: {}", hours(age)));
     }
     (1, report)
 }
