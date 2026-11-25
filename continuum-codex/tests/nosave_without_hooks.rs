@@ -548,3 +548,96 @@ fn control_without_a_no_save_request_the_stored_copy_stays() {
     let (output, _, copy) = run_with_a_stored_copy(&scratch, false, end);
     assert!(copy.join("messages.jsonl").exists(), "{}", said(&output));
 }
+
+// --- The close log ------------------------------------------------------
+
+fn close_log_path(scratch: &Scratch) -> PathBuf {
+    scratch.home.join(".local/share/continuum/codex-nosave-closes.jsonl")
+}
+
+/// Each entry of the close log; none when there is no log.
+fn close_log(scratch: &Scratch) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(close_log_path(scratch))
+        .map(|text| text.lines().map(|l| serde_json::from_str(l).unwrap()).collect())
+        .unwrap_or_default()
+}
+
+fn strings(value: &serde_json::Value) -> Vec<String> {
+    value.as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
+}
+
+/// A close by the wrapper is logged: the closer, the start record, the
+/// rollout marked by file stem, the stored copy removed by path. Red against
+/// the wrapper before this change, which writes no log.
+#[test]
+fn a_close_by_the_wrapper_is_logged_with_its_stems_and_removed_paths() {
+    for end in [&ENDS[0], &ENDS[4]] {
+        let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), &format!("closelog-wrapper-{}", end.name));
+        let (output, earlier, copy) = run_with_a_stored_copy(&scratch, true, end);
+        let context = format!("end {}\n{}", end.name, said(&output));
+        let new = rollout_path(&scratch, "2026/10/07", NEW_THREAD);
+
+        let log = close_log(&scratch);
+        assert_eq!(log.len(), 1, "one entry\n{log:?}\n{context}");
+        let entry = &log[0];
+        assert_eq!(entry["closer"], "wrapper", "{context}");
+        assert!(entry["start"].as_str().is_some_and(|s| s.ends_with(".start")), "{entry}\n{context}");
+        assert_eq!(strings(&entry["marked"]), [stem(&new)], "{context}");
+        assert_eq!(strings(&entry["removed"]), [copy.to_string_lossy().into_owned()], "{context}");
+        assert!(entry["failed"].is_null(), "{context}");
+        assert!(entry["time"].as_str().is_some_and(|t| t.starts_with("20")), "{context}");
+        // Names and paths only.
+        let text = std::fs::read_to_string(close_log_path(&scratch)).unwrap();
+        assert!(!text.contains("zz99"), "no session content in the log\n{context}");
+        assert_eq!(stored_copy(&scratch, &earlier), Some(1), "{context}");
+    }
+}
+
+/// The control: a start without a no-save request writes no close log.
+#[test]
+fn control_without_a_no_save_request_nothing_is_logged() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "closelog-wrapper-control");
+    let (output, _, _) = run_with_a_stored_copy(&scratch, false, &ENDS[4]);
+    assert_eq!(close_log(&scratch), Vec::<serde_json::Value>::new(), "{}", said(&output));
+}
+
+/// A close that marks nothing (Codex wrote no rollout) is logged too.
+#[test]
+fn a_close_that_marks_nothing_is_still_logged() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "closelog-nothing");
+    existing_rollout(&scratch, "2026/10/06", EARLIER_THREAD);
+    scratch.stand_in_launcher();
+    scratch.harness("codex", "exit 0");
+    scratch.request_no_save();
+    let output = scratch.command(&wrapper()).args(["exec", "ZZ99"]).output().unwrap();
+    let context = said(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    let log = close_log(&scratch);
+    assert_eq!(log.len(), 1, "{log:?}\n{context}");
+    assert_eq!(log[0]["closer"], "wrapper", "{context}");
+    assert_eq!(strings(&log[0]["marked"]), Vec::<String>::new(), "{context}");
+    assert_eq!(strings(&log[0]["removed"]), Vec::<String>::new(), "{context}");
+    assert_eq!(names(&registry(&scratch)), Vec::<String>::new(), "nothing marked\n{context}");
+}
+
+/// A close log that cannot be written (a folder where the file should be)
+/// stops neither the marking nor the removal, and the wrapper says so.
+#[test]
+fn a_log_that_cannot_be_written_does_not_stop_the_wrapper_close() {
+    let scratch = Scratch::new(env!("CARGO_TARGET_TMPDIR"), "closelog-wrapper-unwritable");
+    std::fs::create_dir_all(close_log_path(&scratch)).unwrap();
+    let (output, earlier, copy) = run_with_a_stored_copy(&scratch, true, &ENDS[4]);
+    let context = said(&output);
+    let new = rollout_path(&scratch, "2026/10/07", NEW_THREAD);
+
+    assert_eq!(output.status.code(), Some(0), "Codex's own status\n{context}");
+    assert_eq!(names(&registry(&scratch)), [stem(&new)], "marked\n{context}");
+    assert!(!copy.exists(), "removed\n{context}");
+    assert_eq!(starts(&scratch), Vec::<String>::new(), "closed\n{context}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("the close is not in the close log"),
+        "the failure is shown\n{context}"
+    );
+    assert_eq!(stored_copy(&scratch, &earlier), Some(1), "{context}");
+}

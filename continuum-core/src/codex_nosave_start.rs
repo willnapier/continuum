@@ -48,18 +48,35 @@
 //! Codex ended. A session that was already running, under the recorded
 //! folders, keeps being stored.
 //!
+//! Every close is logged, whichever closer did it (the wrapper, or an import
+//! after a killed wrapper): one JSON line in `codex-nosave-closes.jsonl`
+//! beside the registry, per machine and outside the synced archive, with the
+//! time, the closer, the start record's file name, each rollout marked
+//! no-save (by file stem), each stored copy removed (by path), and the step
+//! that failed, if one did. It holds names and paths only, never a session's
+//! content. The close comes first: a log that cannot be written stops neither
+//! the marking nor the removal, and is reported (by the wrapper on its
+//! terminal; by an import as an error, so the timer raises its alert). An
+//! import that closes a start also prints one line with the counts.
+//!
+//! A start has no time limit. [`start_ages`] reports how long each record
+//! has been there, without touching any, so that a start left open too long
+//! (a no-save Codex left running in a tab, a killed wrapper whose child's
+//! process id was reused) can be reported: `continuum codex nosave-starts`.
+//!
 //! Not covered: a no-save Codex that goes on in an existing rollout other
 //! than by `resume <uuid>` on its command line (a session chosen inside a
 //! running Codex), which still relies on its hooks; and a rollout of the
 //! session that a Codex app-server creates only after the Codex process has
 //! ended.
 
-use crate::import::{self, discard_session, register_nosave};
+use crate::import::{self, discard_session_copies, register_nosave};
 use crate::PlainTextWriter;
 use color_eyre::{eyre::eyre, eyre::Context, Result};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::time::{Duration, SystemTime};
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
@@ -109,12 +126,47 @@ pub struct CodexNoSaveStart {
 }
 
 /// What closing a start did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Closed {
-    /// Rollouts made since the start, now registered as no-save.
-    pub registered: usize,
+    /// The start record's file name.
+    pub start: String,
+    /// Rollouts made since the start, by file stem, now registered as no-save.
+    pub marked: Vec<String>,
     /// Stored copies of those rollouts that were removed.
-    pub removed: usize,
+    pub removed: Vec<PathBuf>,
+    /// Why this close is not in the close log; None when it is. The close
+    /// itself was done.
+    pub log_failure: Option<String>,
+}
+
+impl Closed {
+    /// The counts, for one line: "marked 2 Codex session(s) no-save, removed
+    /// 1 stored copy(ies)".
+    pub fn counts(&self) -> String {
+        format!(
+            "marked {} Codex session(s) no-save, removed {} stored copy(ies)",
+            self.marked.len(),
+            self.removed.len()
+        )
+    }
+}
+
+/// Which closer closed a start, as the close log names it.
+#[derive(Debug, Clone, Copy)]
+enum Closer {
+    /// The wrapper, when its Codex ended.
+    Wrapper,
+    /// An import, after the wrapper was killed and its Codex ended.
+    Import,
+}
+
+impl Closer {
+    fn name(self) -> &'static str {
+        match self {
+            Closer::Wrapper => "wrapper",
+            Closer::Import => "import",
+        }
+    }
 }
 
 impl CodexNoSaveStart {
@@ -211,9 +263,10 @@ impl CodexNoSaveStart {
 
     /// Codex has ended, however it ended: close the start. On an error the
     /// start stays open, and a later import closes it.
+    /// The close is logged; a log that cannot be written is
+    /// [`Closed::log_failure`], not an error.
     pub fn finish(mut self, writer: &PlainTextWriter) -> Result<Closed> {
-        let closed = close(writer, &self.record)?;
-        remove_files(&self.start, &self.child)?;
+        let closed = close_start(writer, &self.record, &self.start, &self.child, Closer::Wrapper)?;
         self.closed = true;
         Ok(closed)
     }
@@ -299,8 +352,15 @@ fn check_start(writer: &PlainTextWriter, start: &Path, mut file: File, close_clo
     }
     // Its wrapper and its child are gone; locked by us here, so no other
     // import closes it at the same time.
-    close(writer, &record)?;
-    remove_files(start, &child)?;
+    let closed = close_start(writer, &record, start, &child, Closer::Import)?;
+    // On stderr, which the timer keeps in its log: a hook's stdout is Codex's.
+    eprintln!("= Closed no-save Codex start {} (its wrapper had ended): {}", closed.start, closed.counts());
+    if let Some(failure) = closed.log_failure {
+        return Err(eyre!(
+            "Closed the no-save Codex start {}, but the close is not in the close log: {failure}",
+            closed.start
+        ));
+    }
     Ok(None)
 }
 
@@ -315,15 +375,97 @@ fn still_published(file: &File, path: &Path) -> Result<bool> {
     }
 }
 
-/// Register every rollout made since the start, and remove its stored copies.
-fn close(writer: &PlainTextWriter, record: &Record) -> Result<Closed> {
-    let now = record.rollouts_now()?;
-    let mut closed = Closed { registered: 0, removed: 0 };
-    for stem in now.difference(&record.before) {
-        closed.removed += discard_session(writer, "codex", stem)?;
-        closed.registered += 1;
+/// Close a start and log the close. On an error the start stays, for a later
+/// import to close again; the log has an entry for the failed close too, with
+/// what it did before the failure.
+fn close_start(writer: &PlainTextWriter, record: &Record, start: &Path, child: &Path, closer: Closer) -> Result<Closed> {
+    let mut closed = Closed {
+        start: start.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        ..Closed::default()
+    };
+    let outcome = close(writer, record, &mut closed).and_then(|()| remove_files(start, child));
+    let failed = outcome.as_ref().err().map(|e| format!("{e:#}"));
+    let logged = log_close(writer, closer, &closed, failed.as_deref());
+    match (outcome, logged) {
+        (Ok(()), logged) => {
+            closed.log_failure = logged.err().map(|e| format!("{e:#}"));
+            Ok(closed)
+        }
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(log)) => Err(e.wrap_err(format!("and the failed close is not in the close log: {log:#}"))),
     }
-    Ok(closed)
+}
+
+/// Register every rollout made since the start, and remove its stored copies,
+/// noting each in `closed` as it is done.
+fn close(writer: &PlainTextWriter, record: &Record, closed: &mut Closed) -> Result<()> {
+    let now = record.rollouts_now()?;
+    for stem in now.difference(&record.before) {
+        discard_session_copies(writer, "codex", stem, &mut closed.removed)?;
+        closed.marked.push(stem.clone());
+    }
+    Ok(())
+}
+
+/// Append one close to the close log: names, paths and counts only.
+fn log_close(writer: &PlainTextWriter, closer: Closer, closed: &Closed, failed: Option<&str>) -> Result<()> {
+    let path = writer
+        .codex_close_log()
+        .ok_or_else(|| eyre!("HOME is unavailable, so the close log cannot be found"))?;
+    let entry = serde_json::json!({
+        "time": chrono::Local::now().to_rfc3339(),
+        "closer": closer.name(),
+        "start": closed.start,
+        "marked": closed.marked,
+        "removed": closed.removed,
+        "failed": failed,
+    });
+    let mut line = serde_json::to_vec(&entry)?;
+    line.push(b'\n');
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // One write of one line: appends from two closers do not interleave.
+    let mut file = options.open(&path).with_context(|| format!("cannot open {}", path.display()))?;
+    file.write_all(&line).with_context(|| format!("cannot write {}", path.display()))?;
+    file.sync_data().with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
+
+/// How long each no-save Codex start on record has been there, open or
+/// waiting for an import to close it, oldest first. Only names and file times
+/// are read: no record is opened, locked, closed, changed or removed. The
+/// age is from the time in the record's name (`<pid>-<nanos>.start`, written
+/// when the start was opened), or its file's modification time for a name
+/// without one. No starts folder is no starts.
+pub fn start_ages(writer: &PlainTextWriter) -> Result<Vec<Duration>> {
+    let dir = starts_dir(writer)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(eyre!("cannot read the no-save starts at {}: {e}", dir.display())),
+    };
+    let now = SystemTime::now();
+    let mut ages = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot read {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        let Some(stem) = name.strip_suffix(START_SUFFIX).filter(|_| !name.starts_with('.')) else { continue };
+        let opened = match stem.rsplit_once('-').and_then(|(_, nanos)| nanos.parse::<u64>().ok()) {
+            Some(nanos) => SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos),
+            None => entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .with_context(|| format!("cannot read the time of {}", entry.path().display()))?,
+        };
+        ages.push(now.duration_since(opened).unwrap_or_default());
+    }
+    ages.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(ages)
 }
 
 /// What a no-save start's arguments say about a resume.
@@ -655,7 +797,7 @@ mod tests {
         assert!(stored(&f, &earlier), "a rollout that was there before is stored");
 
         let closed = start.finish(&f.writer).unwrap();
-        assert_eq!(closed, Closed { registered: 1, removed: 0 });
+        assert_eq!((closed.marked, closed.removed, closed.log_failure), (vec![NEW.to_string()], vec![], None));
         assert_eq!(starts(&f), Vec::<String>::new(), "the start is gone");
         assert!(matches!(import_codex(&f.writer, &new).unwrap(), Imported::NoSave), "and the rollout is no-save");
         assert!(stored(&f, &earlier), "the earlier one is untouched");
@@ -680,7 +822,8 @@ mod tests {
         let unrelated = f.writer.base_dir().join("codex/2026-10-07").join(EARLIER);
         fs::create_dir_all(&unrelated).unwrap();
 
-        assert_eq!(start.finish(&f.writer).unwrap(), Closed { registered: 1, removed: 1 });
+        let closed = start.finish(&f.writer).unwrap();
+        assert_eq!((closed.marked, closed.removed), (vec![NEW.to_string()], vec![copy.clone()]));
         assert!(!copy.exists(), "the stored copy is removed");
         assert!(unrelated.exists(), "another session's copy is not");
     }
@@ -874,7 +1017,8 @@ mod tests {
         fs::create_dir_all(&day).unwrap();
         let elsewhere = day.join(format!("{NEW}.jsonl"));
         fs::write(&elsewhere, format!("{LINE}\n")).unwrap();
-        assert_eq!(start.finish(&f.writer).unwrap(), Closed { registered: 1, removed: 0 });
+        let closed = start.finish(&f.writer).unwrap();
+        assert_eq!((closed.marked.len(), closed.removed.len()), (1, 0));
         assert!(matches!(import_codex(&f.writer, &elsewhere).unwrap(), Imported::NoSave));
     }
 
@@ -890,5 +1034,54 @@ mod tests {
         assert!(registry.join(EARLIER).exists() && registry.join("019a0000-0000-7000-8000-0000000000a1").exists());
         assert!(matches!(import_codex(&f.writer, &earlier).unwrap(), Imported::NoSave));
         assert!(copy.exists(), "the turns saved before the resume are kept");
+    }
+
+    fn close_log(f: &Fixture) -> Vec<serde_json::Value> {
+        fs::read_to_string(f.writer.codex_close_log().unwrap())
+            .map(|text| text.lines().map(|l| serde_json::from_str(l).unwrap()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_failed_close_is_logged_with_what_it_did_and_the_step_that_failed() {
+        let f = fixture();
+        let mut start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let mut child = start.spawn_child(&mut Command::new("true"), String::new).unwrap();
+        child.wait().unwrap();
+        drop(start);
+        let new = rollout(&f, NEW);
+        let registry = f.writer.nosave_dir().unwrap().to_path_buf();
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(&registry, b"not a folder").unwrap();
+        let failed = import_codex(&f.writer, &new);
+        fs::remove_file(&registry).unwrap();
+
+        assert!(failed.is_err(), "{failed:?}");
+        let log = close_log(&f);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0]["closer"], "import");
+        assert_eq!(log[0]["marked"], serde_json::json!([]));
+        assert!(log[0]["failed"].as_str().is_some_and(|e| e.contains("nosave-sessions")), "{log:?}");
+    }
+
+    #[test]
+    fn start_ages_reads_names_and_touches_nothing() {
+        let f = fixture();
+        let start = CodexNoSaveStart::open(&f.writer, std::slice::from_ref(&f.sessions)).unwrap();
+        let dir = f.writer.codex_starts_dir().unwrap();
+        let seven_hours_ago = SystemTime::now() - Duration::from_secs(7 * 3600);
+        let nanos = seven_hours_ago.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        fs::write(dir.join(format!("4242-{nanos}.start")), b"{}").unwrap();
+        // Not records: a temporary file, a child record, and a name with no time.
+        fs::write(dir.join(format!(".4242-{nanos}.tmp")), b"").unwrap();
+        fs::write(dir.join(format!("4242-{nanos}.child")), b"").unwrap();
+        let before = starts(&f);
+
+        let ages = start_ages(&f.writer).unwrap();
+        assert_eq!(ages.len(), 2, "{ages:?}");
+        assert!(ages[0] >= Duration::from_secs(7 * 3600 - 5) && ages[0] < Duration::from_secs(7 * 3600 + 60));
+        assert!(ages[1] < Duration::from_secs(60), "the fresh one: {ages:?}");
+        assert_eq!(starts(&f), before, "nothing changed");
+        drop(start);
     }
 }

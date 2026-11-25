@@ -163,14 +163,27 @@ fn main() -> Result<()> {
     // none. After a launcher code or a signal there is then nothing to import
     // here: the newest session file below would be some other session's.
     let after = nosave_request::settle_at_exit(nosave, status.code(), false);
+    // What the close did is also in the close log
+    // (`~/.local/share/continuum/codex-nosave-closes.jsonl`).
     match closed {
-        Some(Ok(closed)) if closed.registered > 0 => eprintln!(
-            "✗ Marked {} Codex session(s) begun during this no-save start as no-save{}",
-            closed.registered,
-            if closed.removed > 0 { format!("; removed {} stored copy(ies)", closed.removed) } else { String::new() }
-        ),
+        Some(Ok(closed)) => {
+            if !closed.marked.is_empty() {
+                eprintln!(
+                    "✗ Marked {} Codex session(s) begun during this no-save start as no-save{}",
+                    closed.marked.len(),
+                    if closed.removed.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; removed {} stored copy(ies)", closed.removed.len())
+                    }
+                );
+            }
+            if let Some(failure) = closed.log_failure {
+                eprintln!("⚠ Warning: this no-save start was closed, but the close is not in the close log: {failure}");
+            }
+        }
         Some(Err(e)) => eprintln!("⚠ Warning: could not close this no-save start; the next import will: {e:#}"),
-        _ => {}
+        None => {}
     }
     if !after.session_of_this_start || skip_saving {
         std::process::exit(status.code().unwrap_or(1));

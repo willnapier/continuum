@@ -16,7 +16,7 @@ which = "6.0"
 chrono.workspace = true
 color-eyre.workspace = true
 regex.workspace = true
-libc = "0.2"  # no-save Codex starts: process checks and signal masks
+libc = "0.2"  # no-save Codex starts: process checks, and the child's record of itself before its exec
 rusqlite.workspace = true  # Only used by Goose adapter to read Goose's own database
 
 [dev-dependencies]

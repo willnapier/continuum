@@ -280,18 +280,32 @@ pub fn register_nosave(writer: &PlainTextWriter, session_id: &str) -> Result<Pat
 /// trusted it yet) and when the user discards a conversation. Returns how
 /// many copies were removed.
 pub fn discard_session(writer: &PlainTextWriter, assistant: &str, session_id: &str) -> Result<usize> {
+    discard_session_copies(writer, assistant, session_id, &mut Vec::new())
+}
+
+/// [`discard_session`], adding the path of each stored copy removed to
+/// `removed` as it goes, so that a caller logging what was done keeps the
+/// copies removed before a later one failed. Returns how many this call
+/// removed.
+pub fn discard_session_copies(
+    writer: &PlainTextWriter,
+    assistant: &str,
+    session_id: &str,
+    removed: &mut Vec<PathBuf>,
+) -> Result<usize> {
     register_nosave(writer, session_id)?;
     writer.with_session_lock(assistant, session_id, || {
         let Ok(days) = std::fs::read_dir(writer.base_dir().join(assistant)) else { return Ok(0) };
-        let mut removed = 0;
+        let mut count = 0;
         for day in days.flatten() {
             let copy = day.path().join(session_id);
             if copy.is_dir() {
                 std::fs::remove_dir_all(&copy).with_context(|| format!("Failed to remove {}", copy.display()))?;
-                removed += 1;
+                removed.push(copy);
+                count += 1;
             }
         }
-        Ok(removed)
+        Ok(count)
     })
 }
 
