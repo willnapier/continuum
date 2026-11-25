@@ -880,7 +880,8 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<()> {
             Ok(())
         }
         continuum_core::import::Imported::Empty => Err(color_eyre::eyre::eyre!("No messages to import")),
-        continuum_core::import::Imported::NoSave => {
+        // Held is Codex's only.
+        continuum_core::import::Imported::NoSave | continuum_core::import::Imported::Held => {
             eprintln!("This session is marked no-save; not saved to continuum logs");
             Ok(())
         }

@@ -36,6 +36,10 @@ pub enum Imported<T> {
     Empty,
     /// The session is in the no-save registry.
     NoSave,
+    /// Not stored for now: an open no-save Codex start may own this rollout
+    /// (`codex_nosave_start`). When the start closes, the rollout is either
+    /// registered as no-save or was there before it, and imports as usual.
+    Held,
 }
 
 impl<T> Imported<T> {
@@ -181,6 +185,10 @@ pub fn import_codex(
     session_path: &Path,
 ) -> Result<Imported<(ImportOutcome, Vec<LoopDetection>)>> {
     let session_id = file_stem(session_path)?;
+    // First, as it may close a start, and closing registers rollouts.
+    if crate::codex_nosave_start::holds(writer, &session_id)? {
+        return Ok(Imported::Held);
+    }
     if nosave_marked(writer, &codex_ids(&session_id))? {
         return Ok(Imported::NoSave);
     }
@@ -225,9 +233,13 @@ fn import_codex_locked(
         })
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     let detections = LoopDetector::new().analyze(&messages);
-    // Again under the lock: the session may have been registered while it was read.
+    // Again under the lock: the session may have been registered, or a
+    // no-save start opened, while it was read.
     if nosave_marked(writer, &codex_ids(&session_id))? {
         return Ok(Imported::NoSave);
+    }
+    if crate::codex_nosave_start::holds_without_closing(writer, &session_id)? {
+        return Ok(Imported::Held);
     }
     let (dir, written) = writer.replace_session(&session_id, "codex", Some(&start_time), &[], &compressed)?;
     let outcome = ImportOutcome { session_id, dir, message_count: compressed.len(), written, skipped_lines };
@@ -311,10 +323,15 @@ fn codex_ids(stem: &str) -> Vec<&str> {
 /// (`rollout-<timestamp>-<uuid>`): the id Codex hooks report.
 fn codex_thread_id(stem: &str) -> Option<&str> {
     let id = stem.get(stem.len().checked_sub(36)?..)?;
-    let shaped = id
-        .char_indices()
-        .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
-    shaped.then_some(id)
+    is_codex_thread_id(id).then_some(id)
+}
+
+/// Whether `id` has the shape of a Codex thread id (a UUID, 36 characters).
+pub fn is_codex_thread_id(id: &str) -> bool {
+    id.len() == 36
+        && id
+            .char_indices()
+            .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() })
 }
 
 /// The cc-clinical session registry: one marker file per clinical session id.
@@ -609,7 +626,8 @@ mod tests {
     fn codex_import_is_idempotent_and_dated_by_the_session_start() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        let writer = PlainTextWriter::with_base_dir(out.path().to_path_buf());
+        // Its own registry, so that the real no-save starts are never consulted.
+        let writer = PlainTextWriter::with_base_dir(out.path().join("logs")).with_nosave_dir(out.path().join("nosave"));
         let line = |role: &str, text: &str| {
             serde_json::json!({"type": "response_item", "timestamp": "2026-09-29T08:00:00.000Z",
                 "payload": {"role": role, "content": [{"type": "input_text", "text": text}]}})

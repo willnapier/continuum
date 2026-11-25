@@ -76,17 +76,46 @@ fn main() -> Result<()> {
     let nosave = NoSaveRequest::reserve(std::path::Path::new(&home));
     let skip_saving = nosave.is_some();
 
+    // Where Codex writes its rollouts: under CODEX_HOME when that is set, as
+    // the hooks read it, else ~/.codex.
+    let sessions_dir = std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&home).join(".codex"))
+        .join("sessions");
+
+    // A no-save start does not rely on Codex's hooks to stay out of
+    // Continuum (`continuum_core::codex_nosave_start`). Before Codex runs, a
+    // resumed session is registered by its rollout file and thread id, and
+    // the start is recorded, so that no import stores a rollout made while
+    // it is open. When Codex has ended, however it ended, every rollout made
+    // since the start is registered and any stored copy of it removed. If
+    // any of that cannot be done, Codex is not started and the request is
+    // kept.
+    let mut nosave_start = None;
     if skip_saving {
+        // Every place this Codex may write a rollout: the sessions folder it
+        // is started with, and ~/.codex's when CODEX_HOME points elsewhere
+        // (an app-server already running may have been started without it).
+        let mut sessions_dirs = vec![sessions_dir.clone()];
+        let default_dir = std::path::PathBuf::from(&home).join(".codex/sessions");
+        if default_dir != sessions_dir {
+            sessions_dirs.push(default_dir);
+        }
+        match open_no_save_start(&args, &sessions_dirs) {
+            Ok(start) => nosave_start = Some(start),
+            Err(refusal) => {
+                nosave_request::settle(nosave, false);
+                eprintln!("✗ Codex was not started: {refusal:#}");
+                eprintln!("↩ The no-save request is kept for the next start");
+                std::process::exit(2);
+            }
+        }
         eprintln!("⚠ This conversation will NOT be saved to continuum logs");
     }
 
     // Get the most recently modified session file BEFORE running codex
-    let sessions_dir = std::path::PathBuf::from(&home).join(".codex/sessions");
-
     let before_session = find_latest_session_file(&sessions_dir);
-    // For a no-save start: every rollout that exists now. One that is not in
-    // this set afterwards was made after this point (see below).
-    let rollouts_before = skip_saving.then(|| rollout_files(&sessions_dir));
 
     // Spawn codex as a child process
     let mut command = launch.command();
@@ -95,74 +124,72 @@ fn main() -> Result<()> {
         // Seen by the per-turn Stop hook through codex's environment.
         command.env(continuum_core::import::NOSAVE_ENV, "1");
     }
-    let mut child = command
+    command
         .args(&args)
         .env(continuum_core::codex_cli::CODEX_DEPTH_ENV, "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| continuum_core::masked_launch::spawn_failure("codex"))?;
+        .stderr(Stdio::inherit());
+    let spawn_failure = || continuum_core::masked_launch::spawn_failure("codex");
+    let mut child = match nosave_start.as_mut() {
+        Some(start) => match start.spawn_child(&mut command, spawn_failure) {
+            Ok(child) => child,
+            Err(error) => {
+                // A Codex that was spawned and then ended again, because it
+                // could not be recorded, may have written a rollout: close the
+                // start (or leave it for an import to close) before failing.
+                if let Some(start) = nosave_start.take().filter(|start| start.child_spawned()) {
+                    if let Err(close) = continuum_core::PlainTextWriter::new().and_then(|writer| start.finish(&writer)) {
+                        eprintln!("⚠ Warning: could not close this no-save start; the next import will: {close:#}");
+                    }
+                }
+                return Err(error);
+            }
+        },
+        None => command.spawn().with_context(spawn_failure)?,
+    };
     let status = child.wait()?;
+
+    // A no-save start is closed first, before anything is printed: the
+    // terminal may be gone.
+    let closed = nosave_start.map(|start| {
+        continuum_core::PlainTextWriter::new().and_then(|writer| start.finish(&writer))
+    });
 
     // Settle the no-save request and decide whether there is a session of
     // this start to work on (`nosave_request::AfterChild`). This wrapper has
     // no evidence of its own that ties a session to its child (it only knows
     // the newest session file, which may be another Codex's), so it passes
     // none. After a launcher code or a signal there is then nothing to import
-    // or discard here: the newest session file below would be some other
-    // session's, and discarding it could delete a session that was meant to
-    // be kept.
-    //
-    // But a Codex may have run a no-save session before it ended that way,
-    // and its hooks may not have registered it (a hook that failed or is not
-    // trusted yet). The timer would then store it. So for a no-save start,
-    // every rollout made since the snapshot above is registered as no-save.
-    // Nothing is deleted, and no rollout that existed before is touched. The
-    // session of this start, if there was one, is among them, whichever it
-    // is. The cost: another Codex session that began between the snapshot and
-    // this child's end is registered too, and is not saved from then on. Not
-    // covered: a no-save `codex resume`, which writes on in a rollout that
-    // existed before; that still relies on its hooks.
+    // here: the newest session file below would be some other session's.
     let after = nosave_request::settle_at_exit(nosave, status.code(), false);
-    if !after.session_of_this_start {
-        if let Some(before) = &rollouts_before {
-            register_new_rollouts_as_no_save(&sessions_dir, before);
-        }
+    match closed {
+        Some(Ok(closed)) if closed.registered > 0 => eprintln!(
+            "✗ Marked {} Codex session(s) begun during this no-save start as no-save{}",
+            closed.registered,
+            if closed.removed > 0 { format!("; removed {} stored copy(ies)", closed.removed) } else { String::new() }
+        ),
+        Some(Err(e)) => eprintln!("⚠ Warning: could not close this no-save start; the next import will: {e:#}"),
+        _ => {}
+    }
+    if !after.session_of_this_start || skip_saving {
         std::process::exit(status.code().unwrap_or(1));
     }
 
     // After codex exits, find the session that was just modified
     let after_session = find_latest_session_file(&sessions_dir);
 
-    // Import the session if it's different from before (and we're not skipping)
+    // Import the session if it's different from before
     let mut session_dir: Option<std::path::PathBuf> = None;
-    if skip_saving {
-        // The hooks register a no-save session as it runs. This backstop
-        // covers a hook that failed or is not trusted yet: it registers the
-        // session, so the Codex timer never stores it later, and for a
-        // session started here deletes any copy stored before then. A resumed
-        // or forked session's earlier record was saved deliberately.
-        let resumed = args.iter().any(|a| a == "resume" || a == "fork");
-        if let Some(session_path) = after_session.filter(|p| before_session.as_ref() != Some(p)) {
-            let result = if resumed { register_only(&session_path) } else { discard(&session_path) };
-            match result {
-                Ok(0) => {}
-                Ok(n) => eprintln!("✗ Removed {n} stored copy(ies) of this no-save session"),
-                Err(e) => eprintln!("⚠ Warning: could not mark the session no-save: {e}"),
-            }
-        }
-    } else {
-        if let Some(session_path) = after_session {
-            if before_session.as_ref() != Some(&session_path) {
-                eprintln!("\n📝 Importing session to continuum logs...");
-                match import_session_to_continuum(&session_path) {
-                    Ok(dir) => {
-                        session_dir = dir;
-                    }
-                    Err(e) => {
-                        eprintln!("⚠ Warning: Failed to import session: {}", e);
-                    }
+    if let Some(session_path) = after_session {
+        if before_session.as_ref() != Some(&session_path) {
+            eprintln!("\n📝 Importing session to continuum logs...");
+            match import_session_to_continuum(&session_path) {
+                Ok(dir) => {
+                    session_dir = dir;
+                }
+                Err(e) => {
+                    eprintln!("⚠ Warning: Failed to import session: {}", e);
                 }
             }
         }
@@ -186,43 +213,28 @@ fn main() -> Result<()> {
     std::process::exit(status.code().unwrap_or(1))
 }
 
-/// Every Codex rollout under `sessions_dir` (`YYYY/MM/DD/rollout-*.jsonl`).
-fn rollout_files(sessions_dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
-    let mut found = std::collections::HashSet::new();
-    let mut dirs = vec![sessions_dir.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_rollout = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
-            if path.is_dir() {
-                dirs.push(path);
-            } else if is_rollout {
-                found.insert(path);
-            }
+/// Before a no-save Codex runs: register a resumed session, then record the
+/// start (`continuum_core::codex_nosave_start`). A resume whose session its
+/// arguments do not name for certain is refused: the rollout it would write
+/// on cannot be known.
+fn open_no_save_start(
+    args: &[String],
+    sessions_dirs: &[std::path::PathBuf],
+) -> Result<continuum_core::codex_nosave_start::CodexNoSaveStart> {
+    use continuum_core::codex_nosave_start::{self as start, CodexNoSaveStart, Resume};
+    let writer = continuum_core::PlainTextWriter::new()?;
+    match start::resume_of(args) {
+        Resume::No => {}
+        Resume::Of(thread) => {
+            start::register_resumed(&writer, sessions_dirs, &thread)
+                .context("the resumed session could not be marked no-save")?;
         }
+        Resume::Unclear => color_eyre::eyre::bail!(
+            "a no-save `codex resume` must name the session's id right after `resume`, and no other id \
+             (codex resume <uuid> [prompt]); otherwise the session to keep out of Continuum cannot be known"
+        ),
     }
-    found
-}
-
-/// Register as no-save every rollout that is there now and was not in
-/// `before`: the backstop for a no-save start that ended without showing which
-/// session was its own. Stored copies and the rollouts themselves are left
-/// alone.
-fn register_new_rollouts_as_no_save(sessions_dir: &std::path::Path, before: &std::collections::HashSet<std::path::PathBuf>) {
-    let mut registered = 0;
-    for rollout in rollout_files(sessions_dir).difference(before) {
-        match register_only(rollout) {
-            Ok(_) => registered += 1,
-            Err(e) => eprintln!("⚠ Warning: could not mark {} no-save: {e}", rollout.display()),
-        }
-    }
-    if registered > 0 {
-        eprintln!("✗ Marked {registered} Codex session(s) begun during this no-save start as no-save");
-    }
+    CodexNoSaveStart::open(&writer, sessions_dirs).context("the no-save start could not be recorded")
 }
 
 fn find_latest_session_file(sessions_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -301,6 +313,13 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<Option<
             eprintln!("This session is marked no-save; not saved to continuum logs");
             return Ok(None);
         }
+        Imported::Held => {
+            eprintln!(
+                "This session began while a no-save Codex session was open, so it is not saved to continuum logs: \
+                 it may be that session's"
+            );
+            return Ok(None);
+        }
     };
 
     if !detections.is_empty() {
@@ -326,12 +345,6 @@ fn import_session_to_continuum(session_path: &std::path::Path) -> Result<Option<
 /// rollout stem, which the importer checks alongside the thread id.
 fn discard(path: &std::path::Path) -> Result<usize> {
     continuum_core::import::discard_session(&continuum_core::PlainTextWriter::new()?, "codex", rollout_stem(path)?)
-}
-
-/// Register a Codex session as no-save without touching stored copies.
-fn register_only(path: &std::path::Path) -> Result<usize> {
-    continuum_core::import::register_nosave(&continuum_core::PlainTextWriter::new()?, rollout_stem(path)?)?;
-    Ok(0)
 }
 
 fn rollout_stem(path: &std::path::Path) -> Result<&str> {
