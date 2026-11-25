@@ -248,7 +248,7 @@ it.** Every importer, the timers included, consults the no-save registry
   in a tab, a killed wrapper whose child's process id was reused) is
   reported, not closed: `continuum codex nosave-starts [--older-than-hours N]`
   (6 by default) reads the record names and file times only, prints the
-  count and ages of those older (`old: <hours> h` each) and exits 0 (none),
+  count and ages of those older (`old: <h> h <m> min` each) and exits 0 (none),
   1 (some) or 3 (could not check). `system-health-check` runs it on nimbini
   and makes one finding of it. To undo one removal: delete the session's
   marker in `~/.local/share/continuum/nosave-sessions/` (by rollout stem, and
